@@ -175,6 +175,105 @@ impl Default for RefsConfig {
     }
 }
 
+/// The CONNECT listener that lets a client which pins its own base URL be
+/// compressed anyway.
+///
+/// A client that reads `ANTHROPIC_BASE_URL` needs none of this: point it at the
+/// proxy and the bytes arrive. Claude Desktop sets that variable itself when it
+/// spawns a session, overwriting both the inherited environment and
+/// `settings.json`, so there is no value to set. What it does honour is a proxy
+/// and a certificate authority, which is what this serves.
+///
+/// Off unless [`Self::listen`] names an address. A CONNECT proxy that appeared
+/// because somebody upgraded would be an unpleasant surprise, and a listener
+/// holding a signing key more so.
+/// An MCP server this one fronts.
+///
+/// Proxy mode exists for clients that cannot be pointed at the HTTP proxy at
+/// all — Claude Desktop's Chat tab among them. Their inference requests carry
+/// no bulk worth eliding, because the conversation lives on the server; the
+/// bulk they carry is **tool results**, which are machine-facing in exactly the
+/// way tool output in a coding agent is. Fronting the servers that produce
+/// those results compresses them without touching anything a person reads.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpServerConfig {
+    /// Prefixes this server's tool names, so two servers exporting `read_file`
+    /// do not shadow each other.
+    pub name: String,
+    /// Spawned, speaking JSON-RPC on its pipe. Exclusive with [`Self::url`].
+    pub command: Option<String>,
+    pub args: Vec<String>,
+    /// Extra environment for a spawned server. The parent's is inherited.
+    pub env: std::collections::BTreeMap<String, String>,
+    /// Connected to over streamable HTTP. Exclusive with [`Self::command`].
+    pub url: Option<String>,
+    /// Whether results from this server are compressed at all.
+    ///
+    /// False forwards them untouched, which is right for a server whose results
+    /// are already small or structurally fragile: excluding one is better than
+    /// tuning the engine around it.
+    pub compress: bool,
+}
+
+impl Default for McpServerConfig {
+    fn default() -> Self {
+        McpServerConfig {
+            name: String::new(),
+            command: None,
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            url: None,
+            compress: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct InterceptConfig {
+    /// Where to accept CONNECT. `None`, the default, serves nothing.
+    ///
+    /// One field rather than a bool beside an address, which can contradict
+    /// itself.
+    pub listen: Option<String>,
+    /// Hosts whose TLS this terminates. Everything else is tunnelled blind.
+    ///
+    /// Exact, lowercased hostnames; no globs and no patterns. mitmproxy takes a
+    /// regex here and the anchors in `'^api\.anthropic\.com:443$'` are doing
+    /// real work — a pattern that loses them intercepts hosts nobody meant it
+    /// to, quietly, while still appearing to function. Equality cannot.
+    pub intercept_hosts: Vec<String>,
+    /// Directory holding `ca.pem` and `ca.key`, created on first use.
+    pub ca_path: PathBuf,
+    /// What to advertise in ALPN.
+    ///
+    /// Both, in preference order, because `http/1.1` alone does not work.
+    /// Claude Desktop's client offers **only** `h2` for `api.anthropic.com`,
+    /// and a server that cannot speak it answers `no_application_protocol`:
+    /// the client hangs up mid-handshake and the listener logs a handshake
+    /// EOF, which looks exactly like an untrusted certificate and is not one.
+    /// Measured with `openssl s_client -alpn h2` against this listener —
+    /// alert 120 with `Verify return code: 0 (ok)`, trust intact, protocol
+    /// refused.
+    pub alpn: Vec<String>,
+    /// How many minted leaves to keep. Bounds memory, not disk; nothing about a
+    /// leaf is written down.
+    pub leaf_cache_entries: usize,
+}
+
+impl Default for InterceptConfig {
+    fn default() -> Self {
+        InterceptConfig {
+            listen: None,
+            intercept_hosts: Vec::new(),
+            ca_path: PathBuf::from("./data/ca"),
+            alpn: vec!["h2".to_string(), "http/1.1".to_string()],
+            leaf_cache_entries: 64,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct StatsFileConfig {
@@ -223,6 +322,8 @@ impl Default for RetrieveConfig {
 pub struct McpConfig {
     pub enabled: bool,
     pub path: String,
+    /// Servers this one fronts. Empty, the default, serves only our own tools.
+    pub servers: Vec<McpServerConfig>,
     /// Empty means any host is accepted, which is right for an internal service.
     pub allowed_hosts: Vec<String>,
     pub max_retrievals_per_minute: u32,
@@ -233,6 +334,7 @@ impl Default for McpConfig {
         McpConfig {
             enabled: true,
             path: "/mcp".to_string(),
+            servers: Vec::new(),
             allowed_hosts: Vec::new(),
             max_retrievals_per_minute: 120,
         }
@@ -533,6 +635,8 @@ pub struct ProxyConfig {
     pub upstreams: Vec<Upstream>,
     pub default_upstream: String,
     pub allow_insecure_upstream: bool,
+    /// See [`InterceptConfig`]. Off unless its `listen` is set.
+    pub intercept: InterceptConfig,
 }
 
 impl Default for ProxyConfig {
@@ -567,6 +671,7 @@ impl Default for ProxyConfig {
             upstreams: Vec::new(),
             default_upstream: String::new(),
             allow_insecure_upstream: false,
+            intercept: InterceptConfig::default(),
         }
     }
 }
