@@ -24,6 +24,13 @@ uses when it cannot be.
 
 ## Why Desktop needs intercepting
 
+![Claude Desktop without kompressor](charts/desktop-baseline.drawio.png)
+
+The two tabs reach different providers over different protocols with different
+credentials, which is why neither is wrapped the way a CLI is. Both charts here
+are `.drawio.png`: picture and source in one file, re-exported with `-e`.
+
+
 The CLI can use `kompressor wrap claude` or `ANTHROPIC_BASE_URL`. Signed-in
 Desktop overrides that base URL, including values supplied through settings.
 Desktop's third-party inference configuration instead uses separate gateway
@@ -245,6 +252,23 @@ statistics; join `optimization_events` and `proxy_requests` by `request_id`.
 | `intercept is listening with no intercept_hosts` | `intercept_hosts` is empty, so every connection is tunnelled. A working listener that compresses nothing. |
 | Claude works but old tool results stay full | Check `CLAUDE_CODE_TETHER_LIVE=0`, restart Desktop, and use a fresh session. |
 | Requests still bypass the listener | Check other environment/settings overrides, lowercase proxy variables, and `NO_PROXY` bypasses. |
+
+**Two things decide whether such a test can show you anything.**
+
+A tool result of **30 KiB or more never reaches the proxy**: Claude Code writes
+it to `~/.claude/projects/…/tool-results/` and sends a ~2 KB preview. Measured
+against 2.1.299 — 30,000 bytes arrives inline, 30,720 does not. A 36 KB fixture
+therefore produces no compression and no markers, and the session will report,
+accurately, that every line arrived whole. Keep fixtures under 30 KiB; the
+sweep's code fixture takes `--compact` for this reason.
+
+And **the model cannot see the compression**. With the default
+`retrieve_execution = "server"` the proxy elides on the way out and resolves the
+handles itself, so the model is handed resolved content and will say no
+compression happened — on a request the engine took 15,299 tokens out of. Verify
+against `optimization_events`, not against the session's own account of its
+context. [CLAUDE-CODE.md](CLAUDE-CODE.md#do-not-ask-the-model) has the measured
+numbers.
 
 For retrieval validation, prepare fresh fixture files before starting the
 session, attach no files, and read `warmup_1.py`, `warmup_2.py`, then `ledger.py`
