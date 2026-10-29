@@ -82,13 +82,27 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = ["c
 # 0.12's `rustls-tls-webpki-roots` is `webpki-roots` + `__rustls-ring`: one
 # provider, one root store, no platform verifier, and it matches
 # tokio-tungstenite's feature of the same name above.
+#
+# Re-tested against 0.13.5, so a dependency report saying "outdated" can be
+# answered without repeating the experiment:
+#
+#   * the private `__rustls` on its own does not compile — the client calls
+#     `rustls_platform_verifier` from code gated only on that feature.
+#   * `rustls-no-provider` builds and keeps aws-lc-rs out, but needs every
+#     client handed a finished rustls config (it panics at build time without a
+#     provider), and the verifier is still linked: `make macos-pkg-docker`
+#     fails on both Apple targets with "unable to find framework 'Security'"
+#     and "'CoreFoundation'", even though nothing calls it.
+#
+# Revisit when reqwest offers rustls without the platform verifier, or the
+# macOS builder gains an SDK.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "http2", "stream", "json"] }
 url = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
 
 # --- storage ---
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 
 # --- cli / config ---
 clap = { version = "4", features = ["derive", "env"] }
