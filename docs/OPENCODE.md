@@ -1,0 +1,199 @@
+# Wrapping opencode
+
+```bash
+kompressor wrap opencode                     # the TUI, compressed
+kompressor wrap opencode -- run "fix the failing test"
+kompressor wrap opencode --attach            # OpenCode Desktop, and TUIs already running
+```
+
+Everything below was measured against **opencode 2.2.4** (CLI) and **OpenCode
+Desktop 2.0.11** (whose bundled CLI is also 2.0.11) on Linux, against a
+recording listener and against the live providers. opencode 2.x is a different
+program from 1.x in the two ways that matter here, so none of this applies to a
+1.x install.
+
+## Contents
+
+- [Why a variable is not enough](#why-a-variable-is-not-enough)
+- [Launched sessions](#launched-sessions)
+- [Desktop and the background service](#desktop-and-the-background-service)
+- [Providers](#providers)
+- [Measuring it](#measuring-it)
+- [Known limits](#known-limits)
+- [Troubleshooting](#troubleshooting)
+
+## Why a variable is not enough
+
+Earlier catalogues wrapped opencode by setting `OPENAI_BASE_URL`. On 2.x that
+does worse than nothing, for two separate reasons.
+
+**1. The variable breaks the provider.** With `OPENAI_BASE_URL` (or
+`ANTHROPIC_BASE_URL`) in its environment, opencode 2.2.4 reports every model of
+that provider as `Model unavailable` and sends no request at all. `wrap
+opencode` sets neither, and the sweep removes both from the environment it
+runs opencode in.
+
+**2. The process that calls the model is not the one you start.** `opencode`
+is a client of a long-lived background service, `opencode serve --service`,
+recorded in `~/.local/state/opencode/service.json`. The service makes every
+provider request with the environment *it* was started with, so a variable set
+on the TUI reaches nothing. OpenCode Desktop uses the same service: it adopts
+one that is running, or starts it with its own bundled CLI.
+
+What does reach every provider is configuration:
+
+```json
+{ "providers": { "openai": { "settings": { "baseURL": "http://127.0.0.1:8817/v1" } } } }
+```
+
+`providers.<id>.settings.baseURL` is the 2.x spelling. The 1.x spelling,
+`provider.<id>.options.baseURL`, is still honoured, and when one file holds
+both, the 2.x one wins. `config.json` is no longer read at all; `opencode.json`
+and `opencode.jsonc` are, and `.jsonc` is read second and wins.
+
+## Launched sessions
+
+`kompressor wrap opencode` adds two things to the command line it runs:
+
+- **`OPENCODE_CONFIG_CONTENT`** holding the overlay above for every provider it
+  routes. It outranks every config file, so nothing on disk can shadow it, and
+  nothing on disk is written. If your shell already sets the variable, it is
+  extended, not replaced.
+- **`--standalone`**, so the session runs a private server that inherits the
+  overlay instead of handing the turn to the background service, which would
+  not see it. `--server URL` is refused for the same reason: that server never
+  sees the overlay either.
+
+```console
+$ kompressor wrap opencode -- run "say hi"
+kompressor: opencode providers through 127.0.0.1:8817: openai, anthropic, opencode, opencode-go
+kompressor: proxy on 127.0.0.1:8817 (mode recoverable), log …
+```
+
+`--print` prints the variable, shell-quoted, for `eval`, and reminds you to
+pass `--standalone` yourself.
+
+## Desktop and the background service
+
+```bash
+kompressor wrap opencode --attach
+```
+
+This writes the same overlay into the **global** `opencode.json`
+(`$XDG_CONFIG_HOME/opencode/`, or `opencode.jsonc` when that exists, because it
+wins), then runs `opencode reload`. Measured: the running service sent its next
+request to the new URL with no restart, so a Desktop window or TUI that is
+already open is covered from that moment. Ctrl-C (or SIGTERM) puts the file
+back and reloads again.
+
+The edit follows the same rules as the Claude Code and Codex ones:
+
+- The file is restored **byte for byte** when nothing else changed in it. Edits
+  you make during the session survive, and a value of ours that you repointed
+  yourself is left as you set it.
+- Two attached sessions share the file; the last one out restores what was
+  there before the first arrived.
+- A session killed with SIGKILL leaves the file pointing at a dead proxy.
+  `kompressor unwrap opencode` restores it and reloads the service.
+- A file with comments or trailing commas is **refused**, not rewritten:
+  rewriting it would lose them. Plain `kompressor wrap opencode` writes no file
+  and has no such limit.
+
+## Providers
+
+| opencode provider | Base URL written                     | Proxy mount                | Upstream              |
+| ----------------- | ------------------------------------ | -------------------------- | --------------------- |
+| `openai`          | `http://127.0.0.1:PORT/v1`           | `/v1` (`openai`)           | api.openai.com        |
+| `anthropic`       | `http://127.0.0.1:PORT/v1`           | `/v1/messages` (`anthropic`) | api.anthropic.com   |
+| `opencode` (Zen)  | `http://127.0.0.1:PORT/zen/v1`       | `/zen` (`opencode-zen`)    | opencode.ai/zen/v1    |
+| `opencode-go`     | `http://127.0.0.1:PORT/zen/go/v1`    | `/zen` (`opencode-zen`)    | opencode.ai/zen/go/v1 |
+
+One `/zen` mount serves both tiers and every wire shape behind them. The wire
+family is read off the path's tail, so Chat Completions, Responses and Messages
+requests to Zen are each walked by the right parser. opencode's
+`x-opencode-session` header is forwarded with the rest, which matters: the
+relay answers `400 MissingSessionID` without it.
+
+**`openai` is pinned to HTTP.** Left alone, opencode opens a WebSocket for the
+main turn of an OpenAI model. The proxy relays and compresses it, but a relayed
+turn reports no usage and runs no retrieve loop. The overlay sets
+`providers.openai.settings.transport = "http"`, after which the same turn
+reported its prompt tokens. A transport you set yourself is kept.
+
+**A provider you routed is yours.** A `baseURL` already set for a provider, in
+any config file opencode would read for that directory or in
+`OPENCODE_CONFIG_CONTENT`, is left alone, and `wrap` says so:
+
+```console
+kompressor: opencode provider anthropic left on its own baseURL (https://gw.example/v1); it is not compressed
+```
+
+Overriding it would send your gateway's key to the vendor's host. Providers not
+in the table (Bedrock, OpenRouter, a custom `@ai-sdk/openai-compatible` entry)
+are not routed; add a `[[proxy.upstreams]]` mount for them, point their own
+`baseURL` at it, and run `kompressor serve`.
+
+**Upstreams.** A `wrap` that starts its own proxy mounts all three. A `wrap`
+that adopts one already running — the packaged service, say — uses that
+proxy's mounts, so it needs the `opencode-zen` mount the packaged configs now
+carry. A config written before it routes `openai` and `anthropic` and 404s
+Zen and Go.
+
+## Measuring it
+
+`scripts/kompressor-sweep/opencode.sh` is the opencode third of the live sweep,
+beside `codex.sh` and `claude.sh`, with the same stages and verdicts:
+
+```bash
+scripts/kompressor-sweep/opencode.sh all
+OPENCODE_SWEEP_MODEL=anthropic/claude-haiku-4-5 scripts/kompressor-sweep/opencode.sh sweep
+```
+
+Every session goes through `kompressor wrap opencode`, so the stages test the
+wrap as well as the engine. opencode runs from a home of the sweep's own,
+`$WORK/opencode-home`: your MCP servers, plugins and instructions stay out of
+the measured prompt, its sessions stay out of your history, and the
+background service your TUI and Desktop share is never touched. Only the
+login is borrowed — opencode 2.x keeps it in the `credential` table of
+`opencode.db`, not in `auth.json`, so the sweep copies those rows (and nothing
+else) on every run.
+
+opencode cuts a tool result at 2,000 lines or 51,200 bytes and sends the model
+the head; the sweep's own config raises `tool_output` so the proxy sees each
+fixture whole, and a run where opencode still cut one is VOID.
+
+## Known limits
+
+- **Retrieval tools as MCP.** `wrap claude` hands Claude Code the retrieve tool
+  as an MCP server for the session. opencode gets the in-band tool the proxy
+  injects into every request, which covers HTTP turns; a WebSocket turn (an
+  `openai` model with `transport` set back to `websocket`) has none.
+- **The `--attach` overlay is global.** Every opencode session served by the
+  background service goes through the proxy while it is attached, not only the
+  one you meant.
+- **Desktop's bundled CLI** is a different version from the one on your PATH.
+  The overlay keys were checked on both; a future release could rename them.
+- **ChatGPT-plan `openai`** (opencode's OAuth login for OpenAI) was not
+  measured. The `/v1` mount follows a ChatGPT credential to chatgpt.com, as it
+  does for Codex.
+
+## Troubleshooting
+
+**`Model unavailable: openai/…`** — `OPENAI_BASE_URL` or `ANTHROPIC_BASE_URL`
+is set in the environment opencode runs in. Unset it.
+
+**Nothing reached the proxy** (`wrap` ends with `0 requests`) — the session
+was served by the background service. Use the plain wrap, which runs
+`--standalone`, or `--attach`, which reloads the service.
+
+**`401 … api_key_expired`, `Go requires a credential`** — the provider refused
+your login; the proxy forwarded it as it should. Sign in again in opencode
+(`opencode auth login`, or `/connect` in the TUI).
+
+**`Free usage limit reached`** — the free Zen models are exhausted for this
+login; pick a model on a provider you pay for.
+
+**Desktop still talks to the provider directly** — check that the edit landed
+(`opencode.json` in your config directory names `127.0.0.1`) and run
+`opencode reload`. A service started before the edit by a different user, or
+with `OPENCODE_CONFIG_CONTENT` of its own, keeps its own view.

@@ -2854,7 +2854,7 @@ Dockerfile exist and are run by hand.
 
 ## 19. Status
 
-Built and passing: ten crates, **1,157 tests**, clippy and rustfmt clean. Measured
+Built and passing: ten crates, **1,330 tests**, clippy and rustfmt clean. Measured
 numbers and the current gap list are in the README; what is *not* built is
 recorded there too rather than left to be discovered.
 
