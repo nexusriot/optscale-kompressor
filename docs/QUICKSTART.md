@@ -652,13 +652,23 @@ three places, first match wins:
 | 3 | `$XDG_CONFIG_HOME/kompressor/config.toml`, or `~/.config/kompressor/config.toml` when that variable is unset |
 
 `/etc/kompressor/config.toml` appears nowhere in that list: the service reads it
-only because the unit passes `--config` explicitly. So a bare `kompressor stats`
-run by a human does not find the system config. Worse, if you also have a user
-config it finds *that* one and answers from the wrong store without saying so:
+only because the unit passes `--config` explicitly. `kompressor stats` is the
+one command that looks there too, and only when the search path found nothing.
+If you also have a user config it finds *that* one, and when its store exists
+it answers from the wrong store without saying so:
 
 ```bash
 $ kompressor stats summary      # with a user config present
 requests   6                    # your own store, not /var/lib/kompressor
+```
+
+A user config whose store does *not* exist (left over from running the service
+by hand before installing the package) gives way to the system one, and says so
+on stderr:
+
+```text
+kompressor: ~/.config/kompressor/config.toml names ~/.local/share/kompressor/stats.db,
+which does not exist; reading /var/lib/kompressor/stats.db from /etc/kompressor/config.toml instead.
 ```
 
 Three ways to ask the right one:
