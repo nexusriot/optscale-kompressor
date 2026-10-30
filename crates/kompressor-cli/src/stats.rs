@@ -6,7 +6,7 @@
 //! caller shown only gross is being shown a number this workspace knows to be
 //! wrong, so the table form never prints one without the other.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use kompressor_core::Config;
 use kompressor_stats::{Bucket, BucketRow, RetrievalSummary, StatsReader, Summary, TypeCoverage};
@@ -80,6 +80,78 @@ fn unreadable(path: &std::path::Path, because: &str) -> CliError {
     ))
 }
 
+/// The configuration `stats` took its database from.
+struct Chosen {
+    config: Config,
+    /// The file it was read from; `None` is the built-in defaults.
+    from: Option<PathBuf>,
+    /// Set when this is not the configuration the search path found first.
+    note: Option<String>,
+}
+
+/// Pick the configuration whose stats path to read.
+///
+/// `--config` is taken literally. Otherwise the search path wins, and
+/// `/etc/kompressor/config.toml` is read only when it found nothing — except
+/// when what it found names a database that does not exist while the system
+/// file names one that does. That is a per-user config left over from running
+/// the service by hand, after it moved to the package: it shadowed the live
+/// database with a missing one, and the failure surfaced as a permission
+/// problem on a file nobody had asked about.
+fn choose_config(
+    explicit: Option<PathBuf>,
+    discovered: Option<PathBuf>,
+    system: Option<PathBuf>,
+) -> Result<Chosen, CliError> {
+    let load = |path: Option<&Path>| Config::load(path).map_err(|e| CliError::Usage(e.to_string()));
+    let chosen = |config, from| Chosen {
+        config,
+        from,
+        note: None,
+    };
+    if let Some(path) = explicit {
+        return Ok(chosen(load(Some(&path))?, Some(path)));
+    }
+    let Some(found) = discovered else {
+        return Ok(chosen(load(system.as_deref())?, system));
+    };
+    let config = load(Some(&found))?;
+    if config.stats.path.exists() {
+        return Ok(chosen(config, Some(found)));
+    }
+    // A system file that does not parse is not this command's problem to
+    // report: the search path's answer stands, and so does its error.
+    if let Some(system) = system.filter(|system| *system != found)
+        && let Ok(fallback) = load(Some(&system))
+        && fallback.stats.path.exists()
+    {
+        let note = format!(
+            "{} names {}, which does not exist; reading {} from {} instead. \
+             Remove the stale file, or pass --config to choose.",
+            found.display(),
+            config.stats.path.display(),
+            fallback.stats.path.display(),
+            system.display(),
+        );
+        return Ok(Chosen {
+            config: fallback,
+            from: Some(system),
+            note: Some(note),
+        });
+    }
+    Ok(chosen(config, Some(found)))
+}
+
+/// Say which configuration named the path, so a stale one can be found.
+fn named_by(error: CliError, config: Option<&Path>) -> CliError {
+    match (error, config) {
+        (CliError::Runtime(message), Some(config)) => {
+            CliError::Runtime(format!("{message} (stats.path from {})", config.display()))
+        }
+        (error, _) => error,
+    }
+}
+
 /// Where the running service answers, if this configuration starts one.
 ///
 /// The API is nested under `/v1`, which is worth knowing: a request to
@@ -110,7 +182,13 @@ struct Types {
 /// owns it when it cannot.
 enum Source {
     Local(StatsReader),
-    Remote(String),
+    /// The service's API base, and why the file was not read. The reason is
+    /// kept because a report the service does not serve has nothing else to
+    /// say: guessing at it sent a missing file off to be chowned.
+    Remote {
+        base: String,
+        local: CliError,
+    },
 }
 
 impl Source {
@@ -165,7 +243,9 @@ impl Source {
             Source::Local(r) => r
                 .summary(tenant, from, to)
                 .map_err(|e| CliError::runtime("reading the summary", e)),
-            Source::Remote(base) => Self::fetch(base, "summary", &Self::window(tenant, from, to)),
+            Source::Remote { base, .. } => {
+                Self::fetch(base, "summary", &Self::window(tenant, from, to))
+            }
         }
     }
 
@@ -180,7 +260,7 @@ impl Source {
             Source::Local(r) => r
                 .histogram(tenant, from, to, bucket)
                 .map_err(|e| CliError::runtime("reading the histogram", e)),
-            Source::Remote(base) => {
+            Source::Remote { base, .. } => {
                 let mut q = Self::window(tenant, from, to);
                 q.push((
                     "bucket",
@@ -204,7 +284,7 @@ impl Source {
                 .map_err(|e| CliError::runtime("reading type coverage", e)),
             // The endpoint wraps its rows in `{"types": [...]}`; the reader
             // returns the rows. Unwrap so both hand the printing the same thing.
-            Source::Remote(base) => {
+            Source::Remote { base, .. } => {
                 Self::fetch::<Types>(base, "by_type", &Self::window(tenant, from, to))
                     .map(|t| t.types)
             }
@@ -216,7 +296,7 @@ impl Source {
             Source::Local(r) => r
                 .retrievals(tenant, from, to)
                 .map_err(|e| CliError::runtime("reading retrievals", e)),
-            Source::Remote(base) => {
+            Source::Remote { base, .. } => {
                 Self::fetch(base, "retrievals", &Self::window(tenant, from, to))
             }
         }
@@ -230,10 +310,10 @@ impl Source {
     fn only_local(&self, report: &str) -> Result<&StatsReader, CliError> {
         match self {
             Source::Local(r) => Ok(r),
-            Source::Remote(base) => Err(CliError::Runtime(format!(
+            Source::Remote { base, local } => Err(CliError::Runtime(format!(
                 "{report} is not served over HTTP, and the local database could not be \
-                 read. Run it as the user that owns the file, or use a report the \
-                 service does expose: summary, histogram, by-type, retrievals ({base})."
+                 read: {local}\nThe reports the service does expose are summary, \
+                 histogram, by-type and retrievals ({base})."
             ))),
         }
     }
@@ -263,6 +343,7 @@ pub fn stats(args: StatsArgs) -> CliResult {
     // The configuration is kept, not just its stats path: when the file cannot
     // be read, `server.listen` is what makes the running service reachable
     // instead.
+    let mut origin = None;
     let (path, listen) = match args.stats_path {
         // An explicitly named file is taken literally. Falling back to a
         // service for a path the caller chose would answer a different question
@@ -279,20 +360,22 @@ pub fn stats(args: StatsArgs) -> CliResult {
             // Only this command looks there, and only when nothing nearer was
             // found. Putting it in `Config::discover` instead made six hermetic
             // CLI tests change their output the moment that file existed.
-            let explicit = args.config.clone().or_else(|| {
-                Config::discover()
-                    .is_none()
-                    .then(Config::system_path)
-                    .flatten()
-            });
-            let config =
-                Config::load(explicit.as_deref()).map_err(|e| CliError::Usage(e.to_string()))?;
-            let listen = api_base(&config);
-            (config.stats.path, listen)
+            let chosen = choose_config(
+                args.config.clone(),
+                Config::discover(),
+                Config::system_path(),
+            )?;
+            if let Some(note) = &chosen.note {
+                eprintln!("kompressor: {note}");
+            }
+            let listen = api_base(&chosen.config);
+            let path = chosen.config.stats.path;
+            origin = chosen.from;
+            (path, listen)
         }
     };
 
-    let source = match open_local(&path) {
+    let source = match open_local(&path).map_err(|e| named_by(e, origin.as_deref())) {
         Ok(reader) => Source::Local(reader),
         Err(local) => match listen {
             // A packaged install puts the database under the service's state
@@ -301,7 +384,7 @@ pub fn stats(args: StatsArgs) -> CliResult {
             // refused with "attempt to write a readonly database" even when the
             // file itself is world-readable. The process that owns it serves the
             // same reports over HTTP; ask that instead of explaining chmod.
-            Some(base) => Source::Remote(base),
+            Some(base) => Source::Remote { base, local },
             None => return Err(local),
         },
     };
@@ -637,6 +720,99 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A config file naming `db` as its stats path, and whether `db` exists.
+    fn config_naming(dir: &Path, name: &str, db: &str, exists: bool) -> PathBuf {
+        let db = dir.join(db);
+        if exists {
+            std::fs::write(&db, b"").unwrap();
+        }
+        let path = dir.join(name);
+        std::fs::write(
+            &path,
+            format!("[stats]\npath = {:?}\n", db.to_str().unwrap()),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn a_found_config_naming_a_missing_database_gives_way_to_the_system_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = config_naming(dir.path(), "user.toml", "gone.db", false);
+        let system = config_naming(dir.path(), "system.toml", "live.db", true);
+        let chosen = choose_config(None, Some(user.clone()), Some(system.clone())).unwrap();
+        assert_eq!(chosen.config.stats.path, dir.path().join("live.db"));
+        assert_eq!(chosen.from.as_deref(), Some(system.as_path()));
+        let note = chosen.note.expect("the switch is announced");
+        assert!(note.contains(user.to_str().unwrap()), "{note}");
+        assert!(note.contains("gone.db"), "{note}");
+    }
+
+    #[test]
+    fn a_found_config_naming_a_live_database_keeps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = config_naming(dir.path(), "user.toml", "mine.db", true);
+        let system = config_naming(dir.path(), "system.toml", "live.db", true);
+        let chosen = choose_config(None, Some(user.clone()), Some(system)).unwrap();
+        assert_eq!(chosen.config.stats.path, dir.path().join("mine.db"));
+        assert_eq!(chosen.from.as_deref(), Some(user.as_path()));
+        assert!(chosen.note.is_none());
+    }
+
+    #[test]
+    fn an_explicit_config_is_taken_literally_even_when_its_database_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let named = config_naming(dir.path(), "named.toml", "gone.db", false);
+        let system = config_naming(dir.path(), "system.toml", "live.db", true);
+        let chosen = choose_config(Some(named), None, Some(system)).unwrap();
+        assert_eq!(chosen.config.stats.path, dir.path().join("gone.db"));
+        assert!(chosen.note.is_none());
+    }
+
+    #[test]
+    fn with_no_live_database_anywhere_the_found_config_stands() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = config_naming(dir.path(), "user.toml", "gone.db", false);
+        let system = config_naming(dir.path(), "system.toml", "also-gone.db", false);
+        let chosen = choose_config(None, Some(user.clone()), Some(system)).unwrap();
+        assert_eq!(chosen.from.as_deref(), Some(user.as_path()));
+        assert!(chosen.note.is_none());
+    }
+
+    #[test]
+    fn nothing_found_reads_the_system_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let system = config_naming(dir.path(), "system.toml", "live.db", true);
+        let chosen = choose_config(None, None, Some(system.clone())).unwrap();
+        assert_eq!(chosen.from.as_deref(), Some(system.as_path()));
+        assert!(chosen.note.is_none());
+    }
+
+    #[test]
+    fn a_report_only_the_file_has_says_why_the_file_was_not_read() {
+        let local = named_by(
+            open_local(Path::new("/nonexistent/stats.db"))
+                .err()
+                .unwrap(),
+            Some(Path::new("/home/someone/.config/kompressor/config.toml")),
+        );
+        let source = Source::Remote {
+            base: "http://127.0.0.1:8817/v1".into(),
+            local,
+        };
+        let message = source
+            .only_local("the HTML report")
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(message.contains("no statistics database"), "{message}");
+        assert!(
+            message.contains("/home/someone/.config/kompressor/config.toml"),
+            "{message}"
+        );
+        assert!(!message.contains("user that owns the file"), "{message}");
+    }
 
     #[test]
     fn an_absent_window_bound_takes_its_default() {
