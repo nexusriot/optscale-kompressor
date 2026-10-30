@@ -18,6 +18,7 @@ program from 1.x in the two ways that matter here, so none of this applies to a
 - [Launched sessions](#launched-sessions)
 - [Desktop and the background service](#desktop-and-the-background-service)
 - [Providers](#providers)
+- [Permanent setup](#permanent-setup)
 - [Measuring it](#measuring-it)
 - [Known limits](#known-limits)
 - [Troubleshooting](#troubleshooting)
@@ -138,6 +139,110 @@ that adopts one already running — the packaged service, say — uses that
 proxy's mounts, so it needs the `opencode-zen` mount the packaged configs now
 carry. A config written before it routes `openai` and `anthropic` and 404s
 Zen and Go.
+
+## Permanent setup
+
+`wrap opencode` is per session: `--attach` edits the config, holds a proxy up
+and puts the file back on exit. To leave compression on for every opencode
+session — Desktop, the TUI, `opencode run` — run kompressor as a service and
+write the opencode side once. Everything served by the background service then
+goes through the proxy, with no terminal left open.
+
+### 1. kompressor, with the Zen mount
+
+Any of the packaged setups works: the `.deb`/`.rpm` (`/etc/kompressor/config.toml`),
+the macOS launch agent, or the systemd user service from
+`scripts/service/install.sh` (`~/.config/kompressor/config.toml`). Configs from
+this release carry every mount opencode needs. One written by an earlier
+release has `openai` (`/v1`) and `anthropic` (`/v1/messages`) but no route for
+OpenCode Zen or Go, which then 404. Check, and add it if it is missing:
+
+```bash
+grep -n 'path_prefix = "/zen"' /etc/kompressor/config.toml   # or your config path
+```
+
+```toml
+[[proxy.upstreams]]
+name = "opencode-zen"
+path_prefix = "/zen"
+base_url = "https://opencode.ai"
+api_family = "auto"
+forward_auth = true
+```
+
+If you only want some providers, the mounts each one needs are in the
+[table above](#providers). Then restart the service (`sudo systemctl restart
+kompressor`, `systemctl --user restart kompressor`, or reload the launch agent),
+and note the port its `[server] listen` names — `8817` below; use yours.
+
+```bash
+curl -s http://127.0.0.1:8817/healthz && echo
+```
+
+### 2. opencode — one block in the global config
+
+Add a `providers` block to `~/.config/opencode/opencode.json` (or
+`opencode.jsonc` if you have one: it is read second and wins). Keep whatever
+else the file holds:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "providers": {
+    "openai":      { "settings": { "baseURL": "http://127.0.0.1:8817/v1", "transport": "http" } },
+    "anthropic":   { "settings": { "baseURL": "http://127.0.0.1:8817/v1" } },
+    "opencode":    { "settings": { "baseURL": "http://127.0.0.1:8817/zen/v1" } },
+    "opencode-go": { "settings": { "baseURL": "http://127.0.0.1:8817/zen/go/v1" } }
+  }
+}
+```
+
+- Leave out a provider you do not use, and leave out one you route to a gateway
+  of your own: a `baseURL` here replaces it, and your gateway key would then go
+  to the vendor's host.
+- `"transport": "http"` is what makes OpenAI turns measurable and recoverable;
+  see [Providers](#providers). Leave it out to keep the WebSocket.
+- `providers.<id>.settings` is the 2.x spelling. If the file already has a
+  1.x `provider.<id>.options.baseURL`, this one wins; remove the old one to
+  avoid confusion.
+
+### 3. Apply it
+
+```bash
+opencode reload
+```
+
+The running service re-reads the file; an open Desktop window is covered from
+its next request. If no service is running, nothing needs doing — the next one
+to start (Desktop, or a TUI) reads the file. Quitting and reopening Desktop
+also works.
+
+### Verify it is working
+
+Send a message from Desktop, then ask the service's statistics what arrived:
+
+```bash
+kompressor stats summary --stats /var/lib/kompressor/stats.db   # the [stats] path of your config
+```
+
+A request count of zero means opencode is not using the proxy — see
+[Troubleshooting](#troubleshooting). `kompressor stats by-provider` shows which
+mount each request took (`opencode-zen`, `openai`, `anthropic`).
+
+### Turning it off
+
+Remove the `providers` entries you added and run `opencode reload`. If the
+service is stopped while opencode still points at it, every turn fails with a
+connection error rather than falling back to the provider — stop the service
+only after removing the block.
+
+### Permanent setup and `wrap`
+
+They can coexist. `kompressor wrap opencode` (launched sessions) ignores a
+`baseURL` pointing at a kompressor proxy on 127.0.0.1 and routes the session
+through its own overlay; a permanent block pointing elsewhere — another host,
+another path — is treated as yours and left alone. `--attach` on top of a
+permanent setup is not needed and only repoints the file for its own session.
 
 ## Measuring it
 
