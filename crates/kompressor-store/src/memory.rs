@@ -122,12 +122,23 @@ impl RefStore for MemoryRefStore {
         refs: &[(RefId, String)],
         meta: &PutMeta,
     ) -> Result<(), StoreError> {
+        self.put_many_created(tenant, refs, meta).map(|_| ())
+    }
+
+    fn put_many_created(
+        &self,
+        tenant: &Tenant,
+        refs: &[(RefId, String)],
+        meta: &PutMeta,
+    ) -> Result<Option<Vec<u64>>, StoreError> {
         let now = self.clock.now();
         let mut entries = self.entries.lock();
+        let mut created = Vec::with_capacity(refs.len());
         for (id, fragment) in refs {
             let key = (tenant.0.clone(), *id);
             match entries.get_mut(&key) {
                 Some(existing) => {
+                    created.push(existing.record.created_at);
                     existing.record.fragment.clear();
                     existing.record.fragment.push_str(fragment);
                     existing.record.kind = meta.kind.as_str().to_owned();
@@ -142,6 +153,7 @@ impl RefStore for MemoryRefStore {
                     }
                 }
                 None => {
+                    created.push(now);
                     entries.insert(
                         key,
                         Entry {
@@ -161,7 +173,7 @@ impl RefStore for MemoryRefStore {
             }
         }
         self.enforce_byte_cap(&mut entries, now);
-        Ok(())
+        Ok(Some(created))
     }
 
     fn get(&self, tenant: &Tenant, id: &RefId, touch: bool) -> Result<Lookup, StoreError> {

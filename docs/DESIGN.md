@@ -374,7 +374,7 @@ impl Engine {
 }
 ```
 
-`Message` is the engine's neutral shape: `{ role: String, content: MessageContent::{Text(String) | Blocks(Vec<TextSlot>) | Opaque}, meta: MessageMeta { cache_control: bool, protected: bool, tool_name, file_path, extra: serde_json::Map } }`. `TextSlot` is the key enabling the proxy: a list of independently compressible text spans inside a block-structured message (each Anthropic `tool_result` text block or OpenAI content part is a slot), so `compress_messages` works for block content too — a gateway that can only see whole string bodies compresses none of it.
+`Message` is the engine's neutral shape: `{ role: String, content: MessageContent::{Text(String) | Blocks(Vec<TextSlot>) | Opaque}, meta: MessageMeta { cache_control: bool, protected: bool, tool_name, file_path, tool_error, extra: serde_json::Map } }`. `TextSlot` is the key enabling the proxy: a list of independently compressible text spans inside a block-structured message (each Anthropic `tool_result` text block or OpenAI content part is a slot), so `compress_messages` works for block content too — a gateway that can only see whole string bodies compresses none of it.
 
 ### 4.7 Stats returned by the engine
 
@@ -511,7 +511,7 @@ Grammar loading is a one-time `LazyLock` per language; no warm-up spike beyond f
 
 ### 5.12 Read lifecycle (`engine::read_lifecycle`)
 
-`classify_reads(&[Message], frozen: usize) -> BTreeMap<usize, ReadState>` (§5.15 step 4): a message whose tool is `read|read_file` and whose path a *later* `edit|write|write_file|apply_patch` targets is `STALE`; paths are normalized before comparison, and reads inside the frozen prefix or marked protected stay `FRESH`. A `SUPERSEDED` state — eliding a read that a *later read of the same file* replaces — is deliberately not implemented: it rewrites content further back in the history and busts prompt caches for a saving the idle-window store already mostly recovers. The proxy populates `tool_name`/`file_path` from tool-call arguments when it can see them (§12.5), which is what makes this reachable at all: a gateway that forwards message bodies without tool metadata can never trigger it.
+`classify_reads(&[Message], frozen: usize) -> BTreeMap<usize, ReadState>` (§5.15 step 4): a message whose tool is `read|read_file` and whose path a *later* `edit|write|write_file|apply_patch` targets is `STALE`; paths are normalized before comparison (separators, empty and `.` components only: `.env` is not `env`, `../src/a.rs` is not `src/a.rs`, `/etc/x` is not `etc/x`), a write that reported failure — Anthropic's `is_error`, `tool_error`/`is_error` on the message API, or a result whose first line opens with `error`, `<tool_use_error>`, `failed`, `failure`, `fatal` or `apply_patch verification failed` — changed nothing and invalidates nothing, and reads inside the frozen prefix or marked protected stay `FRESH`. A `SUPERSEDED` state — eliding a read that a *later read of the same file* replaces — is deliberately not implemented: it rewrites content further back in the history and busts prompt caches for a saving the idle-window store already mostly recovers. The proxy populates `tool_name`/`file_path` from tool-call arguments when it can see them (§12.5), which is what makes this reachable at all: a gateway that forwards message bodies without tool metadata can never trigger it.
 
 ### 5.13 Token estimator and the guard (`engine::tokens`)
 
@@ -1155,7 +1155,7 @@ CREATE INDEX IF NOT EXISTS refs_expiry ON refs (last_accessed);   -- lazy purge 
 - **Get**: `SELECT fragment, kind, request_id, created_at, last_accessed, ttl_seconds, max_lifetime FROM refs WHERE tenant=? AND ref=?`, liveness computed in Rust so `Expired` can be distinguished from `Miss`. On a live hit with `touch`, an `UPDATE … SET last_accessed=?` runs with the liveness predicate repeated **in SQL** — a touch must not be able to resurrect a row the absolute cap already killed.
 - **Purge**: expiry is decided on read (`Lookup::Expired`), and `purge_expired` deletes in bounded batches of 5,000 via `DELETE FROM refs WHERE (tenant, ref) IN (SELECT … LIMIT ?)` — a `WITHOUT ROWID` table has no `rowid` for the usual bounded-delete idiom. **Nothing schedules it**: `refs.purge_interval` (60 s) is currently a knob with no consumer, so dead rows linger until the size cap reclaims them. That is safe but untidy — reads never return an expired fragment, and expired rows do not count toward the cap.
 - **Size cap**: `refs.max_bytes` (default 1 GiB) is enforced inline on every `put_many`. Live bytes over the cap ⇒ evict by `last_accessed ASC, tenant ASC, ref ASC` down to 90% of the cap. The 90% is so a store parked exactly at the limit does not evict on every write for the rest of its life; the key tie-break is so that which member of a same-second batch dies does not vary run to run.
-- **Recent-write cache** (`store::cache::CachedRefStore`): an in-process write-through cache of the last `refs.recent_cache_entries` (default 4,096) `(tenant, ref) → fragment`, with a 60 s window against an hour-scale TTL. It exists to cover the gap around a *write* — the proxy hands the model a marker and the model may ask for it in the same turn — not to be a second store with its own retention. Reads deliberately do **not** populate it: a record coming back from the inner store does not carry its absolute lifetime, so a cached copy could only guess at the one deadline a read is not allowed to extend.
+- **Recent-write cache** (`store::cache::CachedRefStore`): an in-process write-through cache of the last `refs.recent_cache_entries` (default 4,096) `(tenant, ref) → fragment`, with a 60 s window against an hour-scale TTL. It exists to cover the gap around a *write* — the proxy hands the model a marker and the model may ask for it in the same turn — not to be a second store with its own retention. Reads deliberately do **not** populate it: a record coming back from the inner store does not carry its absolute lifetime, so a cached copy could only guess at the one deadline a read is not allowed to extend. Writes do not guess either: `RefStore::put_many_created` has the inner store report the `created_at` each row kept through the upsert, so a fragment re-stored after it was evicted from the cache keeps its original absolute deadline instead of being cached as created now.
 - Schema versioning via `PRAGMA user_version` and an ordered `MIGRATIONS: &[(u32, &str)]` array, keyed on an **integer**. The usual shortcut — sorting migration filenames as strings — puts `V10_` before `V2_`, so the tenth migration runs first the moment a tenth one exists; keying on an integer and iterating the array cannot express that bug.
 
 ### 8.3 Other backends
@@ -2878,7 +2878,7 @@ Dockerfile exist and are run by hand.
 
 ## 19. Status
 
-Built and passing: ten crates, **1,355 tests**, clippy and rustfmt clean. Measured
+Built and passing: ten crates, **1,371 tests**, clippy and rustfmt clean. Measured
 numbers and the current gap list are in the README; what is *not* built is
 recorded there too rather than left to be discovered.
 

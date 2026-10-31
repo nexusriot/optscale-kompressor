@@ -863,6 +863,20 @@ async fn prepare_inner(
         thaw_the_uncached_tail(&mut walk, held);
     }
 
+    // Recoverable means the model can ask for what was elided. A `tool_choice`
+    // of `"none"`, or one forcing a different tool, takes that away for this
+    // request: it would answer from markers it is not allowed to resolve.
+    if options.mode == kompressor_engine::Mode::Recoverable
+        && proxy.retrieve_tool != RetrieveTool::Never
+        && tool::choice_forbids_retrieval(&value, family)
+    {
+        tracing::debug!(
+            request_id,
+            "tool_choice forbids the retrieve tool; forwarding as it arrived"
+        );
+        return passthrough_with_stable_tools(proxy, options.mode, family, body, stream, model);
+    }
+
     let before = compressible_tokens(&walk);
     if before < proxy.min_tokens {
         tracing::debug!(

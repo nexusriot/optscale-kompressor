@@ -2223,3 +2223,78 @@ async fn a_turn_about_something_else_leaves_the_elision_alone() {
         "and so does not ship the log whole"
     );
 }
+
+/// A recoverable elision is only recoverable if the model may call the tool.
+/// `tool_choice` can forbid that — `"none"`, or a different tool forced — and
+/// a request that cannot fetch anything back is forwarded whole rather than
+/// answered from a marker the model is not allowed to resolve.
+#[tokio::test]
+async fn a_tool_choice_that_forbids_retrieval_leaves_the_content_whole() {
+    let harness = Harness::new().await;
+    answering(&harness).await;
+    let payload = log_payload(400);
+
+    let mut chat_none = chat_body(&payload);
+    chat_none["tool_choice"] = json!("none");
+    let mut chat_forced = chat_body(&payload);
+    chat_forced["tools"] = json!([{"type": "function",
+        "function": {"name": "summarize", "parameters": {"type": "object"}}}]);
+    chat_forced["tool_choice"] = json!({"type": "function", "function": {"name": "summarize"}});
+    harness.post("/v1/chat/completions", &chat_none).await;
+    harness.post("/v1/chat/completions", &chat_forced).await;
+
+    let mut anthropic_none = anthropic_body(&payload);
+    anthropic_none["tool_choice"] = json!({"type": "none"});
+    let mut anthropic_forced = anthropic_body(&payload);
+    anthropic_forced["tool_choice"] = json!({"type": "tool", "name": "summarize"});
+    harness.post("/v1/messages", &anthropic_none).await;
+    harness.post("/v1/messages", &anthropic_forced).await;
+
+    let mut responses_none = responses_body(&payload);
+    responses_none["tool_choice"] = json!("none");
+    harness.post("/v1/responses", &responses_none).await;
+
+    let sent = harness.upstream_json().await;
+    assert_eq!(sent[0]["messages"][3]["content"], payload, "chat, none");
+    assert_eq!(sent[1]["messages"][3]["content"], payload, "chat, forced");
+    assert_eq!(
+        sent[2]["messages"][2]["content"][0]["content"], payload,
+        "anthropic, none"
+    );
+    assert_eq!(
+        sent[3]["messages"][2]["content"][0]["content"], payload,
+        "anthropic, forced"
+    );
+    assert_eq!(sent[4]["input"][2]["output"], payload, "responses, none");
+    for body in &sent {
+        assert!(!without_our_tool(&body.to_string()).contains("ref:k_"));
+    }
+}
+
+/// The choices that leave the retrieve tool callable are compressed as before.
+#[tokio::test]
+async fn a_tool_choice_that_allows_retrieval_is_compressed() {
+    let harness = Harness::new().await;
+    answering(&harness).await;
+    let payload = log_payload(400);
+    for choice in [
+        json!("auto"),
+        json!("required"),
+        json!({"type": "function", "function": {"name": "optscale_kompressor_retrieve"}}),
+    ] {
+        let mut body = chat_body(&payload);
+        body["tool_choice"] = choice;
+        harness.post("/v1/chat/completions", &body).await;
+    }
+    let mut anthropic_any = anthropic_body(&payload);
+    anthropic_any["tool_choice"] = json!({"type": "any"});
+    harness.post("/v1/messages", &anthropic_any).await;
+
+    for body in harness.upstream_json().await {
+        assert!(
+            without_our_tool(&body.to_string()).contains("ref:k_"),
+            "{}",
+            body["tool_choice"]
+        );
+    }
+}
