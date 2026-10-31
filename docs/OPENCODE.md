@@ -206,6 +206,37 @@ else the file holds:
   1.x `provider.<id>.options.baseURL`, this one wins; remove the old one to
   avoid confusion.
 
+### OpenCode Desktop needs 2.2.4 or newer
+
+Desktop runs the background service with **its own bundled CLI**, not the one
+on your PATH, and replaces a service of any other version with it. Desktop
+**2.0.11** bundles CLI 2.0.11, which does not reliably honour
+`providers.<id>.settings.baseURL`: the setting parses and `opencode debug
+config` shows it, but requests go straight to opencode.ai. Measured against a
+recording listener, on Linux:
+
+| Setup (CLI 2.0.11)                                         | Reached the listener |
+| ---------------------------------------------------------- | -------------------- |
+| `opencode-go` block only, no stored login                   | 3                    |
+| same, `opencode-go` login stored                            | 0                    |
+| same, OpenCode account login (`opencode` integration)       | 0, even with `apiKey` set |
+| `opencode-go` and `opencode` blocks, no login               | 0                    |
+
+`OPENCODE_CONFIG_CONTENT` and the 1.x `provider.<id>.options` spelling were
+ignored the same way, and with the listener answering errors 2.0.11 fell back
+to opencode.ai. There is no configuration that routes it dependably, so the
+fix is the version: **CLI 2.2.4 honours the setting with every login above**
+(8 requests reached the listener with the OpenCode account login stored).
+Upgrade Desktop to 2.2.4 or newer — its updater, or the package from
+opencode.ai — and check the version of the service it runs:
+
+```bash
+python3 -c "import json;print(json.load(open('$HOME/.local/state/opencode/service.json'))['version'])"
+```
+
+This applies to `kompressor wrap opencode --attach` too, which reaches Desktop
+through the same service.
+
 ### 3. Apply it
 
 ```bash
@@ -276,8 +307,9 @@ fixture whole, and a run where opencode still cut one is VOID.
 - **The `--attach` overlay is global.** Every opencode session served by the
   background service goes through the proxy while it is attached, not only the
   one you meant.
-- **Desktop's bundled CLI** is a different version from the one on your PATH.
-  The overlay keys were checked on both; a future release could rename them.
+- **Desktop's bundled CLI** is a different version from the one on your PATH,
+  and Desktop 2.0.11's CLI does not reliably honour a provider's `baseURL` — see
+  [OpenCode Desktop needs 2.2.4 or newer](#opencode-desktop-needs-224-or-newer).
 - **ChatGPT-plan `openai`** (opencode's OAuth login for OpenAI) was not
   measured. The `/v1` mount follows a ChatGPT credential to chatgpt.com, as it
   does for Codex.
