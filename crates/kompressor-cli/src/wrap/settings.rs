@@ -166,12 +166,34 @@ impl Drop for Lock {
     }
 }
 
-fn read_json(path: &Path) -> Map<String, Value> {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        .and_then(|value| value.as_object().cloned())
-        .unwrap_or_default()
+/// The settings file as an object; an absent file is an empty one.
+///
+/// Anything else that is not a JSON object is an error, never an empty map.
+/// Treating a file with a trailing comma as empty was how a claim replaced the
+/// user's permissions and hooks with `{"env":{…}}`, and the ownership record
+/// keeps one value, not the file, so nothing could put them back.
+fn read_json(path: &Path) -> Result<Map<String, Value>, CliError> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Map::new()),
+        Err(error) => {
+            return Err(CliError::runtime(
+                &format!("could not read {}", path.display()),
+                error,
+            ));
+        }
+    };
+    match serde_json::from_str::<Value>(&text) {
+        Ok(Value::Object(object)) => Ok(object),
+        Ok(_) => Err(CliError::Runtime(format!(
+            "{} is not a JSON object; fix it and run this again — it was left untouched",
+            path.display()
+        ))),
+        Err(error) => Err(CliError::Runtime(format!(
+            "{} is not valid JSON ({error}); fix it and run this again — it was left untouched",
+            path.display()
+        ))),
+    }
 }
 
 fn write_json(path: &Path, object: &Map<String, Value>) -> Result<(), CliError> {
@@ -230,7 +252,7 @@ pub fn claim(target: &Target, key: &str, value: &str, port: u16) -> Result<bool,
     let owners_path = target.owners_path();
     let mut owners = read_owners(&owners_path);
 
-    let mut settings = read_json(&target.settings);
+    let mut settings = read_json(&target.settings)?;
     let section = settings
         .entry(target.section.to_string())
         .or_insert_with(|| Value::Object(Map::new()));
@@ -303,7 +325,10 @@ pub fn release(target: &Target, key: &str, force: bool) -> Result<Released, CliE
         return Ok(Released::StillInUse);
     }
 
-    let mut settings = read_json(&target.settings);
+    // Read before the ownership record changes: a file that stopped parsing
+    // mid-session keeps its claim, so `unwrap` can finish the job once it is
+    // fixed.
+    let mut settings = read_json(&target.settings)?;
     if let Some(Value::Object(section)) = settings.get_mut(target.section) {
         match &claim.original {
             Some(original) => {
@@ -354,6 +379,7 @@ mod tests {
 
     fn value_at(target: &Target, key: &str) -> Option<String> {
         read_json(&target.settings)
+            .ok()?
             .get(target.section)?
             .get(key)?
             .as_str()
@@ -398,7 +424,7 @@ mod tests {
             value_at(&target, "ANTHROPIC_BASE_URL").as_deref(),
             Some("https://my-gateway.internal")
         );
-        let settings = read_json(&target.settings);
+        let settings = read_json(&target.settings).unwrap();
         assert_eq!(
             settings.get("other").and_then(Value::as_i64),
             Some(1),
@@ -521,5 +547,43 @@ mod tests {
             assert!(path.exists(), "the lock file is the lock");
         }
         assert!(!path.exists(), "and it is gone once dropped");
+    }
+
+    /// A settings file that does not parse is one this command cannot merge
+    /// into, and replacing it with `{"env":{…}}` loses everything else in it
+    /// for good: the ownership record keeps one value, not the file. The claim
+    /// must refuse and leave the bytes exactly as they were.
+    #[test]
+    fn a_settings_file_that_does_not_parse_is_refused_not_replaced() {
+        let scratch = Scratch::new("malformed");
+        let target = scratch.target();
+        std::fs::create_dir_all(target.settings.parent().unwrap()).unwrap();
+        let original = r#"{"permissions":{"deny":["Bash(rm *)"]},}"#;
+        std::fs::write(&target.settings, original).unwrap();
+
+        let error = claim(&target, "ANTHROPIC_BASE_URL", "http://127.0.0.1:8817", 8817)
+            .expect_err("a file that does not parse must not be overwritten");
+        assert!(error.to_string().contains("settings.local.json"), "{error}");
+        assert_eq!(std::fs::read_to_string(&target.settings).unwrap(), original);
+        assert_eq!(
+            release(&target, "ANTHROPIC_BASE_URL", false).unwrap(),
+            Released::NotOurs,
+            "a refused claim records no owner"
+        );
+        assert_eq!(std::fs::read_to_string(&target.settings).unwrap(), original);
+    }
+
+    /// The user broke the file mid-session. Restoring by rewriting it from an
+    /// empty object would delete what they were in the middle of editing.
+    #[test]
+    fn a_release_does_not_rewrite_a_file_that_stopped_parsing() {
+        let scratch = Scratch::new("broken-mid-session");
+        let target = scratch.target();
+        claim(&target, "ANTHROPIC_BASE_URL", "http://127.0.0.1:8817", 8817).unwrap();
+        let edited = r#"{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:8817"},"hooks":{"#;
+        std::fs::write(&target.settings, edited).unwrap();
+
+        assert!(release(&target, "ANTHROPIC_BASE_URL", false).is_err());
+        assert_eq!(std::fs::read_to_string(&target.settings).unwrap(), edited);
     }
 }

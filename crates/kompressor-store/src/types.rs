@@ -290,6 +290,22 @@ pub trait RefStore: Send + Sync {
         meta: &PutMeta,
     ) -> Result<(), StoreError>;
 
+    /// [`Self::put_many`], also reporting the `created_at` each fragment now
+    /// has, in `refs` order — the original one for a re-store.
+    ///
+    /// A cache in front of this store needs it to know a fragment's absolute
+    /// deadline without a read: a re-store of a fragment it had evicted would
+    /// otherwise be cached as created now, and served past the deadline the
+    /// row still enforces. `None` is "not known", which the default answers.
+    fn put_many_created(
+        &self,
+        tenant: &Tenant,
+        refs: &[(RefId, String)],
+        meta: &PutMeta,
+    ) -> Result<Option<Vec<u64>>, StoreError> {
+        self.put_many(tenant, refs, meta).map(|()| None)
+    }
+
     /// Point read scoped by tenant.
     ///
     /// With `touch`, a hit restarts the idle window. Pass `false` for reads

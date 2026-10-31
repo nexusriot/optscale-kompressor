@@ -75,6 +75,7 @@ ON CONFLICT(tenant, ref) DO UPDATE SET
   max_lifetime  = excluded.max_lifetime,
   kind          = excluded.kind,
   request_id    = coalesce(excluded.request_id, refs.request_id)
+RETURNING created_at
 ";
 
 const SQL_GET: &str = "
@@ -320,11 +321,21 @@ impl RefStore for SqliteRefStore {
         refs: &[(RefId, String)],
         meta: &PutMeta,
     ) -> Result<(), StoreError> {
+        self.put_many_created(tenant, refs, meta).map(|_| ())
+    }
+
+    fn put_many_created(
+        &self,
+        tenant: &Tenant,
+        refs: &[(RefId, String)],
+        meta: &PutMeta,
+    ) -> Result<Option<Vec<u64>>, StoreError> {
         if refs.is_empty() {
-            return Ok(());
+            return Ok(Some(Vec::new()));
         }
         let now = self.clock.now();
         let mut conn = self.conn.lock();
+        let mut created = Vec::with_capacity(refs.len());
         {
             // One transaction for the batch: a request's elisions become
             // retrievable together, and fsync cost is paid once rather than per
@@ -333,24 +344,30 @@ impl RefStore for SqliteRefStore {
             {
                 let mut stmt = tx.prepare_cached(SQL_UPSERT)?;
                 for (id, fragment) in refs {
-                    stmt.execute(params![
-                        tenant.as_str(),
-                        id.body(),
-                        fragment.as_bytes(),
-                        fragment.len() as i64,
-                        meta.kind.as_str(),
-                        meta.request_id.as_deref(),
-                        clamp_i64(now),
-                        clamp_i64(now),
-                        clamp_i64(meta.ttl_seconds),
-                        clamp_i64(meta.max_lifetime_seconds),
-                    ])?;
+                    // `RETURNING` reports the row as it stands after the
+                    // upsert, so a re-store answers with its first creation.
+                    let at: i64 = stmt.query_row(
+                        params![
+                            tenant.as_str(),
+                            id.body(),
+                            fragment.as_bytes(),
+                            fragment.len() as i64,
+                            meta.kind.as_str(),
+                            meta.request_id.as_deref(),
+                            clamp_i64(now),
+                            clamp_i64(now),
+                            clamp_i64(meta.ttl_seconds),
+                            clamp_i64(meta.max_lifetime_seconds),
+                        ],
+                        |row| row.get(0),
+                    )?;
+                    created.push(at.max(0) as u64);
                 }
             }
             tx.commit()?;
         }
         self.enforce_byte_cap(&mut conn, now)?;
-        Ok(())
+        Ok(Some(created))
     }
 
     fn get(&self, tenant: &Tenant, id: &RefId, touch: bool) -> Result<Lookup, StoreError> {
@@ -701,7 +718,7 @@ mod tests {
         let id = ref_for("whatever");
         {
             let conn = store.conn.lock();
-            conn.execute(
+            conn.query_row(
                 SQL_UPSERT,
                 params![
                     tenant.as_str(),
@@ -715,6 +732,7 @@ mod tests {
                     i64::MAX / 4,
                     i64::MAX / 4,
                 ],
+                |_| Ok(()),
             )
             .unwrap();
         }
