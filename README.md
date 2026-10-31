@@ -191,6 +191,24 @@ on by default since 0.14.0. Relayed turns report no provider usage, so their
 savings are real but unmeasured; `KOMPRESSOR__PROXY__WEBSOCKET_RELAY=false` trades
 that coverage back for the numbers.
 
+### opencode — the TUI and OpenCode Desktop
+
+```bash
+kompressor wrap opencode                   # a TUI or `run` session of its own
+kompressor wrap opencode --attach          # Desktop, and every session on the background service
+```
+
+opencode 2.x is pointed at the proxy through its own configuration, never a
+variable: `OPENAI_BASE_URL` in its environment makes every OpenAI model
+"unavailable" (measured on 2.2.4). A launched session gets the overlay in
+`OPENCODE_CONFIG_CONTENT` and runs `--standalone`, because the shared background
+service that otherwise makes the model calls never sees our environment.
+Desktop uses that service, so `--attach` writes the overlay into the global
+`opencode.json`, runs `opencode reload`, and puts the file back on exit. Both
+route the built-in `openai`, `anthropic`, OpenCode Zen and OpenCode Go
+providers, and leave alone any provider whose `baseURL` you set yourself.
+Details: [docs/OPENCODE.md](docs/OPENCODE.md).
+
 ### Other agents
 
 ```bash
@@ -453,7 +471,7 @@ Good first issues are labelled
 | `make harbor-gates` | every live-agent benchmark gate, with no provider spend                                        |
 
 
-`cargo test --workspace` runs **1,157 tests** across ten crates; clippy and rustfmt
+`cargo test --workspace` runs **1,335 tests** across ten crates; clippy and rustfmt
 are clean. `make bench-save` and `make golden` move what the tests compare against,
 so both ask before they run.
 

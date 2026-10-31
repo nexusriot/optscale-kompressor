@@ -46,9 +46,12 @@ and the entries below differ:
   single `openai_base_url` override. `wrap` reads the mode from codex's own
   `auth.json`; `kompressor unwrap codex` removes a block left behind by a
   session that was killed. [CODEX.md](CODEX.md) has the details.
-- **opencode** reads it only for its built-in `openai` provider. A provider
-  declared in `opencode.json` carries its own `options.baseURL`, and config
-  beats environment — so point that provider at the proxy instead.
+- **opencode** (2.x) must not get the variable at all: `OPENAI_BASE_URL` in its
+  environment makes every OpenAI model "unavailable" (measured on 2.2.4). It is
+  wrapped through its configuration instead — `OPENCODE_CONFIG_CONTENT` plus
+  `--standalone` for a launched session, the global `opencode.json` and an
+  `opencode reload` for `--attach`, which is how OpenCode Desktop is reached.
+  [OPENCODE.md](OPENCODE.md) has the details.
 - **claude** reads it and routes correctly, but pins its whole prompt with a
   `cache_control` breakpoint, so a wrapped session compresses nothing by design.
   [CLAUDE-CODE.md](CLAUDE-CODE.md) explains why that is the right outcome.
@@ -65,7 +68,7 @@ Agents kompressor wrap knows:
   cursor        Cursor (GUI editor; base URL set by hand in Settings)
   claude        Claude Code (Anthropic Messages)
   codex         OpenAI Codex CLI (OpenAI Responses), via its config file
-  opencode      opencode (OpenAI Chat; only for its built-in `openai` provider)
+  opencode      opencode CLI/TUI and Desktop (openai, anthropic, OpenCode Zen and Go), via its config
   aider         aider (OpenAI Chat or Anthropic Messages, by model)
 
 Anything else: kompressor wrap --env NAME=root|v1 -- <command> [args]
