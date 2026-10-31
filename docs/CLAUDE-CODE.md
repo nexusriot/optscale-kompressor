@@ -451,7 +451,7 @@ With `proxy.cache_keep_warm = true`, after a response that stopped on
 `tool_use` the proxy re-sends that request with `max_tokens: 1` every 270
 seconds until Claude Code's next request arrives, at most 11 times; after an
 `end_turn` while a background task or `Monitor` watch Claude Code started is
-still running, also at most 11 times (`proxy.cache_keep_warm_background_pings`,
+still running, or a `ScheduleWakeup` wake is still to come, also at most 11 times (`proxy.cache_keep_warm_background_pings`,
 0 to turn that off).
 Each ping costs the conversation at the cache-read price plus one output token,
 and is recorded as its own `proxy_requests` row with `keep_warm = 1`. Simulated

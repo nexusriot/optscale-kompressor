@@ -26,7 +26,8 @@
 //! background task running — one Claude Code reported starting ("running in
 //! background with ID: …", "moved to the background (ID: …)", or a `Monitor`
 //! watch, "Monitor started (task …") and has not yet reported on
-//! (`<task-id>…</task-id>` in its notification). The model is
+//! (`<task-id>…</task-id>` in its notification), or while a wake the model set
+//! with `ScheduleWakeup` has not yet been delivered. The model is
 //! woken when the job ends, so the client will most likely be back; but an
 //! agent can also give its final answer with a job still running, and then no
 //! request ever comes. Those waits get their own cap,
@@ -170,8 +171,22 @@ const BACKGROUND_STARTED: &[&str] = &[
 /// the task ended: completed, failed or stopped.
 const BACKGROUND_REPORTED: (&str, &str) = ("<task-id>", "</task-id>");
 
+/// What Claude Code's `ScheduleWakeup` tool answers when it sets a wake, and
+/// what the prompt that wake delivers says. A wake has no id: one is pending
+/// when the last set comes after the last delivered, unless the model called
+/// the tool with `stop` since.
+///
+/// It is a background wait without a task: the model ends its turn and the
+/// client comes back when the wake fires. Measured on the 89-task run of
+/// 2026-10-31 (`10-06-33`): crack-7z-hash detached its cracker, let its last
+/// `Monitor` watch expire, set a 1200 s wake and ended its turn with no task
+/// left unreported; the wake came 897 s later with no ping sent, and 40,104
+/// tokens were written again at the one-hour price.
+const WAKE_SCHEDULED: &str = "Next wakeup scheduled for ";
+const WAKE_DELIVERED: &str = "You scheduled this tick via the ScheduleWakeup tool";
+
 /// Whether the conversation in `body` has a background task it started and
-/// has not been told the end of.
+/// has not been told the end of, or a `ScheduleWakeup` wake still to come.
 ///
 /// Read from the request, not the response: a task the response started is
 /// one the client has not yet run, and a notification can only arrive in a
@@ -180,13 +195,21 @@ const BACKGROUND_REPORTED: (&str, &str) = ("<task-id>", "</task-id>");
 pub(crate) fn background_task_running(body: &Value) -> bool {
     let mut started = Vec::new();
     let mut reported = Vec::new();
+    let mut wake_pending = false;
     for message in body
         .get("messages")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
     {
+        if wake_stopped(message.get("content")) {
+            wake_pending = false;
+        }
         texts(message.get("content"), &mut |text| {
+            let (set, delivered) = (text.rfind(WAKE_SCHEDULED), text.rfind(WAKE_DELIVERED));
+            if set.is_some() || delivered.is_some() {
+                wake_pending = set > delivered;
+            }
             for marker in BACKGROUND_STARTED {
                 started.extend(ids_after(text, marker));
             }
@@ -200,7 +223,18 @@ pub(crate) fn background_task_running(body: &Value) -> bool {
             }
         });
     }
-    started.iter().any(|id| !reported.contains(id))
+    wake_pending || started.iter().any(|id| !reported.contains(id))
+}
+
+/// Whether `content` has a `ScheduleWakeup` call that ends the loop.
+fn wake_stopped(content: Option<&Value>) -> bool {
+    content.and_then(Value::as_array).is_some_and(|blocks| {
+        blocks.iter().any(|block| {
+            block.get("type").and_then(Value::as_str) == Some("tool_use")
+                && block.get("name").and_then(Value::as_str) == Some("ScheduleWakeup")
+                && block.pointer("/input/stop").and_then(Value::as_bool) == Some(true)
+        })
+    })
 }
 
 /// Every task id that follows `marker` in `text`.
@@ -537,6 +571,42 @@ mod tests {
         reported.push(json!({"role": "user", "content":
             "<system-reminder>\n<task-notification>\n<task-id>b166z0pbd</task-id>\n<summary>Monitor event: \"parameter search completion\"</summary>"}));
         assert!(!background_task_running(&with_messages(json!(reported))));
+    }
+
+    #[test]
+    fn a_scheduled_wake_is_a_wait_until_it_is_delivered_or_stopped() {
+        let scheduled = json!([
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "ScheduleWakeup",
+                "input": {"delaySeconds": 1200, "prompt": "<<autonomous-loop-dynamic>>", "reason": "fallback heartbeat"}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1",
+                "content": "Next wakeup scheduled for 09:59:00 (in 1202s). If you owe the user a status update this tick, write it now as ordinary response text; then end the turn."}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "Waiting."}]},
+        ]);
+        assert!(background_task_running(&with_messages(scheduled.clone())));
+
+        let mut delivered = scheduled.as_array().unwrap().clone();
+        delivered.push(json!({"role": "user", "content": [{"type": "text", "text":
+            "# Autonomous loop tick (dynamic pacing)\n\nYou scheduled this tick via the ScheduleWakeup tool (not a recurring cron)."}]}));
+        assert!(!background_task_running(&with_messages(json!(
+            delivered.clone()
+        ))));
+
+        let mut set_again = delivered.clone();
+        set_again.push(scheduled[1].clone());
+        assert!(background_task_running(&with_messages(json!(
+            set_again.clone()
+        ))));
+
+        let mut stopped = set_again;
+        stopped.push(
+            json!({"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_2",
+            "name": "ScheduleWakeup", "input": {"stop": true}}]}),
+        );
+        stopped.push(
+            json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_2",
+            "content": "Loop stopped."}]}),
+        );
+        assert!(!background_task_running(&with_messages(json!(stopped))));
     }
 
     #[test]
