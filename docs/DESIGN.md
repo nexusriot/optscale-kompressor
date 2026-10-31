@@ -1325,9 +1325,22 @@ prefix answers 404 rather than an empty report — an empty report would read as
 | `GET /v1/stats/retrievals?…` | hit/miss/expired counts, ranged share, top refs by retrieval count |
 | `GET /v1/stats/requests?request_id=` | one request's economy row plus its events |
 | `GET /v1/stats/store` | live refs/bytes, oldest, purge counters |
+| `GET /v1/stats/live?window&recent&tenant&format&refresh` | a live snapshot ending now: totals, 1m/5m/15m rates, a timeline, upstream status/cache/latency percentiles, by provider/model/type, skip reasons, retrievals, the latest requests, and process info (version, uptime, dropped events). JSON, or a self-refreshing HTML dashboard for `?format=html` or a browser's `Accept` |
 | `GET /metrics` | Prometheus (§15) |
 
 Responses are JSON; `?format=csv` on the tabular ones. The same queries back `kompressor stats …` on the CLI (direct SQLite, no server needed).
+
+`/v1/stats/live` reads the same database as the rest, so it is as current as
+the writer's commit interval (100 ms) and needs no second set of counters to
+keep in step. `window` is `<n>s|m|h|d` up to 90d (default `1h`; raw rows older
+than retention are gone), `recent` 0–200 (default 25), `refresh` the page's
+poll interval in seconds (default 2). `server.stats_listen` serves it on a
+listener of its own as well — the dashboard at `/`, the JSON at
+`/v1/stats/live`, plus the probes, and nothing that compresses — and that
+listener runs whatever surfaces were selected, so `serve --proxy` has one too.
+The HTML shell is served without credentials because it holds no data; with
+`auth.mode = "api_keys"` its polls send a key the viewer types in, kept in the
+tab's `sessionStorage`.
 
 ## 10. `kompressor-server`: HTTP compression API
 
@@ -2098,6 +2111,7 @@ listen        = "127.0.0.1:8817"    # shared listener for selected surfaces
 api_listen    = ""                  # per-surface listeners; empty means share `listen`
 mcp_listen    = ""
 proxy_listen  = ""
+stats_listen  = ""                  # live statistics on a port of their own, e.g. "127.0.0.1:8818"
 max_body_bytes            = 67108864   # bytes, not "64MiB"
 max_inflight_compressions = 0          # 0 = CPU count x 2
 queue_timeout   = "2s"              # then 503 with Retry-After
@@ -2399,8 +2413,14 @@ wrap claude ── resolve port ──▶ serving? ──yes──▶ adopt (nev
                            and no other live session still holds it
 ```
 
-**Pointing the agent at the proxy.** Every agent already reads a base-URL
-environment variable; wrapping sets it. The two URL shapes are not
+**Pointing the agent at the proxy.** Most agents read a base-URL environment
+variable, and wrapping sets it. Two do not, and are wired through their own
+configuration instead: codex ignores `OPENAI_BASE_URL` and gets a marker-delimited
+block in `config.toml` (§12.5a), and opencode 2.x is *broken* by that variable —
+every model of the provider reports "unavailable" — so a launched session gets
+its provider `baseURL`s in `OPENCODE_CONFIG_CONTENT` and runs `--standalone`,
+because the background service that otherwise makes the calls never sees this
+command's environment (`docs/OPENCODE.md`). The two URL shapes are not
 interchangeable — an Anthropic-style client is given a host and appends
 `/v1/messages` itself, an OpenAI-style client is given a URL that already ends
 in `/v1` — so the catalogue records which shape each tool wants. An entry is a
@@ -2428,7 +2448,11 @@ A proxy this session did **not** start is never stopped by it.
 **Editor-hosted agents.** Environment variables only reach a process this command
 launches. An agent started by an editor inherits the editor's environment, so
 `--attach` writes the base URL into the settings file the agent reads for itself
-and holds the proxy up until interrupted. That turns a one-line change into
+and holds the proxy up until interrupted: `.claude/settings.local.json` for
+Claude Code, and the global `opencode.json` for opencode — followed by
+`opencode reload`, so the running background service, which OpenCode Desktop
+shares, picks it up (only when one is running: `reload` would otherwise start
+one). That turns a one-line change into
 shared mutable state on disk, with three failure modes and one answer to all of
 them — a sidecar recording who owns each key and what it held before any of them
 arrived:
@@ -2854,7 +2878,7 @@ Dockerfile exist and are run by hand.
 
 ## 19. Status
 
-Built and passing: ten crates, **1,335 tests**, clippy and rustfmt clean. Measured
+Built and passing: ten crates, **1,355 tests**, clippy and rustfmt clean. Measured
 numbers and the current gap list are in the README; what is *not* built is
 recorded there too rather than left to be discovered.
 
@@ -3587,7 +3611,7 @@ be filled in.
 
 | Section | Reachable keys |
 |---|---|
-| `server` | `listen`, `api_listen`, `mcp_listen`, `proxy_listen` |
+| `server` | `listen`, `api_listen`, `mcp_listen`, `proxy_listen`, `stats_listen` |
 | `auth` | `mode` (`api_keys` only), `secret` |
 | `refs` | `path`, `backend` (`memory` only) |
 | `stats` | `path`, `enabled` |

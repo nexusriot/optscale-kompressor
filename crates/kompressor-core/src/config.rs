@@ -45,6 +45,11 @@ pub struct ServerConfig {
     pub api_listen: String,
     pub mcp_listen: String,
     pub proxy_listen: String,
+    /// A listener of its own for the live statistics page and its JSON, e.g.
+    /// `127.0.0.1:8818`. Empty serves them only on the API listener, at
+    /// `/v1/stats/live`; set, they are served here too, whatever surfaces the
+    /// process runs, so a proxy-only deployment still has a dashboard.
+    pub stats_listen: String,
     pub max_body_bytes: usize,
     /// 0 means twice the detected parallelism.
     ///
@@ -75,6 +80,7 @@ impl Default for ServerConfig {
             api_listen: String::new(),
             mcp_listen: String::new(),
             proxy_listen: String::new(),
+            stats_listen: String::new(),
             max_body_bytes: 64 * 1024 * 1024,
             max_inflight_compressions: 0,
             queue_timeout: Duration::from_secs(2),
@@ -1042,6 +1048,7 @@ impl Config {
                 "api_listen" => self.server.api_listen = value.to_string(),
                 "mcp_listen" => self.server.mcp_listen = value.to_string(),
                 "proxy_listen" => self.server.proxy_listen = value.to_string(),
+                "stats_listen" => self.server.stats_listen = value.to_string(),
                 _ => {}
             },
             "auth" => match field {
@@ -1917,5 +1924,18 @@ mod tests {
     fn an_unknown_key_in_a_config_file_is_an_error_not_a_silent_typo() {
         let text = "[engine]\nmax_array_itemz = 5\n";
         assert!(toml::from_str::<Config>(text).is_err());
+    }
+    #[test]
+    fn the_statistics_listener_is_off_until_a_file_or_the_environment_names_it() {
+        assert!(Config::default().server.stats_listen.is_empty());
+        let from_file: Config =
+            toml::from_str("[server]\nstats_listen = \"127.0.0.1:8818\"\n").expect("parses");
+        assert_eq!(from_file.server.stats_listen, "127.0.0.1:8818");
+        let mut config = Config::default();
+        config.apply_env(&[(
+            "KOMPRESSOR__SERVER__STATS_LISTEN".into(),
+            "0.0.0.0:9000".into(),
+        )]);
+        assert_eq!(config.server.stats_listen, "0.0.0.0:9000");
     }
 }

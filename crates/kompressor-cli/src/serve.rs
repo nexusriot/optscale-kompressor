@@ -254,6 +254,7 @@ pub async fn run(config: Config, surfaces: Surfaces, listen: Option<String>) -> 
             .map_err(|e| CliError::Runtime(format!("could not bind {addr}: {e}")))?;
         bound.push((addr, listener, selected));
     }
+    let stats_listener = bind_stats_listener(core.config(), &bound).await?;
     for (addr, listener, selected) in bound {
         let mut enabled = Vec::new();
         if selected.api {
@@ -267,6 +268,22 @@ pub async fn run(config: Config, surfaces: Surfaces, listen: Option<String>) -> 
         }
         tracing::info!(address = %addr, surfaces = %enabled.join(","), mode = %core.config().engine.mode, "listening");
         let app = compose(&core, selected, client.clone());
+        let mut rx = shutdown_rx.clone();
+        servers.spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    while !*rx.borrow() {
+                        if rx.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                })
+                .await
+        });
+    }
+    if let Some((addr, listener)) = stats_listener {
+        tracing::info!(address = %addr, "live statistics at http://{addr}/");
+        let app = kompressor_server::stats_listener_router(ServerState::new(core.clone()));
         let mut rx = shutdown_rx.clone();
         servers.spawn(async move {
             axum::serve(listener, app)
@@ -352,6 +369,44 @@ pub async fn run(config: Config, surfaces: Surfaces, listen: Option<String>) -> 
         return Err(CliError::Runtime(error));
     }
     Ok(())
+}
+
+/// Bind `server.stats_listen`, when it names an address.
+///
+/// Separate from [`listener_groups`] because it is not a surface: it serves
+/// the live statistics whatever surfaces were selected, so `serve --proxy`
+/// still has its dashboard. Sharing an address with a surface listener is
+/// refused rather than merged — the API surface already serves
+/// `/v1/stats/live` on its own listener, and a second bind would fail with a
+/// less useful message.
+async fn bind_stats_listener(
+    config: &Config,
+    surfaces: &[(SocketAddr, tokio::net::TcpListener, Surfaces)],
+) -> Result<Option<(SocketAddr, tokio::net::TcpListener)>, CliError> {
+    let address = config.server.stats_listen.trim();
+    if address.is_empty() {
+        return Ok(None);
+    }
+    let addr: SocketAddr = address
+        .parse()
+        .map_err(|e| CliError::Usage(format!("invalid server.stats_listen {address:?}: {e}")))?;
+    if surfaces.iter().any(|(bound, _, _)| *bound == addr) {
+        return Err(CliError::Usage(format!(
+            "server.stats_listen {addr} is already a surface listener; give it a port of its \
+             own, or leave it empty and use /v1/stats/live on the API listener"
+        )));
+    }
+    if !config.stats.enabled {
+        tracing::warn!(
+            address = %addr,
+            "server.stats_listen is set but statistics are disabled; not listening"
+        );
+        return Ok(None);
+    }
+    let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
+        CliError::Runtime(format!("could not bind server.stats_listen {addr}: {e}"))
+    })?;
+    Ok(Some((addr, listener)))
 }
 
 fn listener_groups(
@@ -687,5 +742,52 @@ mod tests {
     fn an_unparseable_listen_address_is_a_usage_error() {
         let err = "not:an:address".parse::<SocketAddr>();
         assert!(err.is_err());
+    }
+    fn stats_config(listen: &str, enabled: bool) -> Config {
+        let mut config = Config::default();
+        config.server.stats_listen = listen.to_string();
+        config.stats.enabled = enabled;
+        config
+    }
+
+    #[tokio::test]
+    async fn the_statistics_listener_binds_only_when_named_and_statistics_are_on() {
+        assert!(
+            bind_stats_listener(&stats_config("", true), &[])
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            bind_stats_listener(&stats_config("127.0.0.1:0", false), &[])
+                .await
+                .unwrap()
+                .is_none(),
+            "with nothing recorded there is nothing to show; a warning, not a failure"
+        );
+        let (addr, _listener) = bind_stats_listener(&stats_config("127.0.0.1:0", true), &[])
+            .await
+            .unwrap()
+            .expect("binds");
+        assert!(addr.ip().is_loopback());
+    }
+
+    #[tokio::test]
+    async fn a_statistics_address_that_is_not_one_or_is_taken_is_refused() {
+        let bad = bind_stats_listener(&stats_config("localhost:abc", true), &[]).await;
+        assert!(matches!(bad, Err(CliError::Usage(_))));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let surfaces = Surfaces::resolve(true, false, false);
+        let shared = [(addr, listener, surfaces)];
+        let clash = bind_stats_listener(&stats_config(&addr.to_string(), true), &shared).await;
+        match clash {
+            Err(CliError::Usage(message)) => assert!(message.contains("surface listener")),
+            other => panic!(
+                "sharing a surface's address must be refused, got {:?}",
+                other.map(|o| o.map(|(a, _)| a))
+            ),
+        }
     }
 }

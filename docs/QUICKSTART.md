@@ -255,9 +255,28 @@ $ curl -s localhost:8817/v1/retrieve -H 'content-type: application/json' \
 | `POST /v1/retrieve` | a handle in, the elided bytes out |
 | `POST /v1/detect` | classify a payload without compressing it |
 | `GET /v1/stats/summary` `by_type` `histogram` `requests` `retrievals` `store` | the same reports as `kompressor stats` — mounted only when `stats.enabled` (the default); with statistics off the whole prefix 404s |
+| `GET /v1/stats/live` | live statistics: JSON, or a dashboard that refreshes itself when opened in a browser (`?format=html`) |
 | `GET /healthz` `/readyz` `/metrics` | liveness, readiness, Prometheus |
 
 `/v2` is served as an alias of `/v1` so a client pinned to either keeps working.
+
+### Live statistics on a port of their own
+
+```toml
+[server]
+stats_listen = "127.0.0.1:8818"
+```
+
+Then open `http://127.0.0.1:8818/` for the dashboard, or ask for JSON:
+
+```bash
+curl -s 'http://127.0.0.1:8818/v1/stats/live?window=15m&recent=10'
+```
+
+The listener serves only the dashboard, the JSON and the probes, and it runs
+whatever surfaces `serve` was started with — so a proxy-only service has a
+dashboard too. Leave `stats_listen` empty to serve `/v1/stats/live` only on the
+API listener. `KOMPRESSOR__SERVER__STATS_LISTEN` sets it from the environment.
 
 ---
 

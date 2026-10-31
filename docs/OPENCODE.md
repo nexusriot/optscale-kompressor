@@ -82,10 +82,15 @@ kompressor wrap opencode --attach
 
 This writes the same overlay into the **global** `opencode.json`
 (`$XDG_CONFIG_HOME/opencode/`, or `opencode.jsonc` when that exists, because it
-wins), then runs `opencode reload`. Measured: the running service sent its next
-request to the new URL with no restart, so a Desktop window or TUI that is
-already open is covered from that moment. Ctrl-C (or SIGTERM) puts the file
-back and reloads again.
+wins), then runs `opencode reload` if a background service is running.
+Measured: the running service sent its next request to the new URL with no
+restart, so a Desktop window or TUI that is already open is covered from that
+moment. With no service running nothing is reloaded — `opencode reload` would
+start one — and the next service to start reads the file. Ctrl-C (or SIGTERM)
+puts the file back and reloads again on the same terms.
+
+This reaches Desktop only on **Desktop 2.2.4 or newer**; see
+[OpenCode Desktop needs 2.2.4 or newer](#opencode-desktop-needs-224-or-newer).
 
 The edit follows the same rules as the Claude Code and Codex ones:
 
@@ -282,8 +287,15 @@ beside `codex.sh` and `claude.sh`, with the same stages and verdicts:
 
 ```bash
 scripts/kompressor-sweep/opencode.sh all
-OPENCODE_SWEEP_MODEL=anthropic/claude-haiku-4-5 scripts/kompressor-sweep/opencode.sh sweep
+OPENCODE_SWEEP_MODEL=opencode-go/glm-5.3 scripts/kompressor-sweep/opencode.sh sweep
 ```
+
+The default model is `anthropic/claude-haiku-5-5`, billed to the Anthropic API
+key in your opencode login. Before any paid stage the script sends the model
+one word with the proxy out of the path, and stops — with the provider's own
+error and what to do about it — if that fails, so an expired or exhausted key
+costs one short request rather than three failed stages. `SKIP_PREFLIGHT=1`
+skips the check.
 
 Every session goes through `kompressor wrap opencode`, so the stages test the
 wrap as well as the engine. opencode runs from a home of the sweep's own,
@@ -323,14 +335,29 @@ is set in the environment opencode runs in. Unset it.
 was served by the background service. Use the plain wrap, which runs
 `--standalone`, or `--attach`, which reloads the service.
 
-**`401 … api_key_expired`, `Go requires a credential`** — the provider refused
-your login; the proxy forwarded it as it should. Sign in again in opencode
-(`opencode auth login`, or `/connect` in the TUI).
+**`401 … api_key_expired`** — the key itself expired at the provider, and
+signing in again with it does not renew it: create a new key (OpenCode Console
+for `opencode` and `opencode-go`) and store it with `opencode auth login` or
+`/connect`. **`Go requires a credential`** — no login is stored for that
+provider. Either way the proxy forwarded the provider's answer as it should.
 
 **`Free usage limit reached`** — the free Zen models are exhausted for this
 login; pick a model on a provider you pay for.
 
-**Desktop still talks to the provider directly** — check that the edit landed
-(`opencode.json` in your config directory names `127.0.0.1`) and run
-`opencode reload`. A service started before the edit by a different user, or
-with `OPENCODE_CONFIG_CONTENT` of its own, keeps its own view.
+**Desktop still talks to the provider directly** — work through these in order:
+
+1. `python3 -c "import json;print(json.load(open('$HOME/.local/state/opencode/service.json'))['version'])"`
+   names the CLI serving Desktop. Below 2.2.4, upgrade Desktop
+   ([why](#opencode-desktop-needs-224-or-newer)). An upgrade installed while the
+   old service runs leaves it serving: quit Desktop and run
+   `opencode service restart`.
+2. `opencode debug config` must list your `opencode.json` as a `document`. If it
+   does not, the file failed to parse — a missing brace is enough — and opencode
+   ignores the **whole file**, MCP servers included, without saying so. Check it
+   with `python3 -m json.tool ~/.config/opencode/opencode.json`.
+3. Run `opencode reload`. A service started with an `OPENCODE_CONFIG_CONTENT` of
+   its own keeps its own view.
+
+**`opencode reload` fails with `DirectoryNotFoundError`** — the service still
+holds a project directory that was deleted since it opened it, and `reload`
+re-resolves every one. `opencode service restart` clears it.

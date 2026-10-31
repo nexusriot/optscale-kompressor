@@ -38,6 +38,7 @@ pub struct ServerState {
 impl ServerState {
     /// Build the shared state for `core`.
     pub fn new(core: Arc<AppCore>) -> Arc<ServerState> {
+        crate::live::mark_started();
         let config = core.config();
         let stats_path = config.stats.enabled.then(|| config.stats.path.clone());
         let state = ServerState {
