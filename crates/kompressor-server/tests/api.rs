@@ -46,18 +46,28 @@ impl Harness {
     /// endpoints: the queries under test are SQL over a real schema, and an
     /// in-memory fake would test none of it.
     fn with_stats() -> Harness {
+        Harness::with_stats_and(|_| {}, kompressor_server::router)
+    }
+
+    /// Statistics on, a further config tweak, and the router to serve.
+    fn with_stats_and(
+        tweak: impl FnOnce(&mut Config),
+        make_router: fn(Arc<kompressor_server::ServerState>) -> Router,
+    ) -> Harness {
         let dir = tempfile::tempdir().expect("a temp dir");
         let path = dir.path().join("stats.db");
         let (sink, handle) =
             kompressor_stats::spawn(&StatsConfig::at(&path)).expect("the writer starts");
         let sink_for_core = sink.clone();
-        let mut harness = Harness::build(
+        let mut harness = Harness::build_with(
             move |config| {
                 config.stats.enabled = true;
                 config.stats.path = path.clone();
+                tweak(config);
             },
             Some(sink_for_core),
             Some(dir),
+            make_router,
         );
         harness.sink = sink;
         harness.stats = Some(handle);
@@ -69,6 +79,15 @@ impl Harness {
         sink: Option<StatsSink>,
         dir: Option<tempfile::TempDir>,
     ) -> Harness {
+        Harness::build_with(tweak, sink, dir, kompressor_server::router)
+    }
+
+    fn build_with(
+        tweak: impl FnOnce(&mut Config),
+        sink: Option<StatsSink>,
+        dir: Option<tempfile::TempDir>,
+        make_router: fn(Arc<kompressor_server::ServerState>) -> Router,
+    ) -> Harness {
         let mut config = Config::default();
         config.refs.backend = RefsBackend::Memory;
         config.stats.enabled = false;
@@ -79,7 +98,7 @@ impl Harness {
         let core = Arc::new(AppCore::new(config, refs, sink.clone()));
         let state = kompressor_server::ServerState::new(core);
         Harness {
-            router: kompressor_server::router(state),
+            router: make_router(state),
             sink,
             stats: None,
             _dir: dir,
@@ -1053,4 +1072,168 @@ async fn the_stats_writer_is_shut_down_cleanly() {
     if let Some(handle) = harness.stats.take() {
         handle.shutdown().expect("the writer stops cleanly");
     }
+}
+
+/// A body as text, whatever `send` made of it.
+fn text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
+#[tokio::test]
+async fn the_live_view_reports_a_compression_moments_after_it_happened() {
+    let harness = Harness::with_stats();
+    let (status, _) = harness
+        .post(
+            "/v1/compress/raw",
+            json!({"content": log_payload(400), "request_id": "live-1"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    harness.sink.flush().expect("the batch commits");
+
+    let (status, live) = harness.get("/v1/stats/live?window=15m&recent=5").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(live["window"]["label"], "15m");
+    assert_eq!(live["server"]["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(live["server"]["stats_dropped"], 0);
+    assert_eq!(live["totals"]["compressions"], 1);
+    assert!(live["totals"]["saved_gross"].as_i64().unwrap() > 0);
+    assert_eq!(live["recent"][0]["request_id"], "live-1");
+    assert_eq!(live["recent"][0]["surface"], "api");
+    assert_eq!(live["rates"].as_array().unwrap().len(), 3);
+    assert!(!live["timeline"].as_array().unwrap().is_empty());
+    for section in [
+        "upstream",
+        "by_provider",
+        "by_model",
+        "by_type",
+        "skipped_by_reason",
+        "retrievals",
+    ] {
+        assert!(
+            !live[section].is_null(),
+            "{section} is part of the snapshot"
+        );
+    }
+    // the versioned alias, as for every other reporting route
+    let (status, _) = harness.get("/v2/stats/live").await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_browser_gets_the_dashboard_and_a_client_gets_json() {
+    let harness = Harness::with_stats();
+    let browser = [("accept", "text/html,application/xhtml+xml,*/*;q=0.8")];
+    let (status, page, _) = harness.get_with("/v1/stats/live", &browser).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = text(&page);
+    assert!(page.starts_with("<!doctype html>"));
+    assert!(
+        page.contains("\"window\":\"1h\""),
+        "the settings are filled in"
+    );
+
+    let (status, forced, _) = harness
+        .get_with("/v1/stats/live?format=json", &browser)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        forced["totals"].is_object(),
+        "an explicit format beats the Accept header"
+    );
+
+    let (_, page) = harness
+        .get("/v1/stats/live?format=html&window=24h&refresh=5")
+        .await;
+    assert!(text(&page).contains("\"refresh\":5"));
+}
+
+#[tokio::test]
+async fn a_live_query_it_cannot_honour_is_refused() {
+    let harness = Harness::with_stats();
+    for query in [
+        "window=2w",
+        "window=91d",
+        "recent=500",
+        "format=xml",
+        "refresh=0",
+        "colour=red",
+    ] {
+        let (status, body) = harness.get(&format!("/v1/stats/live?{query}")).await;
+        assert!(status.is_client_error(), "{query} answered {status}");
+        assert!(body["error"]["message"].is_string(), "{query} says why");
+    }
+}
+
+#[tokio::test]
+async fn the_live_data_needs_a_key_where_keys_are_required_but_the_page_does_not() {
+    let harness = Harness::with_stats_and(keyed_config, kompressor_server::router);
+    let (status, _) = harness.get("/v1/stats/live?format=json").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // the page holds no data; it asks for the key and sends it with its polls
+    let (status, page) = harness.get("/v1/stats/live?format=html").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(text(&page).contains("x-kompressor-key"));
+
+    let (status, live, _) = harness
+        .get_with("/v1/stats/live", &[("x-kompressor-key", "sk-alpha")])
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(live["tenant"], "team-a");
+
+    let (status, _, _) = harness
+        .get_with(
+            "/v1/stats/live?tenant=team-b",
+            &[("x-kompressor-key", "sk-alpha")],
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a key reads only its own tenant"
+    );
+}
+
+#[tokio::test]
+async fn live_statistics_on_a_deployment_with_statistics_off_say_so() {
+    let harness = Harness::memory();
+    let (status, body) = harness.get("/v1/stats/live").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(text(&body["error"]["message"]).contains("disabled"));
+}
+
+#[tokio::test]
+async fn the_statistics_listener_serves_the_dashboard_and_nothing_that_compresses() {
+    let harness = Harness::with_stats_and(|_| {}, kompressor_server::stats_listener_router);
+    let (status, page) = harness.get("/").await;
+    assert_eq!(status, StatusCode::OK);
+    let page = text(&page);
+    assert!(page.contains("Kompressor live"));
+    assert!(
+        page.contains("\"endpoint\":\"/v1/stats/live\""),
+        "the page at / must poll the JSON path, not itself"
+    );
+
+    let (status, live) = harness.get("/v1/stats/live").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(live["server"].is_object());
+
+    let (status, health) = harness.get("/healthz").await;
+    assert_eq!(
+        (status, health["status"].as_str()),
+        (StatusCode::OK, Some("ok"))
+    );
+
+    let (status, _) = harness
+        .post("/v1/compress/raw", json!({"content": log_payload(10)}))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a stats port is not a compression port"
+    );
 }

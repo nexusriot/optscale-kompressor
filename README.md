@@ -207,7 +207,9 @@ Desktop uses that service, so `--attach` writes the overlay into the global
 `opencode.json`, runs `opencode reload`, and puts the file back on exit. Both
 route the built-in `openai`, `anthropic`, OpenCode Zen and OpenCode Go
 providers, and leave alone any provider whose `baseURL` you set yourself.
-Details: [docs/OPENCODE.md](docs/OPENCODE.md).
+OpenCode Desktop needs **2.2.4 or newer**: the CLI that 2.0.11 bundles does not
+reliably honour a provider's `baseURL`, so its traffic bypasses the proxy.
+Details, including a permanent setup: [docs/OPENCODE.md](docs/OPENCODE.md).
 
 ### Other agents
 
@@ -407,6 +409,7 @@ are in [docs/charts/](docs/charts/).
 | Agent wrap | `kompressor wrap <agent>`                                                                                                                                                   |
 | LLM proxy  | `kompressor serve --proxy`: OpenAI Chat Completions, OpenAI Responses, Anthropic Messages, and a WebSocket relay                                                            |
 | HTTP API   | `POST /v1/compress`, `/v1/compress/raw`, `/v1/retrieve`, `/v1/detect`; `GET /v1/stats/*`, `/healthz`, `/readyz`, `/metrics`                                                 |
+| Live stats | `GET /v1/stats/live`: JSON, or a self-refreshing dashboard in a browser; on its own port with `server.stats_listen`                                                       |
 | MCP server | `kompressor serve --mcp` (streamable HTTP): `optscale_kompressor_retrieve`, `optscale_kompressor_compress`, `optscale_kompressor_compress_raw`, `optscale_kompressor_stats` |
 | CLI        | `kompressor compress`, `retrieve`, `detect`, `stats`, `bench`, `check-config`                                                                                               |
 | Library    | the `kompressor-engine` crate: compress a string or a conversation, no I/O                                                                                                  |
@@ -429,6 +432,13 @@ re-compresses the same growing history and credits the same bytes again.
 `kompressor_stats_dropped_total` on `/metrics` is zero; otherwise every report is
 an undercount. [docs/BENCHMARK.md](docs/BENCHMARK.md) explains how to measure
 against a live agent.
+
+To watch it as it happens, set `server.stats_listen = "127.0.0.1:8818"` and open
+`http://127.0.0.1:8818/`: a dashboard of the last hour (or 5 minutes, or 7
+days) — throughput, tokens removed, net of retrieval, cache reads, upstream
+status and latency, savings by provider, model and content type, why messages
+were left alone, and the latest requests — refreshed every two seconds. The
+same data is JSON at `/v1/stats/live`. It shows the dropped-event count too.
 
 ---
 
@@ -471,7 +481,7 @@ Good first issues are labelled
 | `make harbor-gates` | every live-agent benchmark gate, with no provider spend                                        |
 
 
-`cargo test --workspace` runs **1,335 tests** across ten crates; clippy and rustfmt
+`cargo test --workspace` runs **1,355 tests** across ten crates; clippy and rustfmt
 are clean. `make bench-save` and `make golden` move what the tests compare against,
 so both ask before they run.
 

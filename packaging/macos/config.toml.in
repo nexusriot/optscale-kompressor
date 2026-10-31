@@ -18,6 +18,10 @@
 
 [server]
 listen = "127.0.0.1:8817"
+# Live statistics — a dashboard at http://<address>/ and JSON at
+# /v1/stats/live — on a port of their own, whatever surfaces are served.
+# Off unless an address is named; /v1/stats/live is on the API listener either way.
+# stats_listen = "127.0.0.1:8818"
 
 # Deployment defaults: what Codex traffic runs under. Code elision on, the
 # client's own cache markers, the provider's default cache lifetime.

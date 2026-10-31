@@ -407,7 +407,7 @@ impl DailyRollup {
 
 /// Read-only access to `stats.db`.
 pub struct StatsReader {
-    conn: Connection,
+    pub(crate) conn: Connection,
     /// Whether `retrieval_events` has the `withheld` column, which schema v10
     /// adds.
     ///
@@ -1096,7 +1096,7 @@ impl StatsReader {
 }
 
 /// `numerator / denominator`, or zero when there is nothing to divide.
-fn ratio(numerator: i64, denominator: i64) -> f64 {
+pub(crate) fn ratio(numerator: i64, denominator: i64) -> f64 {
     if denominator == 0 {
         0.0
     } else {

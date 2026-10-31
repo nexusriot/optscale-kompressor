@@ -52,6 +52,7 @@
 pub mod config;
 pub mod error;
 pub mod events;
+pub mod live;
 pub mod reader;
 pub mod retention;
 pub mod schema;
