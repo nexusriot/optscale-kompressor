@@ -26,7 +26,8 @@
 //! background task running — one Claude Code reported starting ("running in
 //! background with ID: …", "moved to the background (ID: …)", or a `Monitor`
 //! watch, "Monitor started (task …") and has not yet reported on
-//! (`<task-id>…</task-id>` in its notification), or while a wake the model set
+//! (`<task-id>…</task-id>` in its notification, or "Successfully stopped task:
+//! …" when the model stopped it), or while a wake the model set
 //! with `ScheduleWakeup` has not yet been delivered. The model is
 //! woken when the job ends, so the client will most likely be back; but an
 //! agent can also give its final answer with a job still running, and then no
@@ -167,9 +168,16 @@ const BACKGROUND_STARTED: &[&str] = &[
     "moved to the background (ID: ",
     "Monitor started (task ",
 ];
-/// The tag a task notification names its task with, which it sends however
-/// the task ended: completed, failed or stopped.
+/// The tag a task notification names its task with, which it sends when the
+/// task ends on its own: completed or failed.
 const BACKGROUND_REPORTED: (&str, &str) = ("<task-id>", "</task-id>");
+/// What the `TaskStop` tool answers, the task id following. A task the model
+/// stops gets no notification, so this answer is its end. Measured on the
+/// 89-task run of 2026-11-01 (`13-41-26`): crack-7z-hash, extract-moves-from-
+/// video, reshard-c4-data and schemelike-metacircular-eval each stopped a task
+/// that had outlived its timeout, finished, and kept 10–11 pings going after
+/// the trial had ended — all 43 of the run's pings to finished trials.
+const BACKGROUND_STOPPED: &str = "Successfully stopped task: ";
 
 /// What Claude Code's `ScheduleWakeup` tool answers when it sets a wake, and
 /// what the prompt that wake delivers says. A wake has no id: one is pending
@@ -264,6 +272,7 @@ pub(crate) fn background_wait(body: &Value) -> Option<Wait> {
             for marker in BACKGROUND_STARTED {
                 started.extend(ids_after(text, marker));
             }
+            reported.extend(ids_after(text, BACKGROUND_STOPPED));
             let (open, close) = BACKGROUND_REPORTED;
             let mut rest = text;
             while let Some(at) = rest.find(open) {
@@ -655,6 +664,22 @@ mod tests {
             background_task_running(&body),
             "boc9wtynk has not been reported"
         );
+    }
+
+    #[test]
+    fn a_task_the_model_stops_is_ended_by_the_stop() {
+        let started = json!([
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1",
+                "content": "Command did not complete within its 600s timeout and was moved to the background (ID: bxf73rkc1). You will be notified when it completes."}]},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_2", "name": "TaskStop",
+                "input": {"task_id": "bxf73rkc1"}}]},
+        ]);
+        assert!(background_task_running(&with_messages(started.clone())));
+
+        let mut stopped = started.as_array().unwrap().clone();
+        stopped.push(json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_2",
+            "content": "{\"message\":\"Successfully stopped task: bxf73rkc1 (cd /app && python compress.py)\",\"task_id\":\"bxf73rkc1\",\"task_type\":\"local_bash\"}"}]}));
+        assert!(!background_task_running(&with_messages(json!(stopped))));
     }
 
     #[test]
