@@ -183,32 +183,83 @@ const BACKGROUND_REPORTED: (&str, &str) = ("<task-id>", "</task-id>");
 /// left unreported; the wake came 897 s later with no ping sent, and 40,104
 /// tokens were written again at the one-hour price.
 const WAKE_SCHEDULED: &str = "Next wakeup scheduled for ";
+/// The delivered tick says this only for the `/loop` sentinel prompts. Any
+/// other prompt comes back as a user message that is that prompt and nothing
+/// else, so a delivery is also a user text equal to the last `prompt` the
+/// tool was called with. Measured on the 89-task run of 2026-10-31
+/// (`18-08-17`): mcmc-sampling-stan, train-fasttext and rstan-to-pystan each
+/// got their wake as "check rstan install" or the like, answered it and
+/// exited, and the wake, never seen delivered, kept 11 pings going each.
 const WAKE_DELIVERED: &str = "You scheduled this tick via the ScheduleWakeup tool";
+/// What follows [`WAKE_SCHEDULED`] up to the wake's delay in seconds.
+const WAKE_DELAY: (&str, &str) = ("(in ", "s)");
 
-/// Whether the conversation in `body` has a background task it started and
-/// has not been told the end of, or a `ScheduleWakeup` wake still to come.
+/// What an `end_turn` is waiting on, when it is waiting on something.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Wait {
+    /// A background task, which has no known end.
+    Task,
+    /// A `ScheduleWakeup` wake, due this long after it was set, or `None` when
+    /// the tool's answer did not say.
+    Wake(Option<Duration>),
+}
+
+impl Wait {
+    /// How many pings at `interval` this wait can use, at most `cap`. A wake
+    /// is due at a known time; if the client is not back by then it has gone,
+    /// so the pings stop there rather than at the cap.
+    pub(crate) fn max_pings(&self, interval: Duration, cap: u32) -> u32 {
+        match self {
+            Wait::Wake(Some(due)) if !interval.is_zero() => {
+                let pings = (due.as_secs_f64() / interval.as_secs_f64()).ceil() as u32;
+                pings.max(1).min(cap)
+            }
+            _ => cap,
+        }
+    }
+}
+
+/// What the conversation in `body` is waiting on: a background task it
+/// started and has not been told the end of, or else a `ScheduleWakeup` wake
+/// still to come.
 ///
 /// Read from the request, not the response: a task the response started is
 /// one the client has not yet run, and a notification can only arrive in a
 /// later request. Every text the messages carry is read — a notification is
 /// a user text block on some turns and a system message on others.
-pub(crate) fn background_task_running(body: &Value) -> bool {
+pub(crate) fn background_wait(body: &Value) -> Option<Wait> {
     let mut started = Vec::new();
     let mut reported = Vec::new();
     let mut wake_pending = false;
+    let mut wake_due = None;
+    let mut wake_prompt = None;
     for message in body
         .get("messages")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
     {
-        if wake_stopped(message.get("content")) {
+        let content = message.get("content");
+        if wake_stopped(content) {
             wake_pending = false;
         }
-        texts(message.get("content"), &mut |text| {
+        if let Some(prompt) = wake_prompt_in(content) {
+            wake_prompt = Some(prompt);
+        }
+        if message.get("role").and_then(Value::as_str) == Some("user")
+            && wake_prompt
+                .as_deref()
+                .is_some_and(|prompt| user_texts(content).any(|text| text.trim() == prompt))
+        {
+            wake_pending = false;
+        }
+        texts(content, &mut |text| {
             let (set, delivered) = (text.rfind(WAKE_SCHEDULED), text.rfind(WAKE_DELIVERED));
             if set.is_some() || delivered.is_some() {
                 wake_pending = set > delivered;
+            }
+            if let Some(at) = set.filter(|_| wake_pending) {
+                wake_due = wake_delay(&text[at..]);
             }
             for marker in BACKGROUND_STARTED {
                 started.extend(ids_after(text, marker));
@@ -223,7 +274,53 @@ pub(crate) fn background_task_running(body: &Value) -> bool {
             }
         });
     }
-    wake_pending || started.iter().any(|id| !reported.contains(id))
+    if started.iter().any(|id| !reported.contains(id)) {
+        Some(Wait::Task)
+    } else {
+        wake_pending.then_some(Wait::Wake(wake_due))
+    }
+}
+
+/// The delay in "Next wakeup scheduled for 09:59:00 (in 1202s)".
+fn wake_delay(scheduled: &str) -> Option<Duration> {
+    let (open, close) = WAKE_DELAY;
+    let after = &scheduled[scheduled.find(open)? + open.len()..];
+    after[..after.find(close)?]
+        .parse()
+        .ok()
+        .map(Duration::from_secs)
+}
+
+/// The trimmed `prompt` of the last `ScheduleWakeup` call in `content` that
+/// sets a wake.
+fn wake_prompt_in(content: Option<&Value>) -> Option<String> {
+    content?
+        .as_array()?
+        .iter()
+        .filter(|block| {
+            block.get("type").and_then(Value::as_str) == Some("tool_use")
+                && block.get("name").and_then(Value::as_str) == Some("ScheduleWakeup")
+        })
+        .filter_map(|block| block.pointer("/input/prompt").and_then(Value::as_str))
+        .map(str::trim)
+        .rfind(|prompt| !prompt.is_empty())
+        .map(str::to_string)
+}
+
+/// The texts a user message says itself: a plain string or its text blocks,
+/// not what a tool result carries, whose text is under `content`.
+fn user_texts(content: Option<&Value>) -> impl Iterator<Item = &str> {
+    let (string, blocks) = match content {
+        Some(Value::String(text)) => (Some(text.as_str()), None),
+        Some(Value::Array(blocks)) => (None, Some(blocks)),
+        _ => (None, None),
+    };
+    string.into_iter().chain(
+        blocks
+            .into_iter()
+            .flatten()
+            .filter_map(|block| block.get("text").and_then(Value::as_str)),
+    )
 }
 
 /// Whether `content` has a `ScheduleWakeup` call that ends the loop.
@@ -520,6 +617,10 @@ mod tests {
         assert_eq!(ping.headers["x-api-key"], "sk-test");
     }
 
+    fn background_task_running(body: &Value) -> bool {
+        background_wait(body).is_some()
+    }
+
     fn with_messages(messages: Value) -> Value {
         json!({"model": "claude-opus-5-5", "messages": messages})
     }
@@ -607,6 +708,63 @@ mod tests {
             "content": "Loop stopped."}]}),
         );
         assert!(!background_task_running(&with_messages(json!(stopped))));
+    }
+
+    #[test]
+    fn a_wake_with_its_own_prompt_is_delivered_as_that_prompt() {
+        let scheduled = json!([
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "ScheduleWakeup",
+                "input": {"delaySeconds": 600, "noop": true, "prompt": "check rstan install", "reason": "fallback"}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1",
+                "content": "Next wakeup scheduled for 15:17:00 (in 620s). If you owe the user a status update this tick, write it now as ordinary response text; then end the turn."}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "Waiting."}]},
+        ]);
+        assert_eq!(
+            background_wait(&with_messages(scheduled.clone())),
+            Some(Wait::Wake(Some(Duration::from_secs(620))))
+        );
+
+        let mut quoted = scheduled.as_array().unwrap().clone();
+        quoted.push(
+            json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_2",
+            "content": "check rstan install"}]}),
+        );
+        assert!(
+            background_task_running(&with_messages(json!(quoted))),
+            "a tool result is not the wake"
+        );
+
+        for delivered in [
+            json!("check rstan install"),
+            json!([{"type": "text", "text": "check rstan install\n"}]),
+        ] {
+            let mut messages = scheduled.as_array().unwrap().clone();
+            messages.push(json!({"role": "user", "content": delivered}));
+            assert!(!background_task_running(&with_messages(json!(messages))));
+        }
+    }
+
+    #[test]
+    fn a_wake_is_kept_warm_until_it_is_due_and_a_task_until_the_cap() {
+        let interval = Duration::from_secs(270);
+        let wake = |secs| Wait::Wake(Some(Duration::from_secs(secs)));
+        assert_eq!(wake(230).max_pings(interval, 11), 1);
+        assert_eq!(wake(620).max_pings(interval, 11), 3);
+        assert_eq!(wake(1241).max_pings(interval, 11), 5);
+        assert_eq!(wake(7200).max_pings(interval, 11), 11);
+        assert_eq!(Wait::Wake(None).max_pings(interval, 11), 11);
+        assert_eq!(Wait::Task.max_pings(interval, 11), 11);
+    }
+
+    #[test]
+    fn a_task_running_beside_a_wake_is_waited_on_without_a_due_time() {
+        let body = with_messages(json!([
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1",
+                "content": "Command running in background with ID: aaa111."}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_2",
+                "content": "Next wakeup scheduled for 15:17:00 (in 620s)."}]},
+        ]));
+        assert_eq!(background_wait(&body), Some(Wait::Task));
     }
 
     #[test]

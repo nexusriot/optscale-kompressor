@@ -398,14 +398,18 @@ fn keep_warm_for(
         upstream,
         conversation,
     )?;
-    let background = (proxy.cache_keep_warm_background_pings > 0
-        && crate::keepwarm::background_task_running(sent))
-    .then(|| crate::keepwarm::Schedule {
-        interval: proxy.cache_keep_warm_interval,
-        max_pings: proxy
-            .cache_keep_warm_background_pings
-            .min(proxy.cache_keep_warm_max_pings),
-    });
+    let background = (proxy.cache_keep_warm_background_pings > 0)
+        .then(|| crate::keepwarm::background_wait(sent))
+        .flatten()
+        .map(|wait| crate::keepwarm::Schedule {
+            interval: proxy.cache_keep_warm_interval,
+            max_pings: wait.max_pings(
+                proxy.cache_keep_warm_interval,
+                proxy
+                    .cache_keep_warm_background_pings
+                    .min(proxy.cache_keep_warm_max_pings),
+            ),
+        });
     Some(KeepWarmPlan {
         state: state.clone(),
         ping,
