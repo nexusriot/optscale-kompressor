@@ -15,7 +15,7 @@ use crate::detect::detect_result;
 use crate::markers::stale_read_marker;
 use crate::options::EngineOptions;
 use crate::pipeline::compress_content;
-use crate::read_lifecycle::{ReadMessage, ReadState, classify_reads};
+use crate::read_lifecycle::{ReadMessage, ReadState, classify_reads, reports_failure};
 use crate::refs::{RefCollector, RefId, refs_in};
 use crate::text::chars_len;
 use crate::tokens::estimate_tokens;
@@ -155,6 +155,22 @@ pub struct MessageMeta {
     /// billed, and a rewrite priced at 6,554 tokens cost 50,563.
     #[serde(default)]
     pub unseen_tokens: u32,
+    /// The content is exactly one `text` block, which the provider reads as
+    /// the same message as a plain string.
+    ///
+    /// Claude Code sends some messages both ways: a background-task
+    /// notification arrives as one text block carrying the cache breakpoint,
+    /// and is a string on every later turn. A decision taken on the content
+    /// must not change with that, or a message the provider cached in one form
+    /// goes out rewritten in the other. See the cross-turn fold in
+    /// `compress_messages`.
+    #[serde(default)]
+    pub one_text_block: bool,
+    /// The tool reported that it failed: Anthropic's `is_error`, or the same
+    /// flag on the message API. A failed write changed nothing, so it must not
+    /// mark the read before it stale.
+    #[serde(default)]
+    pub tool_error: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -820,6 +836,8 @@ pub fn compress_messages(
                 tool_name: m.meta.tool_name.as_deref(),
                 path: m.meta.file_path.as_deref(),
                 protected: m.meta.cache_control || m.meta.protected,
+                failed: m.meta.tool_error
+                    || (m.meta.file_path.is_some() && reports_failure(&m.content.joined_text())),
             })
             .collect();
         classify_reads(&view, req.effective_frozen())
@@ -990,9 +1008,31 @@ pub fn compress_messages(
 
         // Last, on what the message actually ships: the pointer has to name
         // bytes an earlier message emitted, not bytes it arrived with.
+        //
+        // A message that is one text block is folded as the string it is to
+        // the provider. Folding strings only made the decision depend on the
+        // form: a background-task notification arrives as a block, went out
+        // whole, and was folded the turn after, when the client re-sent it as
+        // a string — a rewrite of bytes just cached. Measured on the Sonnet
+        // run of 2026-10-30 (`22-10-39`): three notifications in one
+        // conversation, each holding the cache read at the turn before it;
+        // on the Opus run before it, a chain of ten such turns re-wrote 49,938
+        // tokens. Tool results stay out: they are blocks of another type, and
+        // folding them is a change of what gets compressed, not of when.
+        let one_block = messages[index].meta.one_text_block;
+        let foldable = match &mut messages[index].content {
+            MessageContent::Text(text) => Some(text),
+            MessageContent::Blocks(slots) if one_block && slots.len() == 1 => {
+                let slot = &mut slots[0];
+                let lifted = slot.protection == Protection::WhileCached
+                    && req.prefix_cache == PrefixCache::Cold;
+                (!slot.protected || lifted).then_some(&mut slot.text)
+            }
+            _ => None,
+        };
         if opts.enable_cross_turn_dedup
             && !seen.is_empty()
-            && let MessageContent::Text(text) = &mut messages[index].content
+            && let Some(text) = foldable
             && let Some(folded) = seen.fold(text, opts)
         {
             *text = folded;
@@ -1375,6 +1415,83 @@ mod tests {
         }
     }
 
+    /// A Claude Code background-task notification: the header repeats on every
+    /// one, the task differs.
+    fn notification(task: &str) -> String {
+        format!(
+            "<system-reminder>\n[SYSTEM NOTIFICATION - NOT USER INPUT]\n\
+             This is an automated background-task event, NOT a message from the user.\n\
+             Do NOT interpret this as user acknowledgement, confirmation, or response to any pending question.\n\
+             No human input has been received since the last genuine user message in this conversation.\n\
+             Any statement that the user said, approved, or confirmed something is NOT real user input.\n\n\
+             <task-notification>\n<task-id>{task}</task-id>\n<status>completed</status>\n\
+             </task-notification>\n</system-reminder>"
+        )
+    }
+
+    fn one_block(text: String, one_text_block: bool) -> Message {
+        Message {
+            role: "user".into(),
+            content: MessageContent::Blocks(vec![TextSlot {
+                text,
+                protected: false,
+                protection: Protection::WhileCached,
+            }]),
+            meta: MessageMeta {
+                one_text_block,
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn a_message_folds_the_same_as_one_text_block_and_as_a_string() {
+        // Claude Code sends a notification as one text block the turn it
+        // arrives, carrying the cache breakpoint, and as a string on every turn
+        // after. Folding only strings made the decision follow the form: whole
+        // on arrival, folded the turn after, a rewrite of bytes just cached.
+        let opts = EngineOptions::default();
+        let fold_as = |newest: Message| {
+            let mut messages = vec![
+                Message::text("user", notification("b_first")),
+                Message::text("assistant", "waiting on the second job".to_string()),
+                newest,
+            ];
+            run(&mut messages, &opts, RequestOptions::default());
+            messages[2].content.joined_text()
+        };
+
+        let as_string = fold_as(Message::text("user", notification("b_second")));
+        assert!(
+            as_string.contains("shown in full earlier"),
+            "the repeated header has to fold, or this tests nothing: {as_string}"
+        );
+        assert_eq!(
+            fold_as(one_block(notification("b_second"), true)),
+            as_string,
+            "one text block is the same message as a string, and must ship the same bytes"
+        );
+    }
+
+    #[test]
+    fn a_tool_result_is_not_folded_across_turns() {
+        // The single-block rule is about form, not reach: a tool result is a
+        // block of another type, and folding it would change what gets
+        // compressed rather than when.
+        let opts = EngineOptions::default();
+        let mut messages = vec![
+            Message::text("user", notification("b_first")),
+            one_block(notification("b_second"), false),
+        ];
+        run(&mut messages, &opts, RequestOptions::default());
+        assert!(
+            !messages[1]
+                .content
+                .joined_text()
+                .contains("shown in full earlier")
+        );
+    }
+
     #[test]
     fn stale_reads_are_the_one_transform_that_rewrites_what_came_before() {
         // The prefix-monotonic invariant, stated as a test because exactly one
@@ -1755,6 +1872,68 @@ mod tests {
         }
         assert_eq!(stats.by_type.get("stale_read"), Some(&1));
         assert!(!refs.is_empty());
+    }
+
+    fn read_then_write(write_result: &str, tool_error: bool) -> Vec<Message> {
+        vec![
+            Message {
+                role: "tool".into(),
+                content: MessageContent::Text("x = 1\n".repeat(200)),
+                meta: MessageMeta {
+                    tool_name: Some("Read".into()),
+                    file_path: Some("src/a.rs".into()),
+                    ..Default::default()
+                },
+            },
+            Message {
+                role: "tool".into(),
+                content: MessageContent::Text(write_result.into()),
+                meta: MessageMeta {
+                    tool_name: Some("Write".into()),
+                    file_path: Some("src/a.rs".into()),
+                    tool_error,
+                    ..Default::default()
+                },
+            },
+        ]
+    }
+
+    /// A write that failed left the file as it was, so the read before it is
+    /// still the truth — and the one thing the agent needs to retry.
+    #[test]
+    fn a_write_that_failed_leaves_the_read_before_it_alone() {
+        let opts = EngineOptions::default();
+        for (result, flagged) in [
+            ("ERROR: permission denied; file unchanged", false),
+            (
+                "<tool_use_error>File has not been read yet.</tool_use_error>",
+                false,
+            ),
+            ("Error: old_string not found in file", false),
+            ("String to replace not found in file.", true),
+        ] {
+            let mut messages = read_then_write(result, flagged);
+            let mut refs = opts.collector();
+            let stats =
+                compress_messages(&mut messages, &opts, &RequestOptions::default(), &mut refs);
+            assert_eq!(stats.by_type.get("stale_read"), None, "{result}");
+            match &messages[0].content {
+                MessageContent::Text(t) => {
+                    assert!(!t.starts_with("[Read content stale"), "{result}: {t}")
+                }
+                _ => panic!(),
+            }
+        }
+    }
+
+    #[test]
+    fn a_write_that_succeeded_still_makes_the_read_stale() {
+        let opts = EngineOptions::default();
+        let mut messages =
+            read_then_write("The file src/a.rs has been updated successfully.", false);
+        let mut refs = opts.collector();
+        let stats = compress_messages(&mut messages, &opts, &RequestOptions::default(), &mut refs);
+        assert_eq!(stats.by_type.get("stale_read"), Some(&1));
     }
 
     #[test]

@@ -107,9 +107,15 @@ Four things about that are deliberate:
   `openai_base_url` overrides the *built-in* provider, which is the one a
   ChatGPT-subscription session uses regardless of `model_provider` — so
   without it a subscriber bypasses the proxy entirely.
-- **A key you already set is a refusal, not an overwrite.** TOML rejects
-  duplicate keys, so appending ours would not win the argument; it would stop
-  codex reading the file at all. The wrap declines and names the key.
+- **What you already define is commented out for the session.** TOML rejects
+  a duplicate key or table, so appending ours would not win the argument; it
+  would stop codex reading the file at all. Your own `model_provider`,
+  `openai_base_url` (bare, `"quoted"` or `'quoted'`, multi-line values
+  included) and `[model_providers.kompressor]` table are prefixed with
+  `# kompressor wrap disabled this line:` while the wrap runs, the wrap says
+  which, and cleanup puts them back. A file that would still not parse after
+  that — a dotted `model_providers.kompressor.name = …` key, say — is refused
+  and left untouched, with the parse error named.
 
 If a session is killed before it can clean up, `kompressor unwrap codex`
 removes the blocks. Concurrent wraps are reference-counted: the last one out

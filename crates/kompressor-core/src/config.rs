@@ -45,6 +45,11 @@ pub struct ServerConfig {
     pub api_listen: String,
     pub mcp_listen: String,
     pub proxy_listen: String,
+    /// A listener of its own for the live statistics page and its JSON, e.g.
+    /// `127.0.0.1:8818`. Empty serves them only on the API listener, at
+    /// `/v1/stats/live`; set, they are served here too, whatever surfaces the
+    /// process runs, so a proxy-only deployment still has a dashboard.
+    pub stats_listen: String,
     pub max_body_bytes: usize,
     /// 0 means twice the detected parallelism.
     ///
@@ -75,6 +80,7 @@ impl Default for ServerConfig {
             api_listen: String::new(),
             mcp_listen: String::new(),
             proxy_listen: String::new(),
+            stats_listen: String::new(),
             max_body_bytes: 64 * 1024 * 1024,
             max_inflight_compressions: 0,
             queue_timeout: Duration::from_secs(2),
@@ -161,6 +167,15 @@ pub struct RefsConfig {
     #[serde(with = "humantime_serde")]
     pub purge_interval: Duration,
     pub max_bytes: u64,
+    /// Serve the ref browser: `/v1/refs`, which lists, shows and deletes
+    /// stored fragments for the caller's tenant.
+    ///
+    /// Off by default. Fragments are tool output — a `.env` read, a cloud
+    /// API response — and until this is on, reading one back needs its
+    /// unguessable handle. With it on, any credential for a tenant can list
+    /// that tenant's fragments, and with `auth.mode = "none"` anyone who can
+    /// reach the listener can.
+    pub browse: bool,
 }
 
 impl Default for RefsConfig {
@@ -171,6 +186,7 @@ impl Default for RefsConfig {
             recent_cache_entries: 4096,
             purge_interval: Duration::from_secs(60),
             max_bytes: 1024 * 1024 * 1024,
+            browse: false,
         }
     }
 }
@@ -504,11 +520,22 @@ pub struct ProxyConfig {
     /// Those waits are kept warm too, while the conversation has a background
     /// task it has started and not yet been told has finished. In the second
     /// keep-warm run they were 13 of 30 pauses past five minutes, every one a
-    /// miss. The cap is lower than [`Self::cache_keep_warm_max_pings`] because
-    /// this wait can be a dead end: an agent that gives its final answer with a
-    /// job still running never sends another request, and 0–4 conversations a
-    /// run did. Four pings, about 20 minutes, covered 45 of the 48 such waits
-    /// past 270 s across four 89-task runs.
+    /// miss.
+    ///
+    /// This wait can be a dead end: an agent that gives its final answer with
+    /// a job still running never sends another request, and 0–4 conversations
+    /// a run did. That was the reason for a lower cap, four pings (about 20
+    /// minutes), and it priced the wrong way round. A ping costs 0.1x the
+    /// prefix; the wait it fails to bridge is re-written at 2x, because
+    /// `cache_ttl = "adaptive"` moves the conversation to one-hour entries on
+    /// that very request — so one bridged wait pays for about 19 pings, and a
+    /// dead end at 11 costs at most seven more than one at 4. Measured on the
+    /// 89-task run of 2026-10-30 (`14-37-11`): three background waits of 26,
+    /// 43 and 60 minutes outran four pings and re-wrote 97,535 tokens at the
+    /// one-hour price, about $0.76, where the pings to bridge them would have
+    /// cost about $0.12; trailing pings after a conversation's last request
+    /// came to $0.03–$0.11 a run across the three final runs. Now the same 11
+    /// as [`Self::cache_keep_warm_max_pings`], which also caps it.
     pub cache_keep_warm_background_pings: u32,
     /// How many retrieve rounds may be **answered** in one request.
     ///
@@ -860,7 +887,7 @@ impl Default for ProxyConfig {
             cache_keep_warm: false,
             cache_keep_warm_interval: Duration::from_secs(270),
             cache_keep_warm_max_pings: 11,
-            cache_keep_warm_background_pings: 4,
+            cache_keep_warm_background_pings: 11,
             retrieve_execution: RetrieveExecution::Server,
             retrieve_max_rounds: 3,
             retrieve_max_tokens_per_request: 16_384,
@@ -1076,6 +1103,7 @@ impl Config {
                 "api_listen" => self.server.api_listen = value.to_string(),
                 "mcp_listen" => self.server.mcp_listen = value.to_string(),
                 "proxy_listen" => self.server.proxy_listen = value.to_string(),
+                "stats_listen" => self.server.stats_listen = value.to_string(),
                 _ => {}
             },
             "auth" => match field {
@@ -1091,6 +1119,9 @@ impl Config {
                 "path" => self.refs.path = PathBuf::from(value),
                 "backend" if value.eq_ignore_ascii_case("memory") => {
                     self.refs.backend = RefsBackend::Memory;
+                }
+                "browse" => {
+                    self.refs.browse = parse_bool_setting("refs.browse", value, self.refs.browse)
                 }
                 _ => {}
             },
@@ -1756,7 +1787,7 @@ mod tests {
             Duration::from_secs(240)
         );
         assert_eq!(config.proxy.cache_keep_warm_max_pings, 5);
-        assert_eq!(config.proxy.cache_keep_warm_background_pings, 4);
+        assert_eq!(config.proxy.cache_keep_warm_background_pings, 11);
         config.apply_env(&[(
             "KOMPRESSOR__PROXY__CACHE_KEEP_WARM_BACKGROUND_PINGS".into(),
             "0".into(),
@@ -1951,5 +1982,28 @@ mod tests {
     fn an_unknown_key_in_a_config_file_is_an_error_not_a_silent_typo() {
         let text = "[engine]\nmax_array_itemz = 5\n";
         assert!(toml::from_str::<Config>(text).is_err());
+    }
+    #[test]
+    fn the_statistics_listener_is_off_until_a_file_or_the_environment_names_it() {
+        assert!(Config::default().server.stats_listen.is_empty());
+        let from_file: Config =
+            toml::from_str("[server]\nstats_listen = \"127.0.0.1:8818\"\n").expect("parses");
+        assert_eq!(from_file.server.stats_listen, "127.0.0.1:8818");
+        let mut config = Config::default();
+        config.apply_env(&[(
+            "KOMPRESSOR__SERVER__STATS_LISTEN".into(),
+            "0.0.0.0:9000".into(),
+        )]);
+        assert_eq!(config.server.stats_listen, "0.0.0.0:9000");
+    }
+
+    #[test]
+    fn the_ref_browser_is_off_until_a_file_or_the_environment_turns_it_on() {
+        assert!(!Config::default().refs.browse);
+        let from_file: Config = toml::from_str("[refs]\nbrowse = true\n").expect("parses");
+        assert!(from_file.refs.browse);
+        let mut config = Config::default();
+        config.apply_env(&[("KOMPRESSOR__REFS__BROWSE".into(), "true".into())]);
+        assert!(config.refs.browse);
     }
 }

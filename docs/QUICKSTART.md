@@ -46,9 +46,12 @@ and the entries below differ:
   single `openai_base_url` override. `wrap` reads the mode from codex's own
   `auth.json`; `kompressor unwrap codex` removes a block left behind by a
   session that was killed. [CODEX.md](CODEX.md) has the details.
-- **opencode** reads it only for its built-in `openai` provider. A provider
-  declared in `opencode.json` carries its own `options.baseURL`, and config
-  beats environment — so point that provider at the proxy instead.
+- **opencode** (2.x) must not get the variable at all: `OPENAI_BASE_URL` in its
+  environment makes every OpenAI model "unavailable" (measured on 2.2.4). It is
+  wrapped through its configuration instead — `OPENCODE_CONFIG_CONTENT` plus
+  `--standalone` for a launched session, the global `opencode.json` and an
+  `opencode reload` for `--attach`, which is how OpenCode Desktop is reached.
+  [OPENCODE.md](OPENCODE.md) has the details.
 - **claude** reads it and routes correctly, but pins its whole prompt with a
   `cache_control` breakpoint, so a wrapped session compresses nothing by design.
   [CLAUDE-CODE.md](CLAUDE-CODE.md) explains why that is the right outcome.
@@ -65,7 +68,7 @@ Agents kompressor wrap knows:
   cursor        Cursor (GUI editor; base URL set by hand in Settings)
   claude        Claude Code (Anthropic Messages)
   codex         OpenAI Codex CLI (OpenAI Responses), via its config file
-  opencode      opencode (OpenAI Chat; only for its built-in `openai` provider)
+  opencode      opencode CLI/TUI and Desktop (openai, anthropic, OpenCode Zen and Go), via its config
   aider         aider (OpenAI Chat or Anthropic Messages, by model)
 
 Anything else: kompressor wrap --env NAME=root|v1 -- <command> [args]
@@ -252,9 +255,57 @@ $ curl -s localhost:8817/v1/retrieve -H 'content-type: application/json' \
 | `POST /v1/retrieve` | a handle in, the elided bytes out |
 | `POST /v1/detect` | classify a payload without compressing it |
 | `GET /v1/stats/summary` `by_type` `histogram` `requests` `retrievals` `store` | the same reports as `kompressor stats` — mounted only when `stats.enabled` (the default); with statistics off the whole prefix 404s |
+| `GET /v1/stats/live` | live statistics: JSON, or a dashboard that refreshes itself when opened in a browser (`?format=html`) |
+| `GET /v1/refs` | the ref browser: the fragments recoverable compression stored, searchable, as JSON or a page — off unless `refs.browse = true` |
 | `GET /healthz` `/readyz` `/metrics` | liveness, readiness, Prometheus |
 
 `/v2` is served as an alias of `/v1` so a client pinned to either keeps working.
+
+### Live statistics on a port of their own
+
+```toml
+[server]
+stats_listen = "127.0.0.1:8818"
+```
+
+Then open `http://127.0.0.1:8818/` for the dashboard, or ask for JSON:
+
+```bash
+curl -s 'http://127.0.0.1:8818/v1/stats/live?window=15m&recent=10'
+```
+
+The listener serves only the dashboard, the JSON and the probes, and it runs
+whatever surfaces `serve` was started with — so a proxy-only service has a
+dashboard too. Leave `stats_listen` empty to serve `/v1/stats/live` only on the
+API listener. `KOMPRESSOR__SERVER__STATS_LISTEN` sets it from the environment.
+
+### Browsing the ref store
+
+Recoverable compression keeps what it elided behind a handle. To see what is
+there — what the proxy took out of a session, whether a secret ended up in a
+fragment — turn the ref browser on:
+
+```toml
+[refs]
+browse = true
+```
+
+Then open `/v1/refs` on the API listener, or `http://127.0.0.1:8818/refs` on
+the statistics listener, for a page that lists the fragments newest first, with
+search over their text, handles and request ids, filters by kind, and each
+fragment in full with every time a model asked for it. JSON is the same path:
+
+```bash
+curl -s 'http://127.0.0.1:8080/v1/refs?q=AWS_SECRET&order=largest&limit=20'
+curl -s 'http://127.0.0.1:8080/v1/refs/k_AbC123dEf456'
+curl -s -X DELETE 'http://127.0.0.1:8080/v1/refs/k_AbC123dEf456'
+```
+
+Looking is not using: nothing here restarts a fragment's idle window or counts
+as a retrieval. A key sees only its own tenant's fragments. Fragments are tool
+output, so the browser is off by default — with it on and `auth.mode = "none"`,
+anyone who can reach the listener can read them. `KOMPRESSOR__REFS__BROWSE=true`
+sets it from the environment.
 
 ---
 
@@ -652,13 +703,23 @@ three places, first match wins:
 | 3 | `$XDG_CONFIG_HOME/kompressor/config.toml`, or `~/.config/kompressor/config.toml` when that variable is unset |
 
 `/etc/kompressor/config.toml` appears nowhere in that list: the service reads it
-only because the unit passes `--config` explicitly. So a bare `kompressor stats`
-run by a human does not find the system config. Worse, if you also have a user
-config it finds *that* one and answers from the wrong store without saying so:
+only because the unit passes `--config` explicitly. `kompressor stats` is the
+one command that looks there too, and only when the search path found nothing.
+If you also have a user config it finds *that* one, and when its store exists
+it answers from the wrong store without saying so:
 
 ```bash
 $ kompressor stats summary      # with a user config present
 requests   6                    # your own store, not /var/lib/kompressor
+```
+
+A user config whose store does *not* exist (left over from running the service
+by hand before installing the package) gives way to the system one, and says so
+on stderr:
+
+```text
+kompressor: ~/.config/kompressor/config.toml names ~/.local/share/kompressor/stats.db,
+which does not exist; reading /var/lib/kompressor/stats.db from /etc/kompressor/config.toml instead.
 ```
 
 Three ways to ask the right one:

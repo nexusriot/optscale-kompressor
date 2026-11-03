@@ -61,6 +61,8 @@ pub struct ReadMessage<'a> {
     pub tool_name: Option<&'a str>,
     pub path: Option<&'a str>,
     pub protected: bool,
+    /// The tool reported a failure, so a write here changed nothing.
+    pub failed: bool,
 }
 
 /// Tools whose result is a file's contents.
@@ -68,16 +70,60 @@ const READ_TOOLS: [&str; 2] = ["read", "read_file"];
 /// Tools that change a file's contents.
 const WRITE_TOOLS: [&str; 4] = ["edit", "write", "write_file", "apply_patch"];
 
+/// How a write tool's result opens when the write did not happen.
+///
+/// The OpenAI families carry no error flag on a tool result, so the result's
+/// own first line is the only evidence. Claude Code's `<tool_use_error>` and
+/// codex's `apply_patch verification failed` are the spellings measured; the
+/// rest are the generic ones harnesses prefix an exception with.
+const FAILURE_PREFIXES: [&str; 6] = [
+    "error",
+    "<tool_use_error>",
+    "failed",
+    "failure",
+    "fatal",
+    "apply_patch verification failed",
+];
+
+/// Whether a tool result says the call failed.
+///
+/// Read off the first non-blank line only: a successful write that echoes
+/// file content containing the word "error" further down is still a write.
+pub fn reports_failure(result: &str) -> bool {
+    let Some(first) = result.lines().map(str::trim).find(|line| !line.is_empty()) else {
+        return false;
+    };
+    let first = first.to_ascii_lowercase();
+    FAILURE_PREFIXES
+        .iter()
+        .any(|prefix| first.starts_with(prefix))
+}
+
 /// Compare two paths the way an agent harness spells them.
 ///
 /// The same file arrives as `./src/a.rs`, `src/a.rs`, `src\a.rs` and
 /// `src//a.rs` within one conversation, depending on which tool reported it, so
 /// a byte comparison would miss most write-after-read pairs.
+///
+/// Only spellings of the same path are folded: separators, empty components
+/// and `.` components. A leading dot is part of a name (`.env` is not `env`),
+/// `..` leaves the directory, and a leading `/` is the root, not the working
+/// directory — stripping any of those made a write to one file mark a read of
+/// another stale. `..` is kept rather than resolved, because through a symlink
+/// `a/..` is not where `a` came from.
 pub fn normalize_path(path: &str) -> String {
-    path.replace('\\', "/")
-        .replace("//", "/")
-        .trim_start_matches(['.', '/'])
-        .to_string()
+    let path = path.replace('\\', "/");
+    let absolute = path.starts_with('/');
+    let parts: Vec<&str> = path
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+    let joined = parts.join("/");
+    if absolute {
+        format!("/{joined}")
+    } else {
+        joined
+    }
 }
 
 /// Classify every Read in `messages` as fresh or stale.
@@ -103,7 +149,9 @@ pub fn classify_reads(
         if READ_TOOLS.contains(&tool.as_str()) {
             let protected = index < frozen_message_count || message.protected;
             reads.push((index, path, protected));
-        } else if WRITE_TOOLS.contains(&tool.as_str()) {
+        } else if WRITE_TOOLS.contains(&tool.as_str()) && !message.failed {
+            // A failed write left the file as it was: the read before it is
+            // still the truth, and the one the agent needs to retry.
             writes.push((index, path));
         }
     }
@@ -136,6 +184,7 @@ mod tests {
             tool_name: Some(tool),
             path: Some(path),
             protected: false,
+            failed: false,
         }
     }
 
@@ -145,6 +194,7 @@ mod tests {
             tool_name: None,
             path: None,
             protected: false,
+            failed: false,
         }
     }
 
@@ -200,6 +250,7 @@ mod tests {
                 tool_name: Some("read"),
                 path: None,
                 protected: false,
+                failed: false,
             },
         ];
         assert!(classify_reads(&messages, 0).is_empty());
@@ -226,6 +277,7 @@ mod tests {
                 tool_name: Some("read"),
                 path: Some("src/a.rs"),
                 protected: true,
+                failed: false,
             },
             msg("edit", "src/a.rs"),
         ];
@@ -264,16 +316,72 @@ mod tests {
     fn normalisation_folds_the_spellings_a_harness_produces() {
         assert_eq!(normalize_path("src\\a.rs"), "src/a.rs");
         assert_eq!(normalize_path("./src/a.rs"), "src/a.rs");
-        assert_eq!(normalize_path("/src//a.rs"), "src/a.rs");
-        assert_eq!(normalize_path("../src/a.rs"), "src/a.rs");
+        assert_eq!(normalize_path("././src/a.rs"), "src/a.rs");
+        assert_eq!(normalize_path("src//a.rs"), "src/a.rs");
+        assert_eq!(normalize_path("src/./a.rs"), "src/a.rs");
+        assert_eq!(normalize_path("/src//a.rs"), "/src/a.rs");
         assert_eq!(normalize_path("src/a.rs"), "src/a.rs");
     }
 
     #[test]
-    fn normalisation_leaves_a_dot_inside_the_path_alone() {
-        // only a *leading* run of `.` and `/` is stripped
-        assert_eq!(normalize_path("src/./a.rs"), "src/./a.rs");
+    fn normalisation_keeps_what_names_a_different_file() {
+        // A leading dot is part of the name, `..` leaves the directory, and a
+        // leading slash is the root rather than the working directory.
+        assert_eq!(normalize_path(".env"), ".env");
+        assert_eq!(normalize_path("./.env"), ".env");
+        assert_eq!(normalize_path("../src/a.rs"), "../src/a.rs");
+        assert_eq!(normalize_path("/etc/config"), "/etc/config");
+        // Not resolved: through a symlink, `a/..` is not where `a` came from.
         assert_eq!(normalize_path("a/../b.rs"), "a/../b.rs");
+    }
+
+    #[test]
+    fn a_write_to_a_different_file_with_a_similar_spelling_leaves_the_read_fresh() {
+        for (read, write) in [
+            (".env", "env"),
+            ("src/a.rs", "../src/a.rs"),
+            ("/etc/config", "etc/config"),
+        ] {
+            let messages = [msg("Read", read), msg("Write", write)];
+            assert_eq!(
+                classify_reads(&messages, 0).get(&0),
+                Some(&ReadState::Fresh),
+                "a write to {write} says nothing about {read}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_write_leaves_the_read_fresh() {
+        let messages = [
+            msg("read", "src/a.rs"),
+            ReadMessage {
+                tool_name: Some("edit"),
+                path: Some("src/a.rs"),
+                protected: false,
+                failed: true,
+            },
+        ];
+        assert_eq!(
+            classify_reads(&messages, 0).get(&0),
+            Some(&ReadState::Fresh)
+        );
+    }
+
+    #[test]
+    fn a_failure_is_read_off_the_first_line_only() {
+        assert!(reports_failure("ERROR: permission denied; file unchanged"));
+        assert!(reports_failure(
+            "\n  <tool_use_error>File has not been read yet."
+        ));
+        assert!(reports_failure(
+            "apply_patch verification failed: no such hunk"
+        ));
+        assert!(!reports_failure(
+            "The file a.rs has been updated.\nerror: kept"
+        ));
+        assert!(!reports_failure("ok"));
+        assert!(!reports_failure(""));
     }
 
     #[test]

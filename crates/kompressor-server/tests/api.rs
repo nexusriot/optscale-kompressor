@@ -46,18 +46,28 @@ impl Harness {
     /// endpoints: the queries under test are SQL over a real schema, and an
     /// in-memory fake would test none of it.
     fn with_stats() -> Harness {
+        Harness::with_stats_and(|_| {}, kompressor_server::router)
+    }
+
+    /// Statistics on, a further config tweak, and the router to serve.
+    fn with_stats_and(
+        tweak: impl FnOnce(&mut Config),
+        make_router: fn(Arc<kompressor_server::ServerState>) -> Router,
+    ) -> Harness {
         let dir = tempfile::tempdir().expect("a temp dir");
         let path = dir.path().join("stats.db");
         let (sink, handle) =
             kompressor_stats::spawn(&StatsConfig::at(&path)).expect("the writer starts");
         let sink_for_core = sink.clone();
-        let mut harness = Harness::build(
+        let mut harness = Harness::build_with(
             move |config| {
                 config.stats.enabled = true;
                 config.stats.path = path.clone();
+                tweak(config);
             },
             Some(sink_for_core),
             Some(dir),
+            make_router,
         );
         harness.sink = sink;
         harness.stats = Some(handle);
@@ -69,6 +79,15 @@ impl Harness {
         sink: Option<StatsSink>,
         dir: Option<tempfile::TempDir>,
     ) -> Harness {
+        Harness::build_with(tweak, sink, dir, kompressor_server::router)
+    }
+
+    fn build_with(
+        tweak: impl FnOnce(&mut Config),
+        sink: Option<StatsSink>,
+        dir: Option<tempfile::TempDir>,
+        make_router: fn(Arc<kompressor_server::ServerState>) -> Router,
+    ) -> Harness {
         let mut config = Config::default();
         config.refs.backend = RefsBackend::Memory;
         config.stats.enabled = false;
@@ -79,7 +98,7 @@ impl Harness {
         let core = Arc::new(AppCore::new(config, refs, sink.clone()));
         let state = kompressor_server::ServerState::new(core);
         Harness {
-            router: kompressor_server::router(state),
+            router: make_router(state),
             sink,
             stats: None,
             _dir: dir,
@@ -156,6 +175,16 @@ impl Harness {
 
     async fn get(&self, path: &str) -> (StatusCode, Value) {
         let (status, value, _) = self.get_with(path, &[]).await;
+        (status, value)
+    }
+
+    async fn delete_with(&self, path: &str, headers: &[(&str, &str)]) -> (StatusCode, Value) {
+        let mut request = Request::builder().method("DELETE").uri(path);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let request = request.body(Body::empty()).expect("a request");
+        let (status, value, _) = self.send(request).await;
         (status, value)
     }
 
@@ -1053,4 +1082,396 @@ async fn the_stats_writer_is_shut_down_cleanly() {
     if let Some(handle) = harness.stats.take() {
         handle.shutdown().expect("the writer stops cleanly");
     }
+}
+
+/// A body as text, whatever `send` made of it.
+fn text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
+#[tokio::test]
+async fn the_live_view_reports_a_compression_moments_after_it_happened() {
+    let harness = Harness::with_stats();
+    let (status, _) = harness
+        .post(
+            "/v1/compress/raw",
+            json!({"content": log_payload(400), "request_id": "live-1"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    harness.sink.flush().expect("the batch commits");
+
+    let (status, live) = harness.get("/v1/stats/live?window=15m&recent=5").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(live["window"]["label"], "15m");
+    assert_eq!(live["server"]["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(live["server"]["stats_dropped"], 0);
+    assert_eq!(live["totals"]["compressions"], 1);
+    assert!(live["totals"]["saved_gross"].as_i64().unwrap() > 0);
+    assert_eq!(live["recent"][0]["request_id"], "live-1");
+    assert_eq!(live["recent"][0]["surface"], "api");
+    assert_eq!(live["rates"].as_array().unwrap().len(), 3);
+    assert!(!live["timeline"].as_array().unwrap().is_empty());
+    for section in [
+        "upstream",
+        "by_provider",
+        "by_model",
+        "by_type",
+        "skipped_by_reason",
+        "retrievals",
+    ] {
+        assert!(
+            !live[section].is_null(),
+            "{section} is part of the snapshot"
+        );
+    }
+    // the versioned alias, as for every other reporting route
+    let (status, _) = harness.get("/v2/stats/live").await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_browser_gets_the_dashboard_and_a_client_gets_json() {
+    let harness = Harness::with_stats();
+    let browser = [("accept", "text/html,application/xhtml+xml,*/*;q=0.8")];
+    let (status, page, _) = harness.get_with("/v1/stats/live", &browser).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = text(&page);
+    assert!(page.starts_with("<!doctype html>"));
+    assert!(
+        page.contains("\"window\":\"1h\""),
+        "the settings are filled in"
+    );
+
+    let (status, forced, _) = harness
+        .get_with("/v1/stats/live?format=json", &browser)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        forced["totals"].is_object(),
+        "an explicit format beats the Accept header"
+    );
+
+    let (_, page) = harness
+        .get("/v1/stats/live?format=html&window=24h&refresh=5")
+        .await;
+    assert!(text(&page).contains("\"refresh\":5"));
+}
+
+#[tokio::test]
+async fn a_live_query_it_cannot_honour_is_refused() {
+    let harness = Harness::with_stats();
+    for query in [
+        "window=2w",
+        "window=91d",
+        "recent=500",
+        "format=xml",
+        "refresh=0",
+        "colour=red",
+    ] {
+        let (status, body) = harness.get(&format!("/v1/stats/live?{query}")).await;
+        assert!(status.is_client_error(), "{query} answered {status}");
+        assert!(body["error"]["message"].is_string(), "{query} says why");
+    }
+}
+
+#[tokio::test]
+async fn the_live_data_needs_a_key_where_keys_are_required_but_the_page_does_not() {
+    let harness = Harness::with_stats_and(keyed_config, kompressor_server::router);
+    let (status, _) = harness.get("/v1/stats/live?format=json").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // the page holds no data; it asks for the key and sends it with its polls
+    let (status, page) = harness.get("/v1/stats/live?format=html").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(text(&page).contains("x-kompressor-key"));
+
+    let (status, live, _) = harness
+        .get_with("/v1/stats/live", &[("x-kompressor-key", "sk-alpha")])
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(live["tenant"], "team-a");
+
+    let (status, _, _) = harness
+        .get_with(
+            "/v1/stats/live?tenant=team-b",
+            &[("x-kompressor-key", "sk-alpha")],
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a key reads only its own tenant"
+    );
+}
+
+#[tokio::test]
+async fn live_statistics_on_a_deployment_with_statistics_off_say_so() {
+    let harness = Harness::memory();
+    let (status, body) = harness.get("/v1/stats/live").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(text(&body["error"]["message"]).contains("disabled"));
+}
+
+#[tokio::test]
+async fn the_statistics_listener_serves_the_dashboard_and_nothing_that_compresses() {
+    let harness = Harness::with_stats_and(|_| {}, kompressor_server::stats_listener_router);
+    let (status, page) = harness.get("/").await;
+    assert_eq!(status, StatusCode::OK);
+    let page = text(&page);
+    assert!(page.contains("Kompressor live"));
+    assert!(
+        page.contains("\"endpoint\":\"/v1/stats/live\""),
+        "the page at / must poll the JSON path, not itself"
+    );
+
+    let (status, live) = harness.get("/v1/stats/live").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(live["server"].is_object());
+
+    let (status, health) = harness.get("/healthz").await;
+    assert_eq!(
+        (status, health["status"].as_str()),
+        (StatusCode::OK, Some("ok"))
+    );
+
+    let (status, _) = harness
+        .post("/v1/compress/raw", json!({"content": log_payload(10)}))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a stats port is not a compression port"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ref browser
+// ---------------------------------------------------------------------------
+
+fn browsable(config: &mut Config) {
+    config.refs.browse = true;
+}
+
+fn browsable_and_keyed(config: &mut Config) {
+    browsable(config);
+    keyed_config(config);
+}
+
+/// Compress a log big enough to elide, as `key`'s tenant, and return a handle.
+async fn mint(harness: &Harness, key: Option<&str>, request_id: &str) -> String {
+    let headers: Vec<(&str, &str)> = key.map(|k| ("x-kompressor-key", k)).into_iter().collect();
+    let (status, compressed, _) = harness
+        .post_with(
+            "/v1/compress",
+            json!({
+                "messages": [{"role": "user", "content": log_payload(400)}],
+                "request_id": request_id,
+            }),
+            &headers,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    handle_in(&compressed["messages"])
+}
+
+#[tokio::test]
+async fn the_ref_browser_is_off_until_the_deployment_turns_it_on() {
+    let harness = Harness::memory();
+    mint(&harness, None, "req-off").await;
+    for path in ["/v1/refs", "/v1/refs/k_AAAAAAAAAAAA"] {
+        let (status, body) = harness.get(path).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+        assert!(
+            text(&body["error"]["message"]).contains("refs.browse"),
+            "{path} says how"
+        );
+    }
+    let (status, _) = harness.delete_with("/v1/refs/k_AAAAAAAAAAAA", &[]).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // The page itself is served, and explains from its first fetch.
+    let (status, page) = harness.get("/v1/refs?format=html").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(text(&page).contains("Kompressor refs"));
+}
+
+#[tokio::test]
+async fn a_minted_fragment_can_be_listed_searched_inspected_and_deleted() {
+    let harness = Harness::with_stats_and(browsable, kompressor_server::router);
+    let handle = mint(&harness, None, "req-browse-1").await;
+    let (_, retrieved) = harness.post("/v1/retrieve", json!({ "ref": handle })).await;
+    assert_eq!(retrieved["found"], true);
+    harness.sink.flush().expect("the batch commits");
+
+    let (status, page) = harness.get("/v1/refs").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page["total"].as_u64().unwrap() >= 1);
+    assert!(page["held"]["live_refs"].as_u64().unwrap() >= 1);
+    let listed: Vec<&str> = page["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["handle"].as_str().unwrap())
+        .collect();
+    assert!(
+        listed.contains(&handle.as_str()),
+        "{listed:?} lists {handle}"
+    );
+    assert!(!page["kinds"].as_array().unwrap().is_empty());
+
+    for search in [handle.clone(), format!("ref:{handle}")] {
+        let (_, found) = harness.get(&format!("/v1/refs?q={search}")).await;
+        assert_eq!(found["total"], 1, "{search}");
+        assert_eq!(found["entries"][0]["handle"], handle.as_str());
+        assert_eq!(found["entries"][0]["request_id"], "req-browse-1");
+    }
+    let (_, by_request) = harness.get("/v1/refs?request_id=req-browse-1").await;
+    assert!(by_request["total"].as_u64().unwrap() >= 1);
+    let (_, nothing) = harness.get("/v1/refs?q=no-such-text-anywhere").await;
+    assert_eq!(nothing["total"], 0);
+
+    let (status, detail) = harness.get(&format!("/v1/refs/{handle}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(detail["handle"], handle.as_str());
+    assert!(text(&detail["fragment"]).contains("worker heartbeat"));
+    assert!(detail["lines"].as_u64().unwrap() > 0);
+    assert_eq!(detail["expired"], false);
+    assert_eq!(detail["retrievals"]["retrievals"], 1);
+    assert_eq!(detail["retrievals"]["hits"], 1);
+    assert_eq!(detail["retrievals"]["recent"][0]["found"], true);
+
+    // Looking is not asking: neither the list nor the detail filed a
+    // retrieval or moved the fragment's clock.
+    let last_accessed = detail["last_accessed"].clone();
+    harness.get(&format!("/v1/refs/{handle}")).await;
+    harness.sink.flush().expect("the batch commits");
+    let (_, again) = harness.get(&format!("/v1/refs/{handle}")).await;
+    assert_eq!(again["retrievals"]["retrievals"], 1);
+    assert_eq!(again["last_accessed"], last_accessed);
+
+    let (status, deleted) = harness
+        .delete_with(&format!("/v1/refs/{handle}"), &[])
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(deleted["removed"], true);
+
+    let (_, after) = harness.post("/v1/retrieve", json!({ "ref": handle })).await;
+    assert_eq!(after["found"], false, "a deleted fragment is a miss");
+    let (status, _) = harness.get(&format!("/v1/refs/{handle}")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = harness
+        .delete_with(&format!("/v1/refs/{handle}"), &[])
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "deleting twice finds nothing"
+    );
+}
+
+#[tokio::test]
+async fn the_ref_browser_shows_each_key_only_its_own_tenant() {
+    let harness = Harness::with_config(browsable_and_keyed);
+    let alpha = mint(&harness, Some("sk-alpha"), "req-a").await;
+    let alpha_key = [("x-kompressor-key", "sk-alpha")];
+    let bravo_key = [("x-kompressor-key", "sk-bravo")];
+
+    let (status, _) = harness.get("/v1/refs").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, page, _) = harness.get_with("/v1/refs", &alpha_key).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page["tenant"], "team-a");
+    assert!(page["total"].as_u64().unwrap() >= 1);
+
+    let (status, page, _) = harness.get_with("/v1/refs", &bravo_key).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page["total"], 0, "bravo holds nothing");
+
+    let (status, _, _) = harness
+        .get_with(&format!("/v1/refs/{alpha}"), &bravo_key)
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "another tenant's handle is not there"
+    );
+    let (status, _) = harness
+        .delete_with(&format!("/v1/refs/{alpha}"), &bravo_key)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _, _) = harness.get_with("/v1/refs?tenant=team-a", &bravo_key).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = harness
+        .delete_with(&format!("/v1/refs/{alpha}?tenant=team-a"), &bravo_key)
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // the cluster secret acts for a named tenant, as on the other reports
+    let (status, page, _) = harness
+        .get_with(
+            "/v1/refs?tenant=team-a",
+            &[("x-kompressor-secret", "cluster-secret")],
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page["total"].as_u64().unwrap() >= 1);
+
+    let (_, still, _) = harness
+        .get_with(&format!("/v1/refs/{alpha}"), &alpha_key)
+        .await;
+    assert_eq!(
+        still["handle"],
+        alpha.as_str(),
+        "bravo's delete changed nothing"
+    );
+}
+
+#[tokio::test]
+async fn the_ref_browser_refuses_parameters_it_does_not_serve() {
+    let harness = Harness::with_config(browsable);
+    for query in [
+        "limit=0",
+        "limit=201",
+        "preview=5000",
+        "order=random",
+        "expired=maybe",
+        "format=xml",
+        "refresh=0",
+        "colour=red",
+    ] {
+        let (status, body) = harness.get(&format!("/v1/refs?{query}")).await;
+        assert!(status.is_client_error(), "{query} answered {status}");
+        assert!(body["error"]["message"].is_string(), "{query} says why");
+    }
+    let (status, _) = harness.get("/v1/refs/too-short").await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let (status, _) = harness.get("/v1/refs/k_AAAAAAAAAAAA?history=999").await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn the_statistics_listener_serves_the_ref_browser_beside_the_dashboard() {
+    let harness = Harness::with_stats_and(browsable, kompressor_server::stats_listener_router);
+    let (status, page) = harness.get("/refs").await;
+    assert_eq!(status, StatusCode::OK);
+    let page = text(&page);
+    assert!(page.contains("Kompressor refs"));
+    assert!(
+        page.contains("\"endpoint\":\"/v1/refs\""),
+        "the page at /refs must fetch the JSON path, not itself"
+    );
+    let (status, list) = harness.get("/v1/refs").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(list["total"], 0);
+
+    let (_, dashboard) = harness.get("/").await;
+    assert!(
+        text(&dashboard).contains("\"refs\":true"),
+        "the dashboard links it"
+    );
 }

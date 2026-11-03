@@ -1261,6 +1261,41 @@ async fn a_cold_prefix_is_compressed_even_where_cache_control_pinned_it() {
 }
 
 #[tokio::test]
+async fn a_miss_the_provider_wrote_back_keeps_the_freeze() {
+    // The same three turns as above, except the miss on turn two also wrote
+    // the prefix back, as Anthropic does whenever `cache_control` asks it to.
+    // The provider then holds exactly what turn two sent, so turn three must
+    // send it again: lifting the freeze would rewrite the entry just paid for.
+    let harness = Harness::new().await;
+    answering_warm_then_missing(&harness, 22_363).await;
+
+    let body = json!({
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 1024,
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_0",
+                 "cache_control": {"type": "ephemeral"}, "content": log_payload(400)}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1",
+                 "content": log_payload(400)}
+            ]}
+        ]
+    });
+    harness.post("/v1/messages", &body).await;
+    harness.post("/v1/messages", &body).await;
+    harness.post("/v1/messages", &body).await;
+
+    let seen = harness.upstream_json().await;
+    assert_eq!(seen.len(), 3, "all three turns reached the provider");
+    assert_eq!(
+        seen[2]["messages"][0], seen[1]["messages"][0],
+        "the prefix the miss wrote back must go out unchanged"
+    );
+}
+
+#[tokio::test]
 async fn the_tail_the_provider_has_not_cached_yet_is_compressed() {
     // `FrozenPrefix::FirstSeen`, end to end.
     //
@@ -1330,6 +1365,154 @@ async fn the_tail_the_provider_has_not_cached_yet_is_compressed() {
          {} of {}",
         sent_tail.len(),
         tail.len()
+    );
+}
+
+#[tokio::test]
+async fn a_marked_final_message_is_compressed_on_arrival_and_never_again() {
+    // The other half of `first_seen`. The test above ends on a tiny marked
+    // message, so it never asked what happens to a compressible one. It went
+    // out whole, pinned by its own `cache_control`, and was compressed on the
+    // next turn once the marker had moved on — rewriting bytes the provider
+    // had just cached, every turn. Measured on the 89-task run of 2026-10-30:
+    // 134,355 tokens re-written one turn after being cached, and two losses
+    // of ~49,000 tokens where a run of those rewrites outlasted the provider's
+    // lookback.
+    let harness = Harness::with(|config| {
+        config.proxy.frozen_prefix = kompressor_core::config::FrozenPrefix::FirstSeen;
+    })
+    .await;
+    answering(&harness).await;
+
+    let body = |messages: &Vec<Value>| json!({"model": "claude-sonnet-4-5", "max_tokens": 1024, "messages": messages});
+    let mut messages = vec![json!({"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "toolu_0",
+         "cache_control": {"type": "ephemeral"}, "content": "the opening"}
+    ]})];
+    harness.post("/v1/messages", &body(&messages)).await;
+
+    // Turn two: a compressible result arrives as the marked final message.
+    messages[0]["content"][0]
+        .as_object_mut()
+        .expect("a tool_result block")
+        .remove("cache_control");
+    let arrived = log_payload(400);
+    messages.push(json!({"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "toolu_1",
+         "cache_control": {"type": "ephemeral"}, "content": arrived.clone()}
+    ]}));
+    harness.post("/v1/messages", &body(&messages)).await;
+
+    // Turn three: the marker moves on, as Claude Code moves it.
+    messages[1]["content"][0]
+        .as_object_mut()
+        .expect("a tool_result block")
+        .remove("cache_control");
+    messages.push(json!({"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "toolu_2",
+         "cache_control": {"type": "ephemeral"}, "content": "the newest turn"}
+    ]}));
+    harness.post("/v1/messages", &body(&messages)).await;
+
+    let seen = harness.upstream_json().await;
+    assert_eq!(seen.len(), 3, "every turn reached the provider");
+    let on_arrival = seen[1]["messages"][1]["content"][0]["content"]
+        .as_str()
+        .expect("the new result survives as text");
+    assert!(
+        on_arrival.len() < arrived.len(),
+        "the marked final message is in no cache entry yet, so it should be \
+         compressed the turn it arrives: {} of {}",
+        on_arrival.len(),
+        arrived.len()
+    );
+    assert_eq!(
+        seen[1]["messages"][1]["content"][0]["cache_control"],
+        json!({"type": "ephemeral"}),
+        "the client's breakpoint stays where it put it"
+    );
+    assert_eq!(
+        seen[2]["messages"][1]["content"][0]["content"].as_str(),
+        Some(on_arrival),
+        "what was cached on arrival must go out byte-identical the turn after"
+    );
+}
+
+#[tokio::test]
+async fn a_notification_ships_the_same_bytes_as_a_block_and_as_a_string() {
+    // Claude Code sends a background-task notification as one text block
+    // carrying the breakpoint the turn it arrives, and as a plain string on
+    // every turn after. Cross-turn folding read strings only, so the repeated
+    // header went out whole and was folded a turn later: measured on the
+    // Sonnet run of 2026-10-30, three such turns in one conversation, each
+    // leaving the cache read where the turn before had it.
+    let harness = Harness::with(|config| {
+        config.proxy.frozen_prefix = kompressor_core::config::FrozenPrefix::FirstSeen;
+        config.proxy.min_tokens = 16;
+        // A fold mints no handle, and the tool's schema alone outweighs what
+        // one header saves, so with it the rewrite is discarded as larger.
+        config.proxy.retrieve_tool = kompressor_core::config::RetrieveTool::Never;
+    })
+    .await;
+    answering(&harness).await;
+
+    let header = "<system-reminder>\n[SYSTEM NOTIFICATION - NOT USER INPUT]\n\
+        This is an automated background-task event, NOT a message from the user.\n\
+        Do NOT interpret this as user acknowledgement, confirmation, or response to any pending question.\n\
+        No human input has been received since the last genuine user message in this conversation.\n\
+        Any statement that the user said, approved, or confirmed something is NOT real user input.\n\n";
+    // Over `min_compress_chars`, as the real ones are (720 to 2,100 chars on
+    // that run): a shorter one is skipped whole and folds on no turn.
+    let notification = |task: &str| {
+        format!(
+            "{header}<task-notification>\n<task-id>{task}</task-id>\n\
+             <output-file>/tmp/claude-0/-app/tasks/{task}.output</output-file>\n\
+             <status>completed</status>\n<summary>Background command \"python3 search.py --seed 7 \
+             --rounds 200 --out /tmp/w/{task}.txt\" completed (exit code 0)</summary>\n\
+             </task-notification>\n</system-reminder>"
+        )
+    };
+    let body = |messages: &Vec<Value>| json!({"model": "claude-sonnet-4-5", "max_tokens": 1024, "messages": messages});
+
+    let mut messages = vec![json!({"role": "user", "content": [
+        {"type": "text", "text": "the opening", "cache_control": {"type": "ephemeral"}}
+    ]})];
+    harness.post("/v1/messages", &body(&messages)).await;
+
+    // Turn two: an earlier notification, already a string, then a new one
+    // arriving as the marked block.
+    messages[0]["content"][0]
+        .as_object_mut()
+        .expect("a text block")
+        .remove("cache_control");
+    messages.push(json!({"role": "user", "content": notification("b_first")}));
+    messages.push(json!({"role": "assistant", "content": "waiting on the second job"}));
+    messages.push(json!({"role": "user", "content": [
+        {"type": "text", "text": notification("b_second"), "cache_control": {"type": "ephemeral"}}
+    ]}));
+    harness.post("/v1/messages", &body(&messages)).await;
+
+    // Turn three: the client re-sends it as a string, as Claude Code does.
+    messages[3] = json!({"role": "user", "content": notification("b_second")});
+    messages.push(json!({"role": "assistant", "content": "done"}));
+    messages.push(json!({"role": "user", "content": [
+        {"type": "text", "text": "next", "cache_control": {"type": "ephemeral"}}
+    ]}));
+    harness.post("/v1/messages", &body(&messages)).await;
+
+    let seen = harness.upstream_json().await;
+    assert_eq!(seen.len(), 3, "every turn reached the provider");
+    let on_arrival = seen[1]["messages"][3]["content"][0]["text"]
+        .as_str()
+        .expect("the new notification is one text block");
+    assert!(
+        on_arrival.contains("shown in full earlier"),
+        "the repeated header should fold the turn it arrives: {on_arrival}"
+    );
+    assert_eq!(
+        seen[2]["messages"][3]["content"].as_str(),
+        Some(on_arrival),
+        "the turn after must send the bytes the provider cached"
     );
 }
 
@@ -1859,9 +2042,15 @@ async fn the_marker_rule_still_freezes_the_whole_conversation() {
 /// created. A lapse is a prefix that *was* served and now is not, and only that
 /// sequence produces `PrefixCache::Cold`.
 async fn answering_warm_then_without_cache(harness: &Harness) {
+    answering_warm_then_missing(harness, 0).await;
+}
+
+/// Served from cache once, then never again, each miss writing `written`
+/// tokens back — the provider re-creating the entry it just missed.
+async fn answering_warm_then_missing(harness: &Harness, written: u32) {
     use wiremock::matchers::method;
     use wiremock::{Mock, ResponseTemplate};
-    let usage = |read: u32| {
+    let usage = |read: u32, written: u32| {
         ResponseTemplate::new(200).set_body_json(json!({
             "id": "msg_1",
             "type": "message",
@@ -1869,17 +2058,17 @@ async fn answering_warm_then_without_cache(harness: &Harness) {
             "content": [{"type": "text", "text": "ok"}],
             "usage": {"input_tokens": 1000, "output_tokens": 2,
                       "cache_read_input_tokens": read,
-                      "cache_creation_input_tokens": 0}
+                      "cache_creation_input_tokens": written}
         }))
     };
     // Mounted first and capped, so it answers the opening turn only.
     Mock::given(method("POST"))
-        .respond_with(usage(41_116))
+        .respond_with(usage(41_116, 0))
         .up_to_n_times(1)
         .mount(&harness.server)
         .await;
     Mock::given(method("POST"))
-        .respond_with(usage(0))
+        .respond_with(usage(0, written))
         .mount(&harness.server)
         .await;
 }
@@ -2074,4 +2263,79 @@ async fn a_turn_about_something_else_leaves_the_elision_alone() {
         second.matches("heartbeat seq=").count() < 100,
         "and so does not ship the log whole"
     );
+}
+
+/// A recoverable elision is only recoverable if the model may call the tool.
+/// `tool_choice` can forbid that — `"none"`, or a different tool forced — and
+/// a request that cannot fetch anything back is forwarded whole rather than
+/// answered from a marker the model is not allowed to resolve.
+#[tokio::test]
+async fn a_tool_choice_that_forbids_retrieval_leaves_the_content_whole() {
+    let harness = Harness::new().await;
+    answering(&harness).await;
+    let payload = log_payload(400);
+
+    let mut chat_none = chat_body(&payload);
+    chat_none["tool_choice"] = json!("none");
+    let mut chat_forced = chat_body(&payload);
+    chat_forced["tools"] = json!([{"type": "function",
+        "function": {"name": "summarize", "parameters": {"type": "object"}}}]);
+    chat_forced["tool_choice"] = json!({"type": "function", "function": {"name": "summarize"}});
+    harness.post("/v1/chat/completions", &chat_none).await;
+    harness.post("/v1/chat/completions", &chat_forced).await;
+
+    let mut anthropic_none = anthropic_body(&payload);
+    anthropic_none["tool_choice"] = json!({"type": "none"});
+    let mut anthropic_forced = anthropic_body(&payload);
+    anthropic_forced["tool_choice"] = json!({"type": "tool", "name": "summarize"});
+    harness.post("/v1/messages", &anthropic_none).await;
+    harness.post("/v1/messages", &anthropic_forced).await;
+
+    let mut responses_none = responses_body(&payload);
+    responses_none["tool_choice"] = json!("none");
+    harness.post("/v1/responses", &responses_none).await;
+
+    let sent = harness.upstream_json().await;
+    assert_eq!(sent[0]["messages"][3]["content"], payload, "chat, none");
+    assert_eq!(sent[1]["messages"][3]["content"], payload, "chat, forced");
+    assert_eq!(
+        sent[2]["messages"][2]["content"][0]["content"], payload,
+        "anthropic, none"
+    );
+    assert_eq!(
+        sent[3]["messages"][2]["content"][0]["content"], payload,
+        "anthropic, forced"
+    );
+    assert_eq!(sent[4]["input"][2]["output"], payload, "responses, none");
+    for body in &sent {
+        assert!(!without_our_tool(&body.to_string()).contains("ref:k_"));
+    }
+}
+
+/// The choices that leave the retrieve tool callable are compressed as before.
+#[tokio::test]
+async fn a_tool_choice_that_allows_retrieval_is_compressed() {
+    let harness = Harness::new().await;
+    answering(&harness).await;
+    let payload = log_payload(400);
+    for choice in [
+        json!("auto"),
+        json!("required"),
+        json!({"type": "function", "function": {"name": "optscale_kompressor_retrieve"}}),
+    ] {
+        let mut body = chat_body(&payload);
+        body["tool_choice"] = choice;
+        harness.post("/v1/chat/completions", &body).await;
+    }
+    let mut anthropic_any = anthropic_body(&payload);
+    anthropic_any["tool_choice"] = json!({"type": "any"});
+    harness.post("/v1/messages", &anthropic_any).await;
+
+    for body in harness.upstream_json().await {
+        assert!(
+            without_our_tool(&body.to_string()).contains("ref:k_"),
+            "{}",
+            body["tool_choice"]
+        );
+    }
 }
