@@ -1635,6 +1635,18 @@ A background task's wait, which ends on `end_turn` rather than `tool_use`, again
 
 ![keep-warm for background tasks](charts/keepwarm-background.drawio.png)
 
+The current rules in three charts, drawn from the code as of 1.5.15 (the two above predate the background cap of 11, `Monitor`, `ScheduleWakeup` and `TaskStop`). Who does what across a tool call: the ping runs on its own tokio task, spawned once the response has been relayed, which the client's next request aborts before it is forwarded:
+
+![keep-warm across a tool call](charts/keepwarm/tool-call-sequence.drawio.png)
+
+When a response arms it:
+
+![when keep-warm is armed](charts/keepwarm/arming.drawio.png)
+
+When pings are sent, and what ends them:
+
+![ping schedule and what ends it](charts/keepwarm/schedule.drawio.png)
+
 **Stale-read is the exception**: a later write to the same path replaces the read before it, so appending a turn *does* rewrite an earlier one. The two features cannot both be had, and `frozen_prefix = "first_seen"` therefore withholds `enable_stale_read`. The economics decide which goes: at Opus rates, re-writing a 20,000-token suffix to remove a 2,000-token stale read needs ~125 further turns to break even, against sessions that run 20 to 70. `stale_reads_are_the_one_transform_that_rewrites_what_came_before` asserts both directions, so whoever makes the transform causal finds the test rather than the bill.
 
 Note the reach: the stale replacement handles `MessageContent::Text` only, so it cannot fire for Anthropic tool results that walk to `Blocks`. The gate is insurance for the shapes where it can (OpenAI string content, single-block messages), **not** an explanation of the cache churn measured on the 2026-09-27 `first_seen` run — that break, on the one turn where `refs_emitted` went 0→1, is still unexplained and needs the two consecutive request bodies diffed (`log.payloads`) rather than another hypothesis.
