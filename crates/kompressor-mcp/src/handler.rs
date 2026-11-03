@@ -477,7 +477,8 @@ fn envelope_note(output: &RetrieveOutput, reference: &str) -> Option<String> {
     }
     if output.truncated {
         return Some(format!(
-            "[kompressor: TRUNCATED at the size cap. ref:{reference} holds {} lines / {} chars.              Ask again with a narrower range rather than assuming this is all of it.]",
+            "[kompressor: TRUNCATED at the size cap. ref:{reference} holds {} lines / {} chars. \
+             Ask again with a narrower range rather than assuming this is all of it.]",
             output.total_lines, output.total_chars
         ));
     }
@@ -496,4 +497,58 @@ fn internal(error: serde_json::Error) -> ErrorData {
 
 fn tool_failure(what: &str, error: impl std::fmt::Display) -> ErrorData {
     ErrorData::internal_error(format!("could not {what}: {error}"), None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn output(found: bool, ranged: bool, truncated: bool) -> RetrieveOutput {
+        RetrieveOutput {
+            content: found.then(|| "fragment".to_string()),
+            found,
+            expired: false,
+            ranged,
+            total_lines: 200,
+            total_chars: 4_800,
+            truncated,
+            hint: None,
+        }
+    }
+
+    #[test]
+    fn a_whole_fragment_gets_no_note() {
+        assert_eq!(envelope_note(&output(true, false, false), "k_x"), None);
+    }
+
+    #[test]
+    fn a_miss_gets_no_note() {
+        // The first block already says why; a second would repeat it.
+        assert_eq!(envelope_note(&output(false, true, true), "k_x"), None);
+    }
+
+    #[test]
+    fn a_range_names_the_handle_and_the_whole_size() {
+        let note = envelope_note(&output(true, true, false), "k_abc").expect("a note");
+        assert_eq!(
+            note,
+            "[kompressor: a range of ref:k_abc, which holds 200 lines / 4800 chars in full.]"
+        );
+    }
+
+    #[test]
+    fn a_truncation_says_so_and_wins_over_a_range() {
+        // Truncated is the field that asks the model to act, so it is the one
+        // reported when both hold.
+        let note = envelope_note(&output(true, true, true), "k_abc").expect("a note");
+        assert_eq!(
+            note,
+            "[kompressor: TRUNCATED at the size cap. ref:k_abc holds 200 lines / 4800 chars. \
+             Ask again with a narrower range rather than assuming this is all of it.]"
+        );
+        assert!(
+            !note.contains("  "),
+            "no run of spaces in the text: {note:?}"
+        );
+    }
 }

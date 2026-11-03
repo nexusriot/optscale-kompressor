@@ -10,7 +10,8 @@ in bulk is tool results, and those are machine-facing in exactly the way tool
 output in a coding agent is.
 
 For the Code tab, use [CLAUDE-DESKTOP.md](CLAUDE-DESKTOP.md) instead — it
-compresses the whole request, which is strictly more.
+compresses the whole request, which is strictly more. How the module is built,
+and why, is in [design/MCP-PROXY.md](design/MCP-PROXY.md).
 
 ## Contents
 
@@ -37,12 +38,12 @@ opening it in drawio edits both. Re-export with `-e` or the source is lost.
 ```text
 Claude Desktop Chat
   └─ kompressor mcp serve            registered as an MCP server
-       ├─ our tools ................ compress, retrieve, stats
+       ├─ our tools ................ compress, compress_raw, retrieve, stats
        └─ fronted servers .......... their tools, prefixed, results compressed
 ```
 
-A `tools/call` for a fronted tool is forwarded verbatim and its text results are
-passed through the engine on the way back. Large results come back with a
+A `tools/call` for a fronted tool is forwarded with its arguments verbatim, and
+its text results are passed through the engine on the way back. Large results come back with a
 marker, and the model resolves it with `optscale_kompressor_retrieve`, which is
 listed beside them.
 
@@ -54,10 +55,12 @@ what the client's server stores, so every later turn pays the reduced price.
 
 ## 1. Install the binary
 
-Proxy mode is newer than most installed copies. Check before anything else:
+Proxy mode is newer than most installed copies, and `kompressor mcp serve`
+itself is older than proxy mode, so its presence proves nothing. Ask the binary
+whether it knows the key, once the configuration from step 2 exists:
 
 ```bash
-kompressor mcp serve --help >/dev/null 2>&1 && echo "mcp serve present"
+kompressor check-config --config ~/.config/kompressor/mcp-proxy.toml >/dev/null && echo "proxy mode known"
 ```
 
 Install the build that has it:
@@ -67,11 +70,14 @@ cp target/release/kompressor ~/.local/bin/kompressor
 ```
 
 A stale binary fails loudly rather than quietly, which is a mercy: it does not
-know `[[mcp.servers]]`, and the configuration is rejected whole.
+know `[[mcp.servers]]`, and the configuration is rejected whole, exit status 2.
 
 ```text
-kompressor: could not parse config: TOML parse error at line 40, column 7
-40 | [[mcp.servers]]
+kompressor: could not parse config: TOML parse error at line N, column 7
+  |
+N | [[mcp.servers]]
+  |       ^^^^^^^
+unknown field `servers`, expected one of `enabled`, `path`, `allowed_hosts`, …
 ```
 
 Claude Desktop shows that as a server which failed to start, with the reason
@@ -100,10 +106,14 @@ name = "fs"
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem", "/home/YOUR_USER/work"]
 compress = true
+startup_timeout = "60s"   # to answer initialize; the default
 ```
 
-`recoverable` matters: in any other mode an elision retains nothing, and the
-handle in the marker resolves to an explanation rather than the bytes.
+Each `name` must be unique and must not contain `__`, the separator between a
+server's name and its tools'. A later entry reusing a name is skipped.
+
+`recoverable` matters: in any other mode an elision retains nothing and the
+marker carries no handle, so there is nothing to fetch back.
 
 **Point `refs.path` at the same file a running `serve` uses.** That is
 deliberate and safe — WAL makes concurrent readers and one writer work across
@@ -129,16 +139,27 @@ printf '%s\n%s\n%s\n' \
   | grep -o '"name":"[^"]*"' | sort -u
 ```
 
-Expect our four tools unprefixed and the fronted server's under its name:
+Expect our four tools unprefixed and the fronted server's under its name,
+sorted, beside the server's own name from `initialize`:
 
 ```text
-"name":"optscale_kompressor_retrieve"
 "name":"fs__read_text_file"
 …
+"name":"optscale_kompressor"
+"name":"optscale_kompressor_compress"
+"name":"optscale_kompressor_compress_raw"
+"name":"optscale_kompressor_retrieve"
+"name":"optscale_kompressor_stats"
 ```
 
-Only our four and nothing prefixed means the servers were not fronted — check
-the binary from step 1, then the paths in `[[mcp.servers]]`.
+Only our four and nothing prefixed means no server was fronted. Drop the
+`2>/dev/null` and the reason is on stderr: `mcp serve` logs there, because
+stdout is the protocol. Each entry that was skipped has a `mcp server not
+fronted` line naming it and saying why. No such line, and nothing prefixed,
+means `KOMPRESSOR_MCP_FRONTED` is set in the environment that launched it.
+
+Claude Desktop keeps that stderr too, in its log for the server
+(`mcp-server-kompressor.log` beside its other logs).
 
 ## 4. Register it with Claude Desktop
 
@@ -189,33 +210,36 @@ A fold of *identical* lines — `connection refused [×380]` — carries no hand
 and needs none: the count preserves everything. That is a compressed result, not
 a failed one.
 
-**Ask the database, not the model.** A session asked what it sees will report
-that nothing was compressed even when thousands of tokens were removed, because
-the handles are resolved before the content reaches it. The rows above are the
-evidence; the model's account of its own context is not.
+**Ask the database, not the model.** The rows above are the evidence; the
+model's account of its own context is not. Through the HTTP proxy that is
+because handles are resolved before the content reaches the model, so it
+reports nothing compressed even when thousands of tokens were removed.
 
-This surface is the exception worth knowing about: a model that calls
-`optscale_kompressor_retrieve` itself *is* a witness, because the tool call
-appears in the transcript. That is the one place asking is meaningful — and what
-to ask is "did you call retrieve", not "do you see markers".
+This surface differs: the marker reaches the model unresolved, and a model that
+calls `optscale_kompressor_retrieve` itself *is* a witness, because the tool
+call appears in the transcript. That is the one place asking is meaningful —
+and what to ask is "did you call retrieve", not "do you see markers".
 
 ## When it does not work
 
 | symptom | cause |
 |---|---|
 | the server fails to start, `TOML parse error` near `[[mcp.servers]]` | stale binary; it does not know the key |
-| only our four tools, nothing prefixed | a `command` that is not on PATH for the spawning process, or one that exits immediately |
+| only our four tools, nothing prefixed | a `command` that is not on PATH for the spawning process, one that exits immediately, an entry with no `command` (or a `url`), or `KOMPRESSOR_MCP_FRONTED` set in the launching environment |
+| the session is slow to start, then one server's tools are missing | that server did not answer `initialize` within its `startup_timeout` (default 60 s) and was killed; raise it for a slow first `npx` download |
+| one of two entries' tools missing | both have the same `name`; the later one is skipped |
 | `mcp server … could not run …` in a result | the fronted server failed; its other tools and ours keep working by design |
 | a marker with no handle | a lossless fold, or `mode` is not `recoverable` |
 | `no such handle is held for this tenant` | `refs.path` differs between the process that minted and the one asked, or the mode is wrong |
 | the same tool twice in Chat | the fronted server is also registered directly in `claude_desktop_config.json` |
-| tools vanish after an upgrade | a fronted server's `command` moved; the session logs it and continues |
+| tools vanish after an upgrade | a fronted server's `command` moved; the session logs it to stderr, skips it, and continues |
 
 ## Limits
 
-**Stdio only.** A `url` upstream is refused with `url is not supported yet; use
-command`. Fronting over HTTP needs rmcp's reqwest client transport, which wants
-a newer `reqwest` than the proxy's own HTTP client is pinned to.
+**Stdio only.** A `url` upstream is skipped, like any entry that cannot be
+fronted, with `url is not supported yet; use command` on stderr. Fronting
+over HTTP needs rmcp's reqwest client transport, which wants `reqwest` 0.13.2 or
+newer, and the proxy's own HTTP client is pinned to 0.12.
 
 **The HTTP MCP surface does not front servers.** `serve --mcp` offers our four
 tools as before; proxy mode is `kompressor mcp serve`, the stdio server a client

@@ -17,17 +17,28 @@ use kompressor_mcp::limit::RetrievalLimiter;
 use kompressor_mcp::proxy::ProxyTools;
 use kompressor_store::memory::MemoryRefStore;
 
-/// A server that returns one large, highly compressible text block.
+/// A small MCP server, written as a shell script rather than a second binary
+/// so the test is self-contained: the protocol is small enough to answer by
+/// hand.
 ///
-/// Written as a shell script rather than a second binary so the test is
-/// self-contained: the protocol is small enough to answer by hand.
+/// Its tools each exercise one path through the proxy:
+///
+/// * `big_result` — one large, compressible text block of `lines` lines.
+/// * `small_result` — one short text block, under any elision threshold.
+/// * `with_image` — an image block beside a large text block.
+/// * `echo` — the request line it received, as text, so a test can see what
+///   was forwarded.
+/// * `whoami` — its arguments and two environment variables, so a test can see
+///   how it was spawned.
+/// * `die` — exits without answering, as a crashed server would.
 fn fake_server(dir: &std::path::Path, lines: usize) -> std::path::PathBuf {
     let path = dir.join("fake-mcp-server.sh");
     let script = format!(
         r#"#!/bin/bash
-# A minimal MCP server: answers initialize, lists one tool, and returns a
-# large result for it. One JSON-RPC message per line, as the transport frames.
+# One JSON-RPC message per line, as the transport frames.
 emit() {{ printf '%s\n' "$1"; }}
+text() {{ emit '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"content":[{{"type":"text","text":"'"$1"'"}}],"isError":false}}}}'; }}
+big() {{ for i in $(seq 1 {lines}); do printf 'WARN worker-%s: connection refused from 10.0.0.%s after %sms\\n' "$i" "$((i % 251))" "$((i * 7))"; done; }}
 while IFS= read -r line; do
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
   case "$line" in
@@ -35,11 +46,23 @@ while IFS= read -r line; do
       emit '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"protocolVersion":"2024-11-05","capabilities":{{"tools":{{}}}},"serverInfo":{{"name":"fake","version":"0"}}}}}}' ;;
     *'"method":"notifications/initialized"'*) ;;
     *'"method":"tools/list"'*)
-      emit '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"tools":[{{"name":"big_result","description":"returns a lot","inputSchema":{{"type":"object"}}}}]}}}}' ;;
-    *'"method":"tools/call"'*)
-      body=$(for i in $(seq 1 {lines}); do printf 'WARN worker-%s: connection refused from 10.0.0.%s after %sms\\n' "$i" "$((i % 251))" "$((i * 7))"; done)
-      payload=$(printf '%s' "$body" | sed ':a;N;$!ba;s/\n/\\n/g')
-      emit '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"content":[{{"type":"text","text":"'"$payload"'"}}],"isError":false}}}}' ;;
+      tools=''
+      for name in big_result small_result with_image echo whoami die; do
+        tools="$tools"'{{"name":"'"$name"'","description":"fake '"$name"'","inputSchema":{{"type":"object"}}}},'
+      done
+      emit '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"tools":['"${{tools%,}}"']}}}}' ;;
+    *'"method":"tools/call"'*'"name":"big_result"'*)
+      text "$(big)" ;;
+    *'"method":"tools/call"'*'"name":"small_result"'*)
+      text 'all good' ;;
+    *'"method":"tools/call"'*'"name":"with_image"'*)
+      emit '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"content":[{{"type":"image","data":"iVBORw0KGgo=","mimeType":"image/png"}},{{"type":"text","text":"'"$(big)"'"}}],"isError":false}}}}' ;;
+    *'"method":"tools/call"'*'"name":"echo"'*)
+      text "$(printf '%s' "$line" | sed 's/\\/\\\\/g; s/"/\\"/g')" ;;
+    *'"method":"tools/call"'*'"name":"whoami"'*)
+      text "args=$* fronted=${{KOMPRESSOR_MCP_FRONTED-unset}} extra=${{FAKE_EXTRA-unset}}" ;;
+    *'"method":"tools/call"'*'"name":"die"'*)
+      exit 3 ;;
     *'"method":"ping"'*)
       emit '{{"jsonrpc":"2.0","id":'"$id"',"result":{{}}}}' ;;
   esac
@@ -332,24 +355,366 @@ async fn fronting_a_real_rmcp_server() {
     serving.abort();
 }
 
-/// The guard against the recursion that a self-referential configuration
-/// creates.
-///
-/// A fronted server inherits the environment, including `KOMPRESSOR_CONFIG`. If
-/// that configuration fronts this same binary, the child reads it, sees itself,
-/// and spawns another — unbounded. This asserts the marker that stops it, which
-/// is cheaper to check here than to rediscover at 1,796 processes.
-#[test]
-fn a_fronted_process_refuses_to_front_further_servers() {
-    assert!(
-        !kompressor_mcp::proxy::is_fronted(),
-        "the test runner is not itself a fronted server"
+/// A client connected to proxy mode fronting `servers`, as an agent runtime
+/// would be.
+async fn session(
+    servers: Vec<McpServerConfig>,
+) -> (
+    rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+) {
+    let mut config = Config::default();
+    config.stats.enabled = false;
+    config.engine.mode = "recoverable".parse().unwrap_or_default();
+    config.mcp.servers = servers;
+    let core = Arc::new(AppCore::new(
+        config,
+        Arc::new(MemoryRefStore::new()) as Arc<dyn kompressor_store::types::RefStore>,
+        kompressor_stats::writer::null_sink(),
+    ));
+    let (client_side, server_side) = tokio::io::duplex(1 << 20);
+    let serving = tokio::spawn(kompressor_mcp::serve_proxy_pipe(
+        core,
+        kompressor_core::auth::Identity::anonymous(),
+        server_side,
+    ));
+    let client = rmcp::ServiceExt::serve((), client_side)
+        .await
+        .expect("client handshake");
+    (client, serving)
+}
+
+fn fake(script: &std::path::Path, compress: bool) -> McpServerConfig {
+    McpServerConfig {
+        name: "fake".to_string(),
+        command: Some(script.to_string_lossy().into_owned()),
+        compress,
+        ..Default::default()
+    }
+}
+
+fn request(name: &str, arguments: Option<serde_json::Value>) -> rmcp::model::CallToolRequestParams {
+    let mut params = rmcp::model::CallToolRequestParams::default();
+    params.name = name.to_string().into();
+    params.arguments = arguments.map(|a| a.as_object().cloned().expect("an object"));
+    params
+}
+
+/// Every text block of a result, in order.
+fn texts(result: &rmcp::model::CallToolResult) -> Vec<String> {
+    result
+        .content
+        .iter()
+        .filter_map(|b| match b {
+            rmcp::model::ContentBlock::Text(t) => Some(t.text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `compress = false` is a promise to forward that server's results as they
+/// came, however large.
+#[tokio::test]
+async fn a_server_with_compress_off_is_forwarded_untouched() {
+    let dir = tempdir("nocompress");
+    let script = fake_server(&dir, 400);
+    let (on, on_serving) = session(vec![fake(&script, true)]).await;
+    let (off, off_serving) = session(vec![fake(&script, false)]).await;
+
+    let compressed = texts(
+        &on.call_tool(request("fake__big_result", None))
+            .await
+            .unwrap(),
     );
-    // SAFETY: single-threaded test, and the variable is read by this crate only.
-    unsafe { std::env::set_var(kompressor_mcp::proxy::FRONTED_MARKER, "1") };
-    assert!(
-        kompressor_mcp::proxy::is_fronted(),
-        "the marker must be observable, or the recursion guard does nothing"
+    let forwarded = texts(
+        &off.call_tool(request("fake__big_result", None))
+            .await
+            .unwrap(),
     );
-    unsafe { std::env::remove_var(kompressor_mcp::proxy::FRONTED_MARKER) };
+
+    assert_eq!(forwarded.len(), 1);
+    assert_eq!(forwarded[0].lines().count(), 400, "every line arrives");
+    assert!(!forwarded[0].contains("ref:k_"), "nothing was elided");
+    assert!(
+        compressed[0].len() < forwarded[0].len(),
+        "the same result is compressed when compress is on, so the comparison means something"
+    );
+
+    for client in [on, off] {
+        let _ = client.cancel().await;
+    }
+    on_serving.abort();
+    off_serving.abort();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A result too small to be worth eliding comes back byte-identical.
+#[tokio::test]
+async fn a_small_result_is_byte_identical() {
+    let dir = tempdir("small");
+    let script = fake_server(&dir, 1);
+    let (client, serving) = session(vec![fake(&script, true)]).await;
+
+    let result = client
+        .call_tool(request("fake__small_result", None))
+        .await
+        .unwrap();
+    assert_eq!(texts(&result), ["all good"]);
+    assert_eq!(result.is_error, Some(false));
+
+    let _ = client.cancel().await;
+    serving.abort();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Only text is compressed; an image beside it is forwarded as it came.
+#[tokio::test]
+async fn a_non_text_block_passes_through_untouched() {
+    let dir = tempdir("image");
+    let script = fake_server(&dir, 400);
+    let (client, serving) = session(vec![fake(&script, true)]).await;
+
+    let result = client
+        .call_tool(request("fake__with_image", None))
+        .await
+        .unwrap();
+    assert_eq!(result.content.len(), 2, "no block added or dropped");
+    match &result.content[0] {
+        rmcp::model::ContentBlock::Image(image) => {
+            assert_eq!(image.data, "iVBORw0KGgo=");
+            assert_eq!(image.mime_type, "image/png");
+        }
+        other => panic!("the image block was replaced: {other:?}"),
+    }
+    let text = &texts(&result)[0];
+    assert!(
+        text.contains("ref:k_"),
+        "the text beside it is still compressed: {text}"
+    );
+
+    let _ = client.cancel().await;
+    serving.abort();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Arguments reach the fronted server as the model sent them: same keys, same
+/// order, same number spelling.
+#[tokio::test]
+async fn arguments_are_forwarded_as_sent() {
+    let dir = tempdir("echo");
+    let script = fake_server(&dir, 1);
+    // Compression off, so the echoed request is read back exactly.
+    let (client, serving) = session(vec![fake(&script, false)]).await;
+
+    let arguments = r#"{"zeta":1,"alpha":"x \"quoted\"","big":12345678901234567890.50,"nested":{"b":[true,null],"a":{}}}"#;
+    let result = client
+        .call_tool(request(
+            "fake__echo",
+            Some(serde_json::from_str(arguments).unwrap()),
+        ))
+        .await
+        .unwrap();
+    let line = &texts(&result)[0];
+    let received: serde_json::Value = serde_json::from_str(line).expect("the echoed request");
+
+    assert_eq!(received["params"]["name"], "echo", "the prefix is stripped");
+    assert_eq!(
+        serde_json::to_string(&received["params"]["arguments"]).unwrap(),
+        arguments,
+        "the arguments were rewritten on the way through"
+    );
+
+    let _ = client.cancel().await;
+    serving.abort();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A spawned server gets its configured `args` and `env`, and the recursion
+/// marker, which a configured `env` cannot clear.
+#[tokio::test]
+async fn a_spawned_server_gets_its_args_env_and_the_marker() {
+    let dir = tempdir("whoami");
+    let script = fake_server(&dir, 1);
+    let mut server = fake(&script, false);
+    server.args = vec!["--one".to_string(), "two".to_string()];
+    server.env = [
+        ("FAKE_EXTRA".to_string(), "configured".to_string()),
+        (
+            kompressor_mcp::proxy::FRONTED_MARKER.to_string(),
+            String::new(),
+        ),
+    ]
+    .into_iter()
+    .collect();
+    let (client, serving) = session(vec![server]).await;
+
+    let result = client
+        .call_tool(request("fake__whoami", None))
+        .await
+        .unwrap();
+    assert_eq!(
+        texts(&result),
+        ["args=--one two fronted=1 extra=configured"]
+    );
+
+    let _ = client.cancel().await;
+    serving.abort();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A server that dies mid-call costs that call and its own tools, and nothing
+/// else: the model gets a tool error it can report, and ours keep working.
+#[tokio::test]
+async fn a_server_that_dies_mid_call_is_a_tool_error_not_a_dead_session() {
+    let dir = tempdir("die");
+    let script = fake_server(&dir, 1);
+    let (client, serving) = session(vec![fake(&script, true)]).await;
+
+    let result = client.call_tool(request("fake__die", None)).await.unwrap();
+    assert_eq!(result.is_error, Some(true));
+    let message = &texts(&result)[0];
+    assert!(
+        message.starts_with(r#"mcp server "fake" could not run "die": "#),
+        "{message}"
+    );
+
+    let listed = client
+        .list_all_tools()
+        .await
+        .expect("tools/list still answers");
+    let names: Vec<&str> = listed.iter().map(|t| t.name.as_ref()).collect();
+    assert!(
+        names.contains(&"optscale_kompressor_retrieve"),
+        "ours survive: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n.starts_with("fake__")),
+        "a dead server lists nothing: {names:?}"
+    );
+
+    let again = client
+        .call_tool(request("fake__small_result", None))
+        .await
+        .unwrap();
+    assert_eq!(again.is_error, Some(true), "a later call is an error too");
+
+    let ours = client
+        .call_tool(request(
+            "optscale_kompressor_compress_raw",
+            Some(serde_json::json!({ "content": "still here" })),
+        ))
+        .await
+        .expect("our own tools still answer");
+    assert_ne!(ours.is_error, Some(true), "{ours:?}");
+
+    let _ = client.cancel().await;
+    serving.abort();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A name with no fronted server's prefix is one of ours, and is never
+/// forwarded anywhere -- including a prefix that merely looks like one.
+#[tokio::test]
+async fn an_unknown_prefix_is_answered_locally_not_forwarded() {
+    let dir = tempdir("unknown");
+    let script = fake_server(&dir, 1);
+    let (client, serving) = session(vec![fake(&script, true)]).await;
+
+    let error = client
+        .call_tool(request("other__small_result", None))
+        .await
+        .expect_err("no such tool, here or anywhere");
+    // Our own router's refusal, not a forwarded call's tool error.
+    match error {
+        rmcp::ServiceError::McpError(data) => {
+            assert_eq!(data.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+            assert_eq!(data.message, "tool not found");
+        }
+        other => panic!("not refused locally: {other}"),
+    }
+
+    let _ = client.cancel().await;
+    serving.abort();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A name already used by an earlier entry is skipped, so each prefix belongs
+/// to exactly one server and its tools are listed once.
+#[tokio::test]
+async fn a_second_server_with_the_same_name_is_skipped() {
+    let dir = tempdir("duplicate");
+    let script = fake_server(&dir, 1);
+    let core = core();
+    let proxy = ProxyTools::connect(
+        tools(core.clone()),
+        core,
+        &[fake(&script, true), fake(&script, false)],
+    )
+    .await;
+    assert_eq!(proxy.fronted(), 1);
+
+    let (client, serving) = session(vec![fake(&script, true), fake(&script, false)]).await;
+    let listed = client.list_all_tools().await.unwrap();
+    let small = listed
+        .iter()
+        .filter(|t| t.name.as_ref() == "fake__small_result")
+        .count();
+    assert_eq!(small, 1, "listed once, not once per entry");
+
+    let _ = client.cancel().await;
+    serving.abort();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Which entry owns a name does not depend on which one managed to start: the
+/// first owns it, and if the first cannot start, the name is unserved.
+#[tokio::test]
+async fn a_duplicate_is_skipped_even_when_the_first_failed() {
+    let dir = tempdir("duplicate-failed");
+    let script = fake_server(&dir, 1);
+    let core = core();
+    let broken = McpServerConfig {
+        name: "fake".to_string(),
+        command: Some("/nonexistent/mcp-server".to_string()),
+        ..Default::default()
+    };
+    let proxy =
+        ProxyTools::connect(tools(core.clone()), core, &[broken, fake(&script, true)]).await;
+    assert_eq!(proxy.fronted(), 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A server that starts and never answers costs its own tools after its
+/// timeout, not the session.
+#[tokio::test]
+async fn a_server_that_never_answers_does_not_hold_the_session() {
+    let dir = tempdir("hang");
+    let script = fake_server(&dir, 1);
+    let hang = McpServerConfig {
+        name: "hang".to_string(),
+        command: Some("sleep".to_string()),
+        args: vec!["30".to_string()],
+        startup_timeout: std::time::Duration::from_millis(300),
+        ..Default::default()
+    };
+
+    let started = std::time::Instant::now();
+    let (client, serving) = session(vec![hang, fake(&script, true)]).await;
+    let listed = client.list_all_tools().await.unwrap();
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "the session waited {:?} for a server that never answered",
+        started.elapsed()
+    );
+    let names: Vec<&str> = listed.iter().map(|t| t.name.as_ref()).collect();
+    assert!(names.contains(&"optscale_kompressor_retrieve"), "{names:?}");
+    assert!(
+        names.contains(&"fake__small_result"),
+        "the server after it: {names:?}"
+    );
+    assert!(!names.iter().any(|n| n.starts_with("hang__")), "{names:?}");
+
+    let _ = client.cancel().await;
+    serving.abort();
+    let _ = std::fs::remove_dir_all(&dir);
 }

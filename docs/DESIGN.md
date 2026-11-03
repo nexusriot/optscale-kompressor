@@ -1404,7 +1404,8 @@ Tool descriptions and the server `instructions` spell out every marker shape fro
 ### 11.2 Transports and auth
 
 - **Streamable HTTP** at `/mcp` on the shared listener: stateless — each POST independent, JSON responses — so the surface scales horizontally without sticky sessions. The header set read for tenant resolution is the same as §10.2. Origin/Host checks are configurable (`mcp.allowed_hosts`, default any, because the usual deployment is an internal service reached by its own DNS name). An SDK default of localhost-only host checking rejects exactly that request as misdirected: the caller's connection hangs and the retrieval capability silently never registers.
-- **stdio** via `kompressor mcp serve [--config PATH]`. An agent runtime spawns this process and speaks JSON-RPC down the pipe, so there is no connection to read a credential from: the tenant is fixed for the life of the process and resolved once at startup, through the same `Authenticator` the HTTP surface uses (`KOMPRESSOR_API_KEY`, or `KOMPRESSOR_SECRET` with `KOMPRESSOR_TENANT`). It opens the same SQLite files a running `serve` uses, WAL making one writer and many readers safe across processes, so a local proxy and a stdio tool server share one set of retained fragments and a handle minted by either resolves through the other. Logging is deliberately not initialised on this path: tracing's default sink is stdout, and one stray line there is a protocol violation the runtime reports as a broken server.
+- **stdio** via `kompressor mcp serve [--config PATH]`. An agent runtime spawns this process and speaks JSON-RPC down the pipe, so there is no connection to read a credential from: the tenant is fixed for the life of the process and resolved once at startup, through the same `Authenticator` the HTTP surface uses (`KOMPRESSOR_API_KEY`, or `KOMPRESSOR_SECRET` with `KOMPRESSOR_TENANT`). It opens the same SQLite files a running `serve` uses, WAL making one writer and many readers safe across processes, so a local proxy and a stdio tool server share one set of retained fragments and a handle minted by either resolves through the other. Logging goes to stderr on this path, at `log.level` and in `log.format` like any other command, because stdout is the protocol and one stray line there is a protocol violation the runtime reports as a broken server.
+- **Proxy mode**, on the stdio transport only: when `[[mcp.servers]]` names servers (`name`, and exactly one of `command` with optional `args` and `env`, or `url`, which is not supported yet and skipped; `compress`, default true), `mcp serve` spawns each one (`startup_timeout`, default 60 s, bounds its `initialize`), lists our four tools first and theirs as `<name>__<tool>`, forwards a call for theirs with its arguments as sent, and passes the text blocks of the result through `compress_raw`. An entry that cannot be fronted — misconfigured, a name already used by an earlier entry or holding `__`, a command that does not start or does not answer in time — is skipped with a `warn` on stderr, and the rest are served. Every spawned server gets `KOMPRESSOR_MCP_FRONTED=1`, and a process started with it ignores its own `[[mcp.servers]]`, so a configuration that fronts this binary cannot recurse. The HTTP transport does not front servers. Setup: [MCP-PROXY.md](MCP-PROXY.md); layout and decisions: [design/MCP-PROXY.md](design/MCP-PROXY.md).
 
 ### 11.3 Session hints
 
@@ -2208,6 +2209,9 @@ max_retrieve_chars = 32768
 [mcp]
 enabled = true
 path    = "/mcp"
+servers = []                        # [[mcp.servers]] to front from `mcp serve`, §11.2;
+                                    # each: name, command, args, env, url, compress = true,
+                                    # startup_timeout = "60s"
 allowed_hosts = []                  # empty = accept any Host
 max_retrievals_per_minute = 120
 

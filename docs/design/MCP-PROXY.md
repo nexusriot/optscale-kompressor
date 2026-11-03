@@ -37,8 +37,8 @@ retrieve half of the loop is therefore done, including the part that is easy to
 underestimate: `guidance.rs` teaches a model the marker grammar, without which
 recoverable mode silently becomes lossy.
 
-What is missing is that kompressor can be *called* as an MCP server but cannot
-*front* one. That is the whole of this proposal.
+What was missing is that kompressor could be *called* as an MCP server but
+could not *front* one. That is the whole of this module.
 
 `AppCore::compress_raw` is the hook, and it already builds its context with
 `Context::for_role("tool")` — a tool result is what it was written for.
@@ -54,9 +54,8 @@ without being told to.
 ```
 crates/kompressor-mcp/src/proxy/
     mod.rs      the session: one client in, several servers out
-    child.rs    launching and supervising a stdio server
-    remote.rs   an HTTP/streamable-HTTP server
-    merge.rs    tools/list merging, name prefixing, collisions
+    child.rs    launching a stdio server, and calling it
+    merge.rs    tools/list merging and name prefixing
     route.rs    which server owns a prefixed tool name
 ```
 
@@ -65,18 +64,25 @@ crates/kompressor-mcp/src/proxy/
 ```
 client (Claude Desktop Chat)
   │
-  ├─ initialize ......... answered locally, capabilities merged with the servers'
-  ├─ tools/list ......... fanned out, names prefixed, our retrieve tool appended
+  ├─ initialize ......... answered locally, with our own capabilities
+  ├─ tools/list ......... our four tools first, then each server's, prefixed
   ├─ tools/call
   │     ├─ ours ......... handled locally; retrieve never leaves the process
   │     └─ theirs ....... routed by prefix, forwarded verbatim, and the result's
   │                       text blocks passed through compress_raw on the way back
-  └─ notifications ...... forwarded unchanged in both directions
+  └─ notifications ...... not forwarded in either direction
 ```
 
 Only the response direction of a `tools/call` is touched. Arguments are
-forwarded byte for byte: a wrapped server that validates them strictly must see
-what the model actually sent.
+forwarded as sent — same keys, same order, same number spelling — because a
+wrapped server that validates them strictly must see what the model actually
+sent. The call is rebuilt from the de-prefixed name and those arguments, so
+anything else on the request (`_meta` included) does not reach the server.
+
+Fronted servers are connected one after another before the client is served,
+each with `startup_timeout` (default 60 s) to answer `initialize`. One that
+does not is killed and skipped, so it delays the session by at most that and
+cannot hold it. Calls to a server once it is up have no timeout of their own.
 
 ## Config surface
 
@@ -90,30 +96,41 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/home/you/work"]
 
 [[mcp.servers]]
 name = "wiki"
-# url = "https://wiki.internal/mcp"   # refused for now; see "Limits"
+command = "wiki-mcp"
+# url = "https://wiki.internal/mcp"   # skipped for now; see "Limits" in MCP-PROXY.md
 compress = false                       # forward this one untouched
 ```
 
 ```rust
-pub struct McpServer {
+#[serde(default, deny_unknown_fields)]
+pub struct McpServerConfig {
     pub name: String,
     /// Spawned, speaking JSON-RPC on the pipe. Exclusive with `url`.
     pub command: Option<String>,
     pub args: Vec<String>,
-    pub env: Vec<(String, String)>,
+    /// Extra environment for the spawned server; the parent's is inherited.
+    pub env: BTreeMap<String, String>,
     /// Connected to over HTTP. Exclusive with `command`, and refused for now:
     /// rmcp's reqwest client transport wants a newer `reqwest` than the proxy's
     /// own client is pinned to, and bumping that for a secondary transport was
     /// not a trade worth making mid-feature.
     pub url: Option<String>,
-    /// Whether results from this server are compressed at all.
+    /// Whether results from this server are compressed at all. Default true.
     pub compress: bool,
+    /// To answer `initialize` before it is killed and skipped. Default 60 s.
+    pub startup_timeout: Duration,
 }
 ```
 
-`command` and `url` are exclusive and one is required — a server that is
-neither spawned nor dialled is a configuration error worth refusing at startup
-rather than discovering on the first call.
+`command` and `url` are exclusive and one is required. The configuration loader
+does not check that: an entry naming neither, or both, is skipped when the
+session connects, and its tools never appear. A misspelt key is refused when
+the file loads, as anywhere else in the configuration, and so is a zero
+`startup_timeout`. A name already used by an earlier entry is skipped before
+anything is spawned, whether or not that earlier entry started, so which server
+owns a prefix never depends on which one happened to come up. A name holding
+`__` is skipped too: with servers `fs` and `fs__x`, routing `fs__x__read` would
+depend on the order of the list.
 
 ## Decisions worth settling first
 
@@ -139,19 +156,24 @@ a server whose results are already small or structurally fragile is better
 excluded than tuned around.
 
 **A dying server must not take the session with it.** If a spawned child exits,
-its tools answer with a JSON-RPC error and everything else keeps working; the
-next call may restart it, bounded, with the reason logged. A supervisor that
-kills the whole session because one wrapped server crashed turns a degraded
-tool into a dead assistant.
+each call to its tools returns a tool error (`isError`, naming the server and
+the tool), it lists no tools from then on, and everything else keeps working.
+It is not restarted. A supervisor that kills the whole session because one
+wrapped server crashed turns a degraded tool into a dead assistant.
+
+**Logs go to stderr.** Stdout is the protocol, so `kompressor mcp serve` logs
+to stderr, at `log.level` and in `log.format`. Every skipped entry is a `warn`
+naming the server and the reason; every fronted one an `info`. Until this it
+logged nothing at all, and a server that failed to start simply was not there.
 
 **Tenancy follows the transport, as it already does.** A spawned proxy has no
 connection to read a credential from, so the identity is fixed from the
 launching environment — `stdio.rs` settled this and the same rule applies.
 
-**Protocol version is negotiated down, not asserted.** `initialize` has to
-reconcile what the client offers, what each server accepts, and what we
-implement. The lowest common version is the only answer that cannot
-misrepresent a server's capabilities to a client.
+**Protocol version is ours, not negotiated across servers.** `initialize` is
+answered from our own server info. The client and each fronted server negotiate
+separately, so a client can be told about a version a fronted server does not
+speak. Taking the lowest common version would close that gap; it is not built.
 
 **One level, enforced.** Every spawned server is told it is one, and a process
 carrying that marker ignores its own `[[mcp.servers]]`. Without it a
@@ -171,19 +193,35 @@ tool that reads it.
 So "Chat tab support" is two features wearing one name. Compressing Chat's
 inference requests is near-worthless and carries real downside. Compressing the
 tool results Chat consumes is worthwhile, rests on a published protocol with a
-version field, and is most of the way built.
+version field, and is built.
 
 ## Testing without a client
 
 The dependency on a real MCP client is avoidable, which is most of the value of
 keeping routing and merging separate from transport:
 
-- `merge.rs` — prefixing, collisions, and that our retrieve tool survives a
-  merge with a server that exports a tool of the same name
-- `route.rs` — a prefixed name routes to one server; an unknown prefix is an
-  error and never a silent local handle
-- `child.rs` — a fake stdio server that echoes, one that exits mid-call, one
-  that writes malformed JSON-RPC
-- end to end — a client speaking JSON-RPC over a pipe against a fake server
-  returning a large text block, asserting that the result comes back with a
-  marker and that `retrieve` on that handle returns the original bytes
+- `merge.rs` — prefixing, our tools first, a fronted tool's description left
+  alone, and that our retrieve tool survives a merge with a server that exports
+  a tool of the same name
+- `route.rs` — a prefixed name routes to one server, a tool name containing the
+  separator survives, and an unknown prefix is not routed anywhere: it falls
+  through to our own tools, which reject a name they do not know
+- `child.rs` — each way an entry is refused: no name, a name holding `__`,
+  neither or both of `command` and `url`, a `url`, a command that does not
+  start, one that is not an MCP server, one that does not answer `initialize`
+  in time
+- `tests/proxy.rs`, against a fake stdio server written as a shell script — a
+  large result comes back with a marker and `retrieve` on that handle returns
+  the original bytes; `compress = false` forwards untouched; a small result is
+  byte-identical; an image beside text passes through; arguments arrive as
+  sent; `args`, `env` and the one-level marker reach the child; a server that
+  exits mid-call is a tool error and the session keeps its other tools; an
+  unknown prefix is refused locally; a second entry with a name already used
+  is skipped, even when the first did not start; a server that never answers
+  costs its own tools and not the session. One more fronts the release binary, when
+  it has been built
+- `kompressor-cli`'s `tests/cli.rs` — `mcp serve` fronts what
+  `[[mcp.servers]]` names, ignores it when started as a fronted server, and
+  logs an entry it could not front to stderr while stdout stays protocol
+
+Malformed JSON-RPC from a fronted server is not tested.

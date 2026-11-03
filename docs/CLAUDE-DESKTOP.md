@@ -27,8 +27,8 @@ uses when it cannot be.
 ![Claude Desktop without kompressor](charts/desktop-baseline.drawio.png)
 
 The two tabs reach different providers over different protocols with different
-credentials, which is why neither is wrapped the way a CLI is. Both charts here
-are `.drawio.png`: picture and source in one file, re-exported with `-e`.
+credentials, which is why neither is wrapped the way a CLI is. The chart is a
+`.drawio.png`: picture and source in one file, re-exported with `-e`.
 
 
 The CLI can use `kompressor wrap claude` or `ANTHROPIC_BASE_URL`. Signed-in
@@ -309,3 +309,6 @@ This integration covers the Code tab's Anthropic Messages calls. Hosted Claude
 Chat uses different endpoints, which this listener does not intercept. An MCP
 registration can expose retrieval tools to Chat, but does not intercept its
 inference requests or automatically compress server-held conversation history.
+What Chat does carry in bulk is MCP tool results, and those can be compressed by
+putting `kompressor mcp serve` in front of the servers that produce them: see
+[MCP-PROXY.md](MCP-PROXY.md).

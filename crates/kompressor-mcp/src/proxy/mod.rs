@@ -61,13 +61,26 @@ impl ProxyTools {
     /// A server that cannot be reached is logged and skipped rather than
     /// refused: one broken entry in a list of five should cost its own tools,
     /// not the other four and ours.
+    ///
+    /// A name already taken by an earlier entry is skipped the same way, before
+    /// anything is spawned, whether or not that earlier entry was fronted: which
+    /// one serves a name must not depend on which happened to start.
     pub async fn connect(
         local: KompressorTools,
         core: Arc<AppCore>,
         configs: &[kompressor_core::config::McpServerConfig],
     ) -> Self {
         let mut upstreams = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         for config in configs {
+            let name = config.name.trim();
+            if !name.is_empty() && !seen.insert(name) {
+                let error = UpstreamError::Duplicate {
+                    name: name.to_string(),
+                };
+                tracing::warn!(%error, "mcp server not fronted");
+                continue;
+            }
             match Upstream::connect(config).await {
                 Ok(upstream) => {
                     tracing::info!(server = %upstream.name, compress = upstream.compress, "fronting mcp server");

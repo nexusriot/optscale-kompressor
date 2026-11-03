@@ -20,6 +20,7 @@ login (`oauth-2025-04-20`), model `claude-opus-5[1m]`, OptScale Kompressor in
 - [Do not disable prompt caching](#do-not-disable-prompt-caching)
 - [Verify it for yourself](#verify-it-for-yourself)
   - [Do not ask the model](#do-not-ask-the-model)
+  - [What the session says on exit](#what-the-session-says-on-exit)
 - [Reading the outcome field](#reading-the-outcome-field)
 - [What the proxy changes about your request](#what-the-proxy-changes-about-your-request)
 - [What compression costs, measured](#what-compression-costs-measured)
@@ -283,8 +284,8 @@ between `min_compress_chars` and that ceiling:
 
 | size | what happens |
 |---|---|
-| under 512 B | below `min_compress_chars`; nothing to do |
-| **512 B – 30 KiB** | **the engine sees it and can compress it** |
+| under 512 characters | below `min_compress_chars`; nothing to do |
+| **512 characters – 30 KiB** | **the engine sees it and can compress it** |
 | 30 KiB and over | withheld by the client; the proxy never sees it |
 
 `BASH_MAX_OUTPUT_LENGTH` appears in the binary beside this logic, so the ceiling

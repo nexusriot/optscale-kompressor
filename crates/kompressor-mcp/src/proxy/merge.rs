@@ -53,6 +53,12 @@ mod tests {
     }
 
     #[test]
+    fn a_fronted_tool_keeps_its_own_description() {
+        let out = qualify_tools("fs", vec![tool("read_file")]);
+        assert_eq!(out[0].description.as_deref(), Some("a tool"));
+    }
+
+    #[test]
     fn our_tools_come_first() {
         // A client that truncates the list must still see retrieve, or it gets
         // markers with no way to resolve them.

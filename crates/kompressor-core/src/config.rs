@@ -218,6 +218,15 @@ pub struct McpServerConfig {
     /// are already small or structurally fragile: excluding one is better than
     /// tuning the engine around it.
     pub compress: bool,
+    /// How long the server has to answer `initialize` before it is killed and
+    /// skipped.
+    ///
+    /// Servers are connected before the client is served, so one that starts
+    /// and never answers would otherwise hold the whole session, our own tools
+    /// included. Generous by default because `npx -y` downloads the package on
+    /// its first run.
+    #[serde(with = "humantime_serde")]
+    pub startup_timeout: Duration,
 }
 
 impl Default for McpServerConfig {
@@ -229,6 +238,7 @@ impl Default for McpServerConfig {
             env: std::collections::BTreeMap::new(),
             url: None,
             compress: true,
+            startup_timeout: Duration::from_secs(60),
         }
     }
 }
@@ -1397,6 +1407,17 @@ impl Config {
                 "refs.purge_interval must be greater than zero".into(),
             ));
         }
+        if let Some(server) = self
+            .mcp
+            .servers
+            .iter()
+            .find(|s| s.startup_timeout.is_zero())
+        {
+            return Err(ConfigError::Invalid(format!(
+                "mcp.servers {:?}: startup_timeout must be greater than zero",
+                server.name
+            )));
+        }
         self.engine
             .validate()
             .map_err(|e| ConfigError::Invalid(format!("engine: {e}")))?;
@@ -1566,6 +1587,66 @@ fn parse_duration(value: &str) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_servers_are_none_by_default() {
+        assert!(Config::default().mcp.servers.is_empty());
+    }
+
+    #[test]
+    fn an_mcp_server_entry_takes_defaults_for_what_it_does_not_name() {
+        let config: Config = toml::from_str(
+            "[[mcp.servers]]\nname = \"fs\"\ncommand = \"npx\"\n\
+             args = [\"-y\", \"@modelcontextprotocol/server-filesystem\"]\n\
+             [mcp.servers.env]\nFS_ROOT = \"/srv\"\n\
+             [[mcp.servers]]\nname = \"wiki\"\ncommand = \"wiki-mcp\"\ncompress = false\n",
+        )
+        .expect("parses");
+        config.validate().expect("valid");
+        let [fs, wiki] = config.mcp.servers.as_slice() else {
+            panic!("two servers: {:?}", config.mcp.servers);
+        };
+        assert_eq!(fs.name, "fs");
+        assert_eq!(fs.command.as_deref(), Some("npx"));
+        assert_eq!(fs.args, ["-y", "@modelcontextprotocol/server-filesystem"]);
+        assert_eq!(fs.env.get("FS_ROOT").map(String::as_str), Some("/srv"));
+        assert_eq!(fs.url, None);
+        assert!(fs.compress, "compressing is the default");
+        assert!(!wiki.compress);
+        assert!(wiki.args.is_empty() && wiki.env.is_empty());
+        assert_eq!(fs.startup_timeout, Duration::from_secs(60));
+        // The rest of `[mcp]` is untouched by naming servers.
+        assert_eq!(config.mcp.path, "/mcp");
+    }
+
+    #[test]
+    fn an_mcp_server_startup_timeout_is_a_duration_above_zero() {
+        let config: Config = toml::from_str(
+            "[[mcp.servers]]\nname = \"fs\"\ncommand = \"npx\"\nstartup_timeout = \"5s\"\n",
+        )
+        .expect("parses");
+        assert_eq!(
+            config.mcp.servers[0].startup_timeout,
+            Duration::from_secs(5)
+        );
+        config.validate().expect("valid");
+
+        let zero: Config = toml::from_str(
+            "[[mcp.servers]]\nname = \"fs\"\ncommand = \"npx\"\nstartup_timeout = \"0s\"\n",
+        )
+        .expect("parses");
+        let error = zero
+            .validate()
+            .expect_err("a zero timeout fails every server");
+        assert!(error.to_string().contains("startup_timeout"), "{error}");
+    }
+
+    #[test]
+    fn a_misspelt_mcp_server_key_is_refused() {
+        assert!(
+            toml::from_str::<Config>("[[mcp.servers]]\nname = \"fs\"\ncomand = \"npx\"\n").is_err()
+        );
+    }
 
     #[test]
     fn a_zero_purge_interval_is_rejected() {
