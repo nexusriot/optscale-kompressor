@@ -187,6 +187,9 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
     } else {
         detect_family(&route.path)
     };
+    // After `decoded` is taken, so a renamed model reads as a rewritten body and
+    // is re-encoded rather than forwarded as the bytes that arrived.
+    let body = model_for_upstream(body, family, route.origin());
     let identity = resolve_identity(&state, &parts.headers);
     let mode = resolve_mode(
         &state,
@@ -1333,6 +1336,52 @@ fn force_usage(value: &mut Value, family: ApiFamily) -> bool {
     true
 }
 
+/// The body with a namespaced Anthropic model name made one the API accepts.
+///
+/// Gateways such as OpenRouter name Claude models `anthropic/<id>`, and
+/// clients configured for one keep the namespace: Harbor's claude-code agent
+/// hands it to Claude Code, which sends it on every subagent request. Anthropic's
+/// own API answers that name with a 404, so each subagent died on its first call
+/// ("Agent terminated early due to an API error: There's an issue with the
+/// selected model"). Measured on the three 1.5.14 Harbor runs of 2026-11-02:
+/// every subagent launched failed this way, two in `protein-assembly` and
+/// `dna-assembly` on the last one, while the main agent ran on the bare name
+/// `suite.sh` sets.
+///
+/// Only Messages requests bound for `api.anthropic.com`, the one place the
+/// namespace can never be right: a gateway behind this proxy wants it kept.
+/// Every other body comes back untouched, and so does one that does not parse.
+fn model_for_upstream(body: Bytes, family: Option<ApiFamily>, origin: &str) -> Bytes {
+    const NAMESPACE: &str = "anthropic/";
+    let anthropic_api = origin
+        .strip_prefix("https://")
+        .is_some_and(|host| host == "api.anthropic.com" || host.starts_with("api.anthropic.com:"));
+    if family != Some(ApiFamily::AnthropicMessages)
+        || !anthropic_api
+        || !body
+            .windows(NAMESPACE.len())
+            .any(|window| window == NAMESPACE.as_bytes())
+    {
+        return body;
+    }
+    let Ok(mut value) = serde_json::from_slice::<Value>(&body) else {
+        return body;
+    };
+    let Some(model) = value
+        .get("model")
+        .and_then(Value::as_str)
+        .and_then(|model| model.strip_prefix(NAMESPACE))
+        .map(str::to_string)
+    else {
+        return body;
+    };
+    value["model"] = Value::String(model);
+    match serde_json::to_vec(&value) {
+        Ok(out) => Bytes::from(out),
+        Err(_) => body,
+    }
+}
+
 fn is_json(headers: &HeaderMap) -> bool {
     headers
         .get(http::header::CONTENT_TYPE)
@@ -2222,6 +2271,58 @@ fn billed(usage: &Value, keys: &[&str]) -> Option<u32> {
 mod tests {
     use super::{RefId, inline_set_under_ceiling};
     use kompressor_engine::refs::ref_for;
+
+    #[test]
+    fn a_namespaced_model_is_renamed_for_anthropics_own_api() {
+        use bytes::Bytes;
+        use kompressor_wire::ApiFamily;
+        let body = |model: &str| {
+            Bytes::from(
+                serde_json::json!({"model": model, "max_tokens": 64000,
+                                   "messages": [{"role": "user", "content": "anthropic/ stays"}]})
+                .to_string(),
+            )
+        };
+        let model = |bytes: &Bytes| {
+            serde_json::from_slice::<serde_json::Value>(bytes).unwrap()["model"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let anthropic = Some(ApiFamily::AnthropicMessages);
+        let renamed = super::model_for_upstream(
+            body("anthropic/claude-opus-5-5"),
+            anthropic,
+            "https://api.anthropic.com",
+        );
+        assert_eq!(model(&renamed), "claude-opus-5-5");
+        let content = serde_json::from_slice::<serde_json::Value>(&renamed).unwrap();
+        assert_eq!(
+            content["messages"][0]["content"], "anthropic/ stays",
+            "only the model field is touched"
+        );
+
+        // A gateway wants the namespace; so does every other family.
+        for (family, origin) in [
+            (anthropic, "https://openrouter.ai"),
+            (anthropic, "http://127.0.0.1:8080"),
+            (Some(ApiFamily::OpenAiChat), "https://api.anthropic.com"),
+            (None, "https://api.anthropic.com"),
+        ] {
+            let sent = body("anthropic/claude-opus-5-5");
+            assert_eq!(
+                super::model_for_upstream(sent.clone(), family, origin),
+                sent,
+                "{family:?} to {origin}"
+            );
+        }
+        // A bare name is forwarded byte for byte.
+        let bare = body("claude-opus-5-5");
+        assert_eq!(
+            super::model_for_upstream(bare.clone(), anthropic, "https://api.anthropic.com"),
+            bare
+        );
+    }
 
     #[test]
     fn the_prompt_outside_the_messages_is_its_system_prompt_and_tools() {
