@@ -31,6 +31,8 @@ use kompressor_store::memory::MemoryRefStore;
 /// * `whoami` — its arguments and two environment variables, so a test can see
 ///   how it was spawned.
 /// * `die` — exits without answering, as a crashed server would.
+///
+/// Spawned as `bash <script>` (see [`spawned`]), never as the script itself.
 fn fake_server(dir: &std::path::Path, lines: usize) -> std::path::PathBuf {
     let path = dir.join("fake-mcp-server.sh");
     let script = format!(
@@ -105,11 +107,15 @@ async fn a_fronted_server_contributes_its_tools_under_a_prefix() {
     let proxy = ProxyTools::connect(
         tools(core.clone()),
         core,
-        &[McpServerConfig {
-            name: "fake".to_string(),
-            command: Some(script.to_string_lossy().into_owned()),
-            compress: true,
-            ..Default::default()
+        &[{
+            let (command, args) = spawned(&script);
+            McpServerConfig {
+                name: "fake".to_string(),
+                command,
+                args,
+                compress: true,
+                ..Default::default()
+            }
         }],
     )
     .await;
@@ -156,6 +162,22 @@ async fn a_url_upstream_is_refused_rather_than_ignored() {
     );
 }
 
+/// The command and arguments that start a [`fake_server`] script.
+///
+/// Through `bash` rather than by executing the script, because the tests run in
+/// parallel threads of one process: a script written by one test is executed
+/// while another is spawning, and a child forked in between inherits the
+/// writer's descriptor and makes `exec` fail with `ETXTBSY`. The server then
+/// fails to start and is dropped — measured once under a full workspace run as
+/// `fronted() == 0` in 0.32 s, far inside its 60 s startup timeout. `bash` is
+/// never written to, and reads the script as data.
+fn spawned(script: &std::path::Path) -> (Option<String>, Vec<String>) {
+    (
+        Some("bash".to_string()),
+        vec![script.to_string_lossy().into_owned()],
+    )
+}
+
 fn tempdir(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "kompressor-mcp-proxy-{name}-{}-{}",
@@ -185,9 +207,11 @@ async fn a_large_fronted_result_comes_back_elided_and_retrievable() {
     // Recoverable, or an elision retains nothing and the handle in the marker
     // resolves to an explanation instead of the bytes.
     config.engine.mode = "recoverable".parse().unwrap_or_default();
+    let (command, args) = spawned(&script);
     config.mcp.servers = vec![McpServerConfig {
         name: "fake".to_string(),
-        command: Some(script.to_string_lossy().into_owned()),
+        command,
+        args,
         compress: true,
         ..Default::default()
     }];
@@ -385,9 +409,11 @@ async fn session(
 }
 
 fn fake(script: &std::path::Path, compress: bool) -> McpServerConfig {
+    let (command, args) = spawned(script);
     McpServerConfig {
         name: "fake".to_string(),
-        command: Some(script.to_string_lossy().into_owned()),
+        command,
+        args,
         compress,
         ..Default::default()
     }
@@ -536,7 +562,8 @@ async fn a_spawned_server_gets_its_args_env_and_the_marker() {
     let dir = tempdir("whoami");
     let script = fake_server(&dir, 1);
     let mut server = fake(&script, false);
-    server.args = vec!["--one".to_string(), "two".to_string()];
+    // After the script, which is `bash`'s first argument.
+    server.args.extend(["--one".to_string(), "two".to_string()]);
     server.env = [
         ("FAKE_EXTRA".to_string(), "configured".to_string()),
         (
