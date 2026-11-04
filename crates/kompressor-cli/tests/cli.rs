@@ -1170,3 +1170,145 @@ fn the_reported_segfault_buried_in_a_training_log_is_no_longer_hidden() {
         value["saved_pct"]
     );
 }
+
+/// `mcp serve` fronting one server, answering `tools/list`.
+///
+/// The fronted server is this binary too, but reading a configuration that
+/// names no servers. Pointing it at its own configuration would test the same
+/// guard, and a regression in that guard would then fork without bound rather
+/// than fail. That the spawned process is told it is fronted is covered against
+/// a fake server in `kompressor-mcp`'s `tests/proxy.rs`.
+///
+/// Returns every tool name it listed. With `fronted` set, the process is
+/// started as though some other kompressor had spawned it.
+fn mcp_proxy_tool_names(fronted: bool) -> Vec<String> {
+    let dir = scratch_dir();
+    let inner = dir.join("inner.toml");
+    std::fs::write(&inner, MCP_PLAIN).unwrap();
+    let servers = format!(
+        "[[mcp.servers]]\nname = \"inner\"\ncommand = {binary:?}\n\
+         args = [\"mcp\", \"serve\", \"--config\", {inner:?}]\n",
+        binary = env!("CARGO_BIN_EXE_kompressor"),
+        inner = inner.to_str().unwrap(),
+    );
+    mcp_serve_tools_list(&dir, &servers, fronted).0
+}
+
+/// A configuration for `mcp serve` that touches no disk.
+const MCP_PLAIN: &str = "[refs]\nbackend = \"memory\"\n\n[stats]\nenabled = false\n";
+
+/// Run `mcp serve` with `servers` appended to [`MCP_PLAIN`], ask `tools/list`,
+/// and hang up. Returns the tool names and everything written to stderr.
+fn mcp_serve_tools_list(dir: &Path, servers: &str, fronted: bool) -> (Vec<String>, String) {
+    use std::io::{BufRead, BufReader, Read};
+    use std::process::Stdio;
+
+    let outer = dir.join("mcp-proxy.toml");
+    std::fs::write(&outer, format!("{MCP_PLAIN}\n{servers}")).unwrap();
+
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_kompressor"));
+    command
+        .args(["mcp", "serve", "--config"])
+        .arg(&outer)
+        .env_remove("KOMPRESSOR_CONFIG")
+        .env_remove("KOMPRESSOR_MCP_FRONTED")
+        .env("XDG_CONFIG_HOME", no_config_dir())
+        .current_dir(dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if fronted {
+        command.env("KOMPRESSOR_MCP_FRONTED", "1");
+    }
+    let mut child = command.spawn().expect("mcp serve starts");
+
+    let mut stdin = child.stdin.take().unwrap();
+    for message in [
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}"#,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+    ] {
+        writeln!(stdin, "{message}").unwrap();
+    }
+    // Stdin stays open until the answer is in: closing it ends the session.
+    let listed = BufReader::new(child.stdout.take().unwrap())
+        .lines()
+        .map_while(Result::ok)
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(&line).expect("one JSON message a line")
+        })
+        .find(|message| message["id"] == 2)
+        .expect("an answer to tools/list");
+    drop(stdin);
+    let _ = child.wait();
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+
+    let names = listed["result"]["tools"]
+        .as_array()
+        .expect("a tool list")
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap().to_string())
+        .collect();
+    (names, stderr)
+}
+
+/// `mcp serve` with `[[mcp.servers]]` is proxy mode: ours unprefixed, the
+/// fronted server's under its name.
+#[test]
+fn mcp_serve_fronts_the_servers_it_names() {
+    let names = mcp_proxy_tool_names(false);
+    assert!(
+        names.iter().any(|n| n == "optscale_kompressor_retrieve"),
+        "ours, unprefixed: {names:?}"
+    );
+    assert!(
+        names
+            .iter()
+            .any(|n| n == "inner__optscale_kompressor_retrieve"),
+        "the fronted server's, prefixed: {names:?}"
+    );
+}
+
+/// A process started as somebody's fronted server ignores `[[mcp.servers]]`
+/// and serves only its own tools: the guard that keeps a self-referential
+/// configuration from recursing.
+#[test]
+fn a_fronted_mcp_serve_ignores_its_own_servers() {
+    let names = mcp_proxy_tool_names(true);
+    assert!(
+        names.iter().any(|n| n == "optscale_kompressor_retrieve"),
+        "{names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n.contains("__")),
+        "nothing may be fronted: {names:?}"
+    );
+}
+
+/// A server that cannot be fronted says why, on stderr, where a runtime keeps
+/// a stdio server's log — and stdout stays nothing but the protocol, which the
+/// listing parsing every stdout line as JSON-RPC already holds to.
+#[test]
+fn mcp_serve_logs_a_server_it_could_not_front_to_stderr() {
+    let dir = scratch_dir();
+    let (names, stderr) =
+        mcp_serve_tools_list(&dir, "[[mcp.servers]]\nname = \"nowhere\"\n", false);
+    assert!(
+        names.iter().any(|n| n == "optscale_kompressor_retrieve"),
+        "{names:?}"
+    );
+    assert!(
+        stderr.contains("mcp server not fronted"),
+        "nothing said why: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("nowhere") && stderr.contains("names neither command nor url"),
+        "the reason names the server: {stderr:?}"
+    );
+}
