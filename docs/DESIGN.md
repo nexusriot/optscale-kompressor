@@ -1353,8 +1353,12 @@ tab's `sessionStorage`.
 `/v1/stats/cache` walks each conversation's `proxy_requests` rows in time
 order, keep-warm pings included, and compares every row with what the row
 before left cached: for Anthropic its reads plus writes, for OpenAI (which
-caches unasked) its whole prompt. A shortfall of 1,024 tokens or more is a
-lost prefix — `partial` if something was read, `miss` if nothing — put down
+caches unasked) its whole prompt — capped at what the new prompt still
+carries, since a client that compacted its context (Codex does) sent a shorter
+prompt and dropped the rest itself. On the archived Codex runs that cap is 26.6M
+of the 30.7M tokens an uncapped comparison called lost. A shortfall of 1,024
+tokens or more on Anthropic, 2,048 on OpenAI (gpt-5.5 caches at 2,048-token
+intervals), is a lost prefix — `partial` if something was read, `miss` if nothing — put down
 to `ttl_expiry` when the conversation had been idle (since its last request or
 ping) past the cache lifetime, five minutes or an hour once it has written
 one-hour entries, and to `prefix_change` otherwise. A client request with fewer

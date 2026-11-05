@@ -13,14 +13,16 @@
 //! After each request the provider holds a cached prefix. For Anthropic that is
 //! what the request read plus what it wrote; for OpenAI, which caches without
 //! being asked, it is the whole prompt. The next row in the same conversation
-//! is expected to read at least that much back. What it reads short of that is
-//! *lost*:
+//! is expected to read that much back, or as much of it as its own prompt
+//! still carries: a client that compacted its context sent a shorter prompt
+//! and dropped the rest itself. What it reads short of that is *lost*:
 //!
 //! - `first`: the first row of the conversation inside the window. There is
 //!   nothing to compare it with.
-//! - `hit`: lost less than [`MIN_LOSS_TOKENS`], the smallest prefix a provider
-//!   caches at all.
-//! - `partial`: some of the prefix read back, at least [`MIN_LOSS_TOKENS`] not.
+//! - `hit`: lost less than [`min_loss_tokens`]: 1,024 on Anthropic, the
+//!   smallest prefix it caches, and 2,048 on OpenAI, whose gpt-5.5 caches at
+//!   2,048-token intervals.
+//! - `partial`: some of the prefix read back, at least that much not.
 //! - `miss`: nothing read back.
 //! - `branch`: a client request carrying fewer messages than the one before it
 //!   in the same conversation — a Claude Code subagent summary or side query
@@ -62,6 +64,19 @@ pub const SHORT_TTL_MS: i64 = 300_000;
 pub const LONG_TTL_MS: i64 = 3_600_000;
 /// The smallest prefix a provider caches; a shortfall below it is not a loss.
 pub const MIN_LOSS_TOKENS: i64 = 1_024;
+/// The same for OpenAI, whose gpt-5.5 caches at 2,048-token intervals: a
+/// prompt that grew can read back up to 2,047 tokens short of the last one
+/// with nothing lost.
+pub const OPENAI_MIN_LOSS_TOKENS: i64 = 2_048;
+
+/// The smallest shortfall that counts as a loss on `api_family`.
+pub fn min_loss_tokens(api_family: &str) -> i64 {
+    if is_anthropic(api_family) {
+        MIN_LOSS_TOKENS
+    } else {
+        OPENAI_MIN_LOSS_TOKENS
+    }
+}
 /// The most rows one report reads. The newest are kept.
 pub const MAX_ROWS: usize = 200_000;
 /// The most turns listed for one conversation. The newest are kept.
@@ -176,7 +191,7 @@ impl CacheTokens {
 /// Prefix tokens the provider failed to read back, by cause.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Losses {
-    /// Rows that lost at least [`MIN_LOSS_TOKENS`].
+    /// Rows that lost at least [`min_loss_tokens`].
     pub events: u64,
     pub tokens: i64,
     pub ttl_expiry_events: u64,
@@ -818,11 +833,17 @@ fn step(walk: &mut Walk, row: &Row, usage: Option<Usage>) -> Turn {
         summary.longest_gap_ms = summary.longest_gap_ms.max(client_gap);
     }
 
-    turn.kind = match walk.expected {
+    // What was cached can only be read back as far as this prompt still
+    // carries it. A prompt shorter than the one before — a client that
+    // compacted its context, as Codex does — dropped the rest itself; that is
+    // not a cache that failed to serve it.
+    let expected = walk.expected.map(|cached| cached.min(usage.input()));
+    turn.expected = expected;
+    turn.kind = match expected {
         None => TurnKind::First,
         Some(expected) => {
             let lost = (expected - usage.read).max(0);
-            if lost < MIN_LOSS_TOKENS {
+            if lost < min_loss_tokens(&row.api_family) {
                 TurnKind::Hit
             } else {
                 let ttl = if summary.long_ttl {
@@ -1078,6 +1099,71 @@ mod tests {
         assert_eq!(report.totals.uncached, 12_016);
         assert_eq!(report.totals.read, 9_984);
         assert!((report.totals.cost - (12_016.0 + 998.4)).abs() < 1e-6);
+    }
+
+    fn openai_row(time_ms: i64, prompt: i64, read: i64) -> Row {
+        Row {
+            api_family: "openai_responses".into(),
+            model: Some("gpt-5.5".into()),
+            prompt: Some(prompt),
+            read: Some(read),
+            write: None,
+            write_1h: None,
+            ..row(time_ms, "o", 0, 0)
+        }
+    }
+
+    #[test]
+    fn a_prompt_the_client_compacted_is_not_a_lost_prefix() {
+        // Codex compacts: 60K of history becomes a 20K summary, and the
+        // provider reads back all it can of the shorter prompt.
+        let rows = [
+            openai_row(T0, 60_000, 0),
+            openai_row(T0 + MIN, 20_000, 19_968),
+            openai_row(T0 + 2 * MIN, 24_000, 19_968),
+        ];
+        let report = report(&rows, Some("o"));
+        assert_eq!(
+            kinds(&report),
+            [TurnKind::First, TurnKind::Hit, TurnKind::Hit]
+        );
+        assert_eq!(report.turns.as_ref().unwrap()[1].expected, Some(20_000));
+        assert_eq!(report.losses.events, 0);
+
+        // The same on Anthropic: the expectation is the prompt it now sends.
+        let mut shorter = row(T0 + MIN, "c", 10_000, 0);
+        shorter.prompt = Some(500);
+        let rows = [row(T0, "c", 0, 30_000), shorter];
+        let report = super::tests::report(&rows, Some("c"));
+        assert_eq!(kinds(&report), [TurnKind::First, TurnKind::Hit]);
+        assert_eq!(report.turns.as_ref().unwrap()[1].expected, Some(10_500));
+    }
+
+    #[test]
+    fn a_compacted_prompt_still_loses_what_it_carries_and_does_not_read() {
+        let rows = [
+            openai_row(T0, 60_000, 0),
+            openai_row(T0 + MIN, 20_000, 4_096),
+        ];
+        let report = report(&rows, Some("o"));
+        assert_eq!(kinds(&report), [TurnKind::First, TurnKind::Partial]);
+        assert_eq!(report.losses.prefix_change_tokens, 15_904);
+    }
+
+    #[test]
+    fn openai_reads_up_to_one_cache_interval_short_with_nothing_lost() {
+        let short = |read| {
+            let rows = [
+                openai_row(T0, 30_000, 0),
+                openai_row(T0 + MIN, 32_000, read),
+            ];
+            kinds(&report(&rows, Some("o")))[1]
+        };
+        // gpt-5.5 caches at 2,048-token intervals.
+        assert_eq!(short(28_672), TurnKind::Hit);
+        assert_eq!(short(27_000), TurnKind::Partial);
+        assert_eq!(min_loss_tokens("openai_chat"), 2_048);
+        assert_eq!(min_loss_tokens("anthropic_messages"), 1_024);
     }
 
     #[test]
