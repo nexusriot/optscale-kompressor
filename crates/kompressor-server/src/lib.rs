@@ -37,6 +37,7 @@ pub mod middleware;
 pub mod state;
 pub mod wire;
 
+pub mod analysis;
 mod api;
 pub mod cache;
 pub mod live;

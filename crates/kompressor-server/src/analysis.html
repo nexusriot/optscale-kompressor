@@ -1,0 +1,608 @@
+<!DOCTYPE html>
+<html lang="en">
+ <head>
+  <meta charset="utf-8"/>
+  <meta content="width=device-width,initial-scale=1" name="viewport"/>
+  <title>
+   Kompressor analysis
+  </title>
+  <style>
+:root {
+  color-scheme:dark;
+  --bg:#101419;
+  --panel:#191f27;
+  --muted:#9caaba;
+  --line:#303a46;
+  --accent:#70d8b6;
+  --bad:#ffa096;
+}
+* {
+  box-sizing:border-box;
+}
+body {
+  margin:0;
+  background:var(--bg);
+  color:#e3eaf2;
+  font:14px system-ui,sans-serif;
+}
+main {
+  max-width:1600px;
+  margin:auto;
+  padding:24px;
+}
+header,.filters,nav {
+  display:flex;
+  gap:14px;
+  align-items:center;
+  flex-wrap:wrap;
+}
+h1 {
+  font-size:24px;
+  margin-right:auto;
+}
+h2 {
+  font-size:18px;
+}
+a,button.link {
+  color:var(--accent);
+}
+button,input,select {
+  font:inherit;
+  color:inherit;
+  background:var(--panel);
+  border:1px solid var(--line);
+  border-radius:5px;
+  padding:8px;
+}
+button {
+  cursor:pointer;
+}
+button[aria-selected=true] {
+  border-color:var(--accent);
+  color:var(--accent);
+}
+label {
+  display:inline-flex;
+  gap:8px;
+  align-items:center;
+}
+.filters,nav {
+  margin:18px 0;
+}
+section,.tile {
+  background:var(--panel);
+  padding:18px;
+  border:1px solid var(--line);
+  border-radius:8px;
+  margin:16px 0;
+}
+.tiles {
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(185px,1fr));
+  gap:12px;
+}
+.tile {
+  margin:0;
+}
+.value {
+  font-size:25px;
+  margin:8px 0;
+}
+.muted,small {
+  color:var(--muted);
+}
+.bad {
+  color:var(--bad);
+}
+.scroll {
+  overflow:auto;
+}
+table {
+  width:100%;
+  border-collapse:collapse;
+  white-space:nowrap;
+}
+th,td {
+  text-align:left;
+  border-bottom:1px solid var(--line);
+  padding:10px;
+  vertical-align:top;
+}
+th {
+  color:var(--muted);
+  font-size:12px;
+}
+.num {
+  text-align:right;
+  font-variant-numeric:tabular-nums;
+}
+button.link {
+  border:0;
+  padding:0;
+  background:none;
+  text-align:left;
+}
+td.wrap {
+  white-space:normal;
+  min-width:180px;
+}
+#error {
+  color:var(--bad);
+}
+[hidden] {
+  display:none!important;
+}
+.bar {
+  height:5px;
+  background:var(--accent);
+  margin-top:5px;
+  min-width:1px;
+}
+.grid {
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(350px,1fr));
+  gap:16px;
+}
+.grid section {
+  margin:0;
+}
+summary {
+  cursor:pointer;
+}
+pre {
+  white-space:pre-wrap;
+  overflow-wrap:anywhere;
+}
+#timeline td {
+  max-width:320px;
+}
+#key {
+  width:220px;
+}
+</style>
+ </head>
+ <body>
+  <main>
+   <header>
+    <h1>
+     Kompressor analysis
+    </h1>
+    <a id="live-link">
+     Live
+    </a>
+    <a id="cache-link">
+     Cache
+    </a>
+    <a hidden="" id="refs-link">
+     Ref store
+    </a>
+   </header>
+   <form class="filters" id="filters">
+    <label>
+     From
+     <input id="from" required="" step="0.001" type="datetime-local"/>
+    </label>
+    <label>
+     To (exclusive)
+     <input id="to" required="" step="0.001" type="datetime-local"/>
+    </label>
+    <button type="submit">
+     Analyze
+    </button>
+    <button id="last-day" type="button">
+     Last 24 hours
+    </button>
+    <span class="muted">
+     Dates use your browser’s timezone
+    </span>
+   </form>
+   <form class="filters" id="auth">
+    <label>
+     API key
+     <input autocomplete="off" id="key" placeholder="Stored for this session" type="password"/>
+    </label>
+    <button>
+     Use key
+    </button>
+   </form>
+   <p id="status" role="status">
+    Loading…
+   </p>
+   <p id="error" role="alert">
+   </p>
+   <p class="muted" id="coverage">
+   </p>
+   <div class="tiles" id="tiles">
+   </div>
+   <p class="muted">
+    Token reduction is estimated per request, including re-sent history. Net subtracts retrieved tokens; it does not measure monetary savings. Cache cost uses a separate baseline. Provider usage includes keep-warm pings. Conversation IDs are prefix fingerprints.
+   </p>
+   <nav aria-label="Analysis views" role="tablist">
+    <button aria-controls="efficiency" aria-selected="true" id="efficiency-tab" role="tab">
+     Conversation efficiency
+    </button>
+    <button aria-controls="opportunities" aria-selected="false" id="opportunities-tab" role="tab" tabindex="-1">
+     Compression opportunities
+    </button>
+   </nav>
+   <div aria-labelledby="efficiency-tab" id="efficiency" role="tabpanel">
+    <section>
+     <header>
+      <h2>
+       Conversations
+      </h2>
+      <label>
+       Sort
+       <select id="sort">
+        <option value="net">
+         Most negative net reduction
+        </option>
+        <option value="retrieval">
+         Highest retrieval debit
+        </option>
+        <option value="loss">
+         Largest cache losses
+        </option>
+        <option value="recent">
+         Most recent
+        </option>
+       </select>
+      </label>
+      <label>
+       Search
+       <input id="search" placeholder="Conversation or model" type="search"/>
+      </label>
+     </header>
+     <p class="muted" id="conversation-count">
+     </p>
+     <div class="scroll" id="conversations">
+     </div>
+     <button hidden="" id="more">
+      Show 100 more
+     </button>
+    </section>
+    <section>
+     <h2>
+      Unattributed activity
+     </h2>
+     <p class="muted">
+      Events without a conversation fingerprint, including other surfaces and retrievals without a request join key.
+     </p>
+     <div class="scroll" id="unattributed">
+     </div>
+    </section>
+   </div>
+   <div aria-labelledby="opportunities-tab" hidden="" id="opportunities" role="tabpanel">
+    <div class="grid">
+     <section>
+      <h2>
+       Compression outcomes
+      </h2>
+      <div class="scroll" id="outcomes">
+      </div>
+     </section>
+     <section>
+      <h2>
+       Skipped token volume
+      </h2>
+      <p class="muted">
+       Skipped tokens are not necessarily recoverable savings. Frozen content is intentionally protected. Opaque content has no measurable token volume.
+      </p>
+      <div class="scroll" id="skips">
+      </div>
+     </section>
+    </div>
+    <section>
+     <h2>
+      Input coverage by model, mode and surface
+     </h2>
+     <p class="muted">
+      Each dimension describes the same traffic; do not add dimensions together.
+     </p>
+     <div class="scroll" id="breakdowns">
+     </div>
+    </section>
+    <section hidden="" id="example">
+     <h2>
+      Example request
+     </h2>
+     <pre id="example-body"></pre>
+    </section>
+   </div>
+   <section hidden="" id="detail">
+    <header>
+     <h2 id="detail-title">
+      Conversation timeline
+     </h2>
+     <a id="detail-cache">
+      Open cache details
+     </a>
+     <button id="close">
+      Close
+     </button>
+    </header>
+    <p class="muted" id="detail-note">
+    </p>
+    <div class="scroll" id="timeline">
+    </div>
+   </section>
+  </main>
+ <script>
+"use strict";
+
+const SETTINGS = /*SETTINGS*/{};
+const $ = id => document.getElementById(id),
+  params = new URLSearchParams(location.search);
+const endpoint = SETTINGS.endpoint || location.pathname;
+const base = endpoint.replace(/stats\/analysis\/?$/, ""),
+  tenant = params.get("tenant");
+const path = name => SETTINGS.listener ? {
+  live: "/",
+  cache: "/cache",
+  refs: "/refs"
+}[name] : base + (name === "refs" ? "refs" : "stats/" + name);
+let selected = SETTINGS.conversation,
+  report = null,
+  visible = 100,
+  serial = 0;
+const nf = new Intl.NumberFormat(),
+  num = v => v == null ? "–" : nf.format(Math.round(v)),
+  stamp = t => new Date(t).toLocaleString();
+const el = (tag, text) => {
+  const n = document.createElement(tag);
+  if (text != null) n.textContent = String(text);
+  return n;
+};
+function url(pathname, query = {}) {
+  const u = new URL(pathname, location.origin);
+  for (const [k, v] of Object.entries(query)) if (v != null) u.searchParams.set(k, v);
+  if (tenant) u.searchParams.set("tenant", tenant);
+  return u;
+}
+function key() {
+  try {
+    return sessionStorage.getItem("kompressor-key") || "";
+  } catch (_) {
+    return $("key").value;
+  }
+}
+async function call(u) {
+  const headers = {
+    accept: "application/json"
+  };
+  if (key()) headers["x-kompressor-key"] = key();
+  const r = await fetch(u, {
+    headers,
+    cache: "no-store"
+  });
+  let d;
+  try {
+    d = await r.json();
+  } catch (_) {
+    throw Error("Invalid response (HTTP " + r.status + ")");
+  }
+  if (!r.ok) throw Error(d?.error?.message || "HTTP " + r.status);
+  return d;
+}
+function local(t) {
+  const d = new Date(t);
+  return new Date(t - d.getTimezoneOffset() * 60000).toISOString().slice(0, 23);
+}
+$("from").value = local(SETTINGS.from);
+$("to").value = local(SETTINGS.to);
+for (const name of ["live", "cache", "refs"]) {
+  $(name + "-link").href = url(path(name));
+}
+$("refs-link").hidden = !SETTINGS.refs;
+function table(id, rows, columns) {
+  const host = $(id);
+  host.replaceChildren();
+  if (!rows.length) {
+    host.append(el("p", "No events in this window."));
+    return;
+  }
+  const t = el("table"),
+    head = el("tr"),
+    body = el("tbody");
+  for (const [label] of columns) head.append(el("th", label));
+  const thead = el("thead");
+  thead.append(head);
+  t.append(thead);
+  for (const r of rows) {
+    const tr = el("tr");
+    for (const [, get, cls] of columns) {
+      const v = get(r),
+        td = el("td", v instanceof Node ? null : v);
+      if (v instanceof Node) td.append(v);
+      if (cls) td.className = cls;
+      if (typeof v === "string" && /^-\d/.test(v)) td.classList.add("bad");
+      tr.append(td);
+    }
+    body.append(tr);
+  }
+  t.append(body);
+  host.append(t);
+}
+function button(text, fn) {
+  const b = el("button", text);
+  b.className = "link";
+  b.onclick = fn;
+  return b;
+}
+function tile(label, value, note) {
+  const t = el("div");
+  t.className = "tile";
+  t.append(el("small", label));
+  const v = el("div", value);
+  v.className = String(value).startsWith("-") ? "value bad" : "value";
+  t.append(v, el("small", note));
+  return t;
+}
+const columns = [["Conversation", c => c.conversation ? button(c.conversation, () => openConversation(c.conversation)) : "Unattributed"], ["Models", c => c.models.join(", ") || "–", "wrap"], ["Active", c => c.last_ms ? stamp(c.first_ms) + " → " + stamp(c.last_ms) : "–", "wrap"], ["Client turns", c => num(c.client_turns), "num"], ["Pings", c => num(c.pings), "num"], ["Compressions", c => num(c.compressions), "num"], ["Gross est.", c => num(c.saved_gross), "num"], ["Retrieved", c => num(c.retrieved_tokens), "num"], ["Net est.", c => num(c.saved_net), "num"], ["Input / output (incl. pings)", c => c.cache ? num(c.cache.tokens.input) + " / " + num(c.cache.tokens.output) : "–", "num"], ["Read / write 5m / 1h", c => c.cache ? [c.cache.tokens.read, c.cache.tokens.write_5m, c.cache.tokens.write_1h].map(num).join(" / ") : "–", "num"], ["Lost prefix (inferred)", c => num(c.cache?.losses.tokens), "num"], ["Loss cost (input-equiv.)", c => num(c.cache?.losses.cost), "num"], ["Retrieval rounds", c => num(c.retrieval_rounds), "num"], ["Avg latency / samples", c => c.latency_samples ? num(c.latency_ms_total / c.latency_samples) + " ms / " + num(c.latency_samples) : "–", "num"], ["Errors", c => num(c.errors), "num"]];
+function conversations() {
+  if (!report) return;
+  const needle = $("search").value.toLowerCase();
+  const rows = report.conversations.filter(c => (c.conversation + " " + c.models.join(" ")).toLowerCase().includes(needle));
+  const sort = $("sort").value;
+  rows.sort((a, b) => sort === "retrieval" ? b.retrieved_tokens - a.retrieved_tokens : sort === "loss" ? (b.cache?.losses.tokens || 0) - (a.cache?.losses.tokens || 0) : sort === "recent" ? b.last_ms - a.last_ms : a.saved_net - b.saved_net);
+  table("conversations", rows.slice(0, visible), columns);
+  $("conversation-count").textContent = `Showing ${Math.min(visible, rows.length)} of ${rows.length} conversations`;
+  $("more").hidden = visible >= rows.length;
+}
+function opportunities(id, rows) {
+  const max = Math.max(1, ...rows.map(r => r.tokens));
+  table(id, rows, [["Category", r => r.name], ["Tokens", r => {
+    const n = el("div", num(r.tokens)),
+      b = el("div");
+    b.className = "bar";
+    b.style.width = 100 * r.tokens / max + "%";
+    n.append(b);
+    return n;
+  }, "num"], ["Messages", r => num(r.messages), "num"], ["Requests", r => num(r.requests), "num"], ["Example", r => r.example_request ? button(r.example_request, () => example(r.example_request)) : "–"]]);
+}
+async function example(id) {
+  $("example").hidden = false;
+  $("example-body").textContent = "Loading…";
+  try {
+    const d = await call(url(base + "stats/requests", {
+      request_id: id
+    }));
+    $("example-body").textContent = JSON.stringify(d, null, 2);
+  } catch (e) {
+    $("example-body").textContent = e.message;
+  }
+  $("example").scrollIntoView({
+    behavior: "smooth",
+    block: "nearest"
+  });
+}
+function timeline() {
+  if (!selected) {
+    $("detail").hidden = true;
+    return;
+  }
+  $("detail").hidden = false;
+  $("detail-title").textContent = "Conversation " + selected;
+  $("detail-cache").href = url(path("cache"), {
+    conversation: selected,
+    from: report.from_ms,
+    to: report.to_ms
+  });
+  $("detail-note").textContent = `${report.turns_total} turns in window. ${report.turns_truncated ? "Showing the latest 2,000 turns. " : ""}Cache loss causes are inferred; ‘first’ has no preceding comparison in this window. Reference links show retrieved handles; expired fragments may no longer be available.`;
+  table("timeline", report.turns || [], [["Time / request", t => stamp(t.time_ms) + "\n" + t.request_id, "wrap"], ["Model / kind", t => (t.model || "–") + (t.keep_warm ? " · keep-warm" : ""), "wrap"], ["Compression est.", t => t.compressions ? num(t.saved_gross) + " removed" : "–", "num"], ["Retrieval debit / rounds", t => num(t.retrieved_tokens) + " / " + num(t.retrieval_rounds), "num"], ["Net est.", t => num(t.saved_net), "num"], ["Fresh / read / writes", t => t.cache ? [t.cache.uncached, t.cache.read, (t.cache.write_5m || 0) + (t.cache.write_1h || 0)].map(num).join(" / ") : "Usage unavailable", "num"], ["Cache outcome", t => t.cache ? t.cache.kind + (t.cache.cause ? " · inferred " + t.cache.cause : "") + " · " + num(t.cache.lost_tokens) + " lost" : "Not classified", "wrap"], ["Latency", t => t.total_ms == null ? "–" : num(t.total_ms) + " ms", "num"], ["Status / error", t => (t.status ?? "–") + (t.error ? " · " + t.error : ""), "wrap"], ["Retrieved refs", t => {
+    const n = el("div");
+    for (const ref of t.references) {
+      if (SETTINGS.refs) {
+        const a = el("a", ref);
+        const u = url(path("refs"));
+        u.hash = ref;
+        a.href = u;
+        n.append(a, el("br"));
+      } else n.append(el("div", ref));
+    }
+    if (t.references_truncated) n.append(el("small", "First 100 refs shown"));
+    return n;
+  }, "wrap"]]);
+}
+async function load() {
+  const seq = ++serial;
+  $("error").textContent = "";
+  $("status").textContent = "Loading…";
+  const from = new Date($("from").value).getTime(),
+    to = new Date($("to").value).getTime();
+  try {
+    if (!Number.isFinite(from) || !Number.isFinite(to) || to <= from || to - from > 90 * 86400000) throw Error("Choose a valid range of at most 90 days.");
+    const d = await call(url(endpoint, {
+      format: "json",
+      from,
+      to,
+      conversation: selected
+    }));
+    if (seq !== serial) return;
+    report = d.report;
+    const all = [...report.conversations, report.unattributed],
+      sum = k => all.reduce((s, c) => s + c[k], 0);
+    $("tiles").replaceChildren(tile("Client turns", num(sum("client_turns")), num(report.conversations.length) + " conversations"), tile("Gross token reduction", num(sum("saved_gross")), "Estimated per request"), tile("Net token reduction", num(sum("saved_net")), num(sum("retrieved_tokens")) + " retrieved tokens"), tile("Provider input", num(report.usage.input), num(report.usage.with_usage) + " of " + num(report.usage.requests) + " rows with usage"), tile("Keep-warm input cost", num(report.ping_usage.cost), "Input-equivalent; output " + num(report.ping_usage.output)));
+    $("coverage").textContent = `Raw event history only; earliest retained event: ${report.raw_available_from_ms == null ? "none" : stamp(report.raw_available_from_ms)}. Retention: ${d.retention_days ? d.retention_days + " days" : "pruning disabled"}. Dropped events since process start: ${d.stats_dropped}. Unattributed client turns: ${report.unattributed.client_turns}. ${report.cache_truncated ? "CACHE DATA PARTIAL: latest 200,000 proxy rows only; cache totals and loss classifications may be incomplete." : ""}`;
+    conversations();
+    table("unattributed", [report.unattributed], columns);
+    for (const id of ["outcomes", "skips", "breakdowns"]) opportunities(id, report[id]);
+    timeline();
+    $("status").textContent = "Analyzed " + stamp(from) + " to " + stamp(to) + " (exclusive)";
+    const u = new URL(location.href);
+    u.searchParams.set("from", from);
+    u.searchParams.set("to", to);
+    if (selected) u.searchParams.set("conversation", selected);else u.searchParams.delete("conversation");
+    history.replaceState(null, "", u);
+  } catch (e) {
+    if (seq === serial) {
+      $("status").textContent = "Analysis unavailable; displayed results may be from the previous range.";
+      $("error").textContent = e.message;
+    }
+  }
+}
+function openConversation(id) {
+  selected = id;
+  load().then(() => {
+    if (selected === id) $("detail").scrollIntoView({
+      behavior: "smooth",
+      block: "start"
+    });
+  });
+}
+for (const id of ["efficiency", "opportunities"]) {
+  $(id + "-tab").onkeydown = e => {
+    if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) {
+      e.preventDefault();
+      const target = e.key === "Home" ? "efficiency" : e.key === "End" ? "opportunities" : id === "efficiency" ? "opportunities" : "efficiency";
+      $(target + "-tab").click();
+      $(target + "-tab").focus();
+    }
+  };
+  $(id + "-tab").onclick = () => {
+    for (const other of ["efficiency", "opportunities"]) {
+      $(other).hidden = other !== id;
+      $(other + "-tab").setAttribute("aria-selected", String(other === id));
+      $(other + "-tab").tabIndex = other === id ? 0 : -1;
+    }
+  };
+}
+$("filters").onsubmit = e => {
+  e.preventDefault();
+  visible = 100;
+  load();
+};
+$("auth").onsubmit = e => {
+  e.preventDefault();
+  try {
+    sessionStorage.setItem("kompressor-key", $("key").value.trim());
+  } catch (_) {}
+  load();
+};
+$("last-day").onclick = () => {
+  const now = Date.now();
+  $("from").value = local(now - 86400000);
+  $("to").value = local(now);
+  load();
+};
+$("sort").onchange = () => {
+  visible = 100;
+  conversations();
+};
+$("search").oninput = () => {
+  visible = 100;
+  conversations();
+};
+$("more").onclick = () => {
+  visible += 100;
+  conversations();
+};
+$("close").onclick = () => {
+  selected = null;
+  $("detail").hidden = true;
+  const u = new URL(location.href);
+  u.searchParams.delete("conversation");
+  history.replaceState(null, "", u);
+};
+load();
+</script></body></html>

@@ -46,6 +46,8 @@ pub(crate) struct CacheQuery {
     tenant: Option<String>,
     /// Trailing window: `30m`, `6h`, `24h`, `7d`.
     window: Option<String>,
+    from: Option<i64>,
+    to: Option<i64>,
     /// How many conversations to list, 0 to 500.
     conversations: Option<usize>,
     /// One conversation's id, to list its rows.
@@ -166,6 +168,18 @@ async fn respond(
     let conversations = query.conversations()?;
     let conversation = query.conversation()?;
     let refresh = query.refresh()?;
+    let fixed = match (query.from, query.to) {
+        (None, None) => None,
+        (Some(from), Some(to))
+            if from >= 0 && to > from && to.saturating_sub(from) <= 90 * 86_400_000 =>
+        {
+            Some((from, to))
+        }
+        _ => return Err(ApiError::Invalid(
+            "from/to must both be epoch milliseconds with 0 <= from < to, spanning at most 90 days"
+                .into(),
+        )),
+    };
 
     // As on the live page: the shell is served to anyone, and the data only
     // to a poll that presents a key.
@@ -178,6 +192,7 @@ async fn respond(
             endpoint,
             live,
             browse.then_some(refs),
+            fixed,
         ));
     }
 
@@ -190,13 +205,13 @@ async fn respond(
     };
 
     let to_ms = now_ms();
-    let from_ms = to_ms - window.as_millis() as i64;
+    let (from_ms, end_ms) = fixed.unwrap_or((to_ms - window.as_millis() as i64, to_ms + 1));
     let report = state
         .with_stats(move |reader| {
             reader.cache(
                 &tenant,
                 from_ms,
-                to_ms + 1,
+                end_ms,
                 conversations,
                 conversation.as_deref(),
             )
@@ -204,7 +219,11 @@ async fn respond(
         .await?;
     Ok(json_response(&CacheResponse {
         generated_at_ms: to_ms,
-        window: label,
+        window: if fixed.is_some() {
+            "fixed range".into()
+        } else {
+            label
+        },
         report,
     }))
 }
@@ -223,11 +242,13 @@ fn page(
     endpoint: &str,
     live: &str,
     refs: Option<&str>,
+    fixed: Option<(i64, i64)>,
 ) -> Response {
     // The settings reach the script as one JSON object, so nothing from the
     // request is spliced into markup or script as text.
     let settings = serde_json::json!({
         "window": window,
+        "fixed": fixed,
         "refresh": refresh,
         "conversation": conversation,
         "endpoint": endpoint,
@@ -284,7 +305,7 @@ mod tests {
     #[test]
     fn nothing_from_the_request_reaches_the_page_unescaped() {
         let hostile = "</script><script>alert(1)</script>";
-        let response = page(hostile, 10, None, hostile, "", Some(hostile));
+        let response = page(hostile, 10, None, hostile, "", Some(hostile), None);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();

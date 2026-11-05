@@ -70,6 +70,7 @@ input { font: inherit; padding: 4px 8px; border: 1px solid var(--line); border-r
     <h1>Kompressor cache</h1>
     <span class="meta"><span id="status-dot" class="dot"></span><span id="status">connecting…</span></span>
     <div class="controls" id="windows"></div>
+    <a id="analysis-link" href="#">Analysis</a>
     <a id="live-link" href="#">Live</a>
     <a id="refs-link" href="#" hidden>Ref store</a>
     <button id="pause" aria-pressed="false">Pause</button>
@@ -115,6 +116,7 @@ const SETTINGS = /*SETTINGS*/{};
 const WINDOWS = ["1h", "6h", "24h", "3d", "7d", "30d"];
 const state = {
   window: SETTINGS.window || "6h",
+  fixed: SETTINGS.fixed || null,
   refresh: Math.max(1, SETTINGS.refresh || 10),
   conversation: SETTINGS.conversation || null,
   endpoint: SETTINGS.endpoint || location.pathname,
@@ -338,6 +340,7 @@ function open(id) {
 function syncUrl() {
   const params = new URLSearchParams(location.search);
   params.set("window", state.window);
+  if (state.fixed) { params.set("from", state.fixed[0]); params.set("to", state.fixed[1]); } else { params.delete("from"); params.delete("to"); }
   if (state.conversation) params.set("conversation", state.conversation); else params.delete("conversation");
   history.replaceState(null, "", location.pathname + "?" + params.toString());
 }
@@ -360,6 +363,9 @@ async function poll() {
   const url = new URL(state.endpoint, location.origin);
   const params = { format: "json", window: state.window };
   if (state.conversation) params.conversation = state.conversation;
+  if (state.fixed) { params.from = state.fixed[0]; params.to = state.fixed[1]; }
+  const tenant = new URLSearchParams(location.search).get("tenant");
+  if (tenant) params.tenant = tenant;
   url.search = new URLSearchParams(params).toString();
   const headers = { accept: "application/json" };
   const key = storedKey();
@@ -395,10 +401,11 @@ function schedule() {
 function windows() {
   const host = $("windows");
   host.replaceChildren();
+  if (state.fixed) host.append(el("span", "Fixed date range", "meta"));
   for (const w of WINDOWS.includes(state.window) ? WINDOWS : [...WINDOWS, state.window]) {
     const b = el("button", w);
-    b.setAttribute("aria-pressed", String(w === state.window));
-    b.addEventListener("click", () => { state.window = w; windows(); syncUrl(); clearTimeout(state.timer); poll(); });
+    b.setAttribute("aria-pressed", String(!state.fixed && w === state.window));
+    b.addEventListener("click", () => { state.fixed = null; state.window = w; windows(); syncUrl(); clearTimeout(state.timer); poll(); });
     host.append(b);
   }
 }
@@ -428,6 +435,9 @@ if (SETTINGS.refs) {
   $("refs-link").href = SETTINGS.refs_path || sibling("refs");
   $("refs-link").hidden = false;
 }
+const analysisUrl = new URL(SETTINGS.live ? "/analysis" : sibling("stats/analysis"), location.origin);
+if (new URLSearchParams(location.search).has("tenant")) analysisUrl.searchParams.set("tenant", new URLSearchParams(location.search).get("tenant"));
+$("analysis-link").href = analysisUrl;
 windows();
 poll();
 </script>

@@ -618,6 +618,18 @@ had idled past the cache lifetime, to a prefix change otherwise — the idle
 gaps before each turn, and what the keep-warm pings cost and bridged. Click a
 conversation for its turns one by one. The JSON is `/v1/stats/cache`.
 
+`http://127.0.0.1:8818/analysis` analyzes a fixed date range: conversation
+compression credits and retrieval debits, provider usage, cache losses, latency,
+and errors, plus compression outcomes and skipped categories ranked by token
+volume. Open a conversation for its turn timeline, with links to cache details
+and retrieved fragments (when ref browsing is enabled). The JSON endpoint is
+`/v1/stats/analysis?from=<epoch-ms>&to=<epoch-ms>`; `to` is exclusive, ranges
+span at most 90 days, and `conversation=<fingerprint>` adds turn details.
+Both `/v1` and `/v2` routes serve HTML with `?format=html`. Cache deep links also
+accept the same `from`/`to` pair. Analysis uses retained raw events; daily
+archives cannot reconstruct turn history. Token reduction remains an estimate
+per request, not a monetary saving or a count of unique content.
+
 ---
 
 ## Not built yet

@@ -61,6 +61,7 @@ input { font: inherit; padding: 4px 8px; border: 1px solid var(--line); border-r
     <h1>Kompressor live</h1>
     <span class="meta"><span id="status-dot" class="dot"></span><span id="status">connecting…</span></span>
     <div class="controls" id="windows"></div>
+    <a id="analysis-link" href="#">Analysis</a>
     <a id="cache-link" href="#">Cache</a>
     <a id="refs-link" href="#" hidden>Ref store</a>
     <button id="pause" aria-pressed="false">Pause</button>
@@ -336,6 +337,9 @@ if (SETTINGS.refs) {
   $("refs-link").href = location.pathname === "/" ? "/refs" : location.pathname.replace(/stats\/live\/?$/, "refs");
   $("refs-link").hidden = false;
 }
+const analysisUrl = new URL(location.pathname === "/" ? "/analysis" : location.pathname.replace(/stats\/live\/?$/, "stats/analysis"), location.origin);
+if (new URLSearchParams(location.search).has("tenant")) analysisUrl.searchParams.set("tenant", new URLSearchParams(location.search).get("tenant"));
+$("analysis-link").href = analysisUrl;
 windows();
 poll();
 </script>

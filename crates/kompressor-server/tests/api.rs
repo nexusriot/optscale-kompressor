@@ -1643,3 +1643,169 @@ async fn the_statistics_listener_serves_the_cache_page_beside_the_dashboard() {
         "the dashboard links it"
     );
 }
+
+// Historical analysis must preserve credits/debits without multiplying them
+// when multiple events share a request, and must never join another tenant.
+#[tokio::test]
+async fn analysis_joins_events_and_preserves_fixed_window_accounting() {
+    use kompressor_engine::types::Mode;
+    use kompressor_stats::{Event, OptimizationEvent, RetrievalEvent, Surface};
+    let harness = Harness::with_stats();
+    let t = now_ms() - 60_000;
+    let req = format!("req-{t}-false");
+    harness.sink.send(proxied_turn(t, "", 1000, 2000, false));
+    harness.sink.send(proxied_turn(t + 1, "", 3000, 0, true));
+    for (tenant, outcome, saved) in [
+        ("", "compressed", 600),
+        ("", "compressed", 100),
+        ("", "discarded", 900),
+        ("other", "compressed", 9999),
+    ] {
+        let mut e = OptimizationEvent::new(t, tenant, &req, Surface::Proxy, Mode::Recoverable);
+        e.tokens_in = saved + 100;
+        e.tokens_out = 100;
+        e.messages_total = 2;
+        e.messages_skipped = 1;
+        e.outcome = Some(outcome.into());
+        e.skipped_by_reason.insert("frozen".into(), 1);
+        e.skipped_tokens_by_reason.insert("frozen".into(), 500);
+        harness.sink.send(Event::Optimization(e));
+    }
+    for (request, found, withheld, returned) in [
+        (Some(req.clone()), true, false, 800),
+        (Some(req.clone()), true, false, 200),
+        (Some(req.clone()), false, true, 999),
+        (None, true, false, 50),
+    ] {
+        harness.sink.send(Event::Retrieval(RetrievalEvent {
+            time_ms: t,
+            tenant: "".into(),
+            request_id: request,
+            surface: Surface::Proxy,
+            reference: "k_AbC123dEf456".into(),
+            found,
+            expired: false,
+            ranged: false,
+            fragment_bytes: 4000,
+            fragment_chars: 4000,
+            fragment_tokens: 1000,
+            returned_chars: returned * 4,
+            returned_tokens: returned as u32,
+            withheld,
+        }));
+    }
+    // Exclusive end: this row must not enter this report.
+    harness.sink.send(proxied_turn(t + 2, "", 0, 9000, false));
+    harness.sink.flush().unwrap();
+    let route = format!(
+        "/v1/stats/analysis?from={t}&to={}&conversation=0123456789abcdef",
+        t + 2
+    );
+    let (status, data) = harness.get(&route).await;
+    assert_eq!(status, StatusCode::OK, "{data}");
+    let r = &data["report"];
+    let c = &r["conversations"][0];
+    assert_eq!(r["conversations"].as_array().unwrap().len(), 1);
+    assert_eq!(c["client_turns"], 1);
+    assert_eq!(c["pings"], 1);
+    assert_eq!(c["saved_gross"], 700);
+    assert_eq!(c["retrieved_tokens"], 1000);
+    assert_eq!(c["saved_net"], -300);
+    assert_eq!(c["latency_samples"], 1);
+    assert_eq!(r["unattributed"]["retrieved_tokens"], 50);
+    assert_eq!(r["skips"][0]["tokens"], 1500);
+    assert_eq!(r["turns_total"], 2);
+    assert_eq!(r["turns"][0]["references"][0], "k_AbC123dEf456");
+    assert_eq!(r["turns"][0]["cache"]["kind"], "first");
+    assert_eq!(r["usage"]["requests"], 2);
+    assert_eq!(r["ping_usage"]["requests"], 1);
+    assert_eq!(data["stats_dropped"], 0);
+    let (status, cache) = harness
+        .get(&format!(
+            "/v1/stats/cache?from={t}&to={}&conversation=0123456789abcdef",
+            t + 2
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cache["from_ms"], t);
+    assert_eq!(cache["to_ms"], t + 2);
+    assert_eq!(cache["totals"]["requests"], 2);
+}
+
+#[tokio::test]
+async fn analysis_routes_validate_scope_dates_and_formats() {
+    let harness = Harness::with_stats_and(keyed_config, kompressor_server::stats_listener_router);
+    for path in [
+        "/v1/stats/analysis?format=json",
+        "/v2/stats/analysis?format=json",
+    ] {
+        assert_eq!(harness.get(path).await.0, StatusCode::UNAUTHORIZED);
+        let (status, body, _) = harness
+            .get_with(path, &[("x-kompressor-key", "sk-alpha")])
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["report"]["tenant"], "team-a");
+        assert_eq!(body["report"]["conversations"], json!([]));
+    }
+    let (status, _, _) = harness
+        .get_with(
+            "/v1/stats/analysis?tenant=team-b",
+            &[("x-kompressor-key", "sk-alpha")],
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    for query in [
+        "from=20&to=10",
+        "from=-1&to=10",
+        "from=0&to=999999999999",
+        "conversation=bad",
+        "format=csv",
+        "unexpected=1",
+    ] {
+        assert_eq!(
+            harness.get(&format!("/v1/stats/analysis?{query}")).await.0,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{query}"
+        );
+    }
+    for path in [
+        "/analysis",
+        "/v1/stats/analysis?format=html",
+        "/v2/stats/analysis?format=html",
+    ] {
+        let (status, page) = harness.get(path).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(text(&page).contains("Conversation efficiency"));
+        assert!(text(&page).contains("x-kompressor-key"));
+    }
+    for query in ["from=0", "from=10&to=1", "from=0&to=999999999999"] {
+        assert_eq!(
+            harness.get(&format!("/v1/stats/cache?{query}")).await.0,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+}
+
+#[tokio::test]
+async fn analysis_turn_limit_keeps_the_latest_turns_in_time_order() {
+    let harness = Harness::with_stats();
+    let t = now_ms() - 10_000;
+    for i in 0..2002 {
+        harness.sink.send(proxied_turn(t + i, "", 3000, 0, false));
+    }
+    harness.sink.flush().unwrap();
+    let (status, body) = harness
+        .get(&format!(
+            "/v1/stats/analysis?from={t}&to={}&conversation=0123456789abcdef",
+            t + 2002
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let r = &body["report"];
+    assert_eq!(r["turns_total"], 2002);
+    assert_eq!(r["turns_truncated"], true);
+    assert_eq!(r["turns"].as_array().unwrap().len(), 2000);
+    assert_eq!(r["turns"][0]["time_ms"], t + 2);
+    assert_eq!(r["turns"][1999]["time_ms"], t + 2001);
+    assert_eq!(r["conversations"][0]["client_turns"], 2002);
+}

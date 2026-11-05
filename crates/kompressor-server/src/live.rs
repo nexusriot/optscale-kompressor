@@ -213,6 +213,7 @@ pub(crate) fn live_routes() -> Router<Arc<ServerState>> {
     Router::new()
         .route("/stats/live", get(live))
         .route("/stats/cache", get(crate::cache::cache))
+        .route("/stats/analysis", get(crate::analysis::analysis))
 }
 
 /// Everything the dedicated statistics listener serves: the page at `/`, the
@@ -226,6 +227,7 @@ pub fn stats_listener_router(state: Arc<ServerState>) -> Router {
         .route("/", get(page_at_root))
         .route("/refs", get(crate::refs::page_on_stats_listener))
         .route("/cache", get(crate::cache::page_on_stats_listener))
+        .route("/analysis", get(crate::analysis::page_on_stats_listener))
         .with_state(state.clone())
         .nest("/v1", routes.clone())
         .nest("/v2", routes)
