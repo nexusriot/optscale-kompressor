@@ -1685,6 +1685,8 @@ A background task's wait, which ends on `end_turn` rather than `tool_use`, again
 
 ![keep-warm for background tasks](charts/keepwarm-background.drawio.png)
 
+**On OpenAI the lever is retention, not pings** (`proxy.prompt_cache_retention`, default `default`). OpenAI caches every prompt of 1,024 tokens or more unasked and, on gpt-5.5 and the models before it, charges nothing to write; how long it keeps an entry is the request's `prompt_cache_retention`, `in_memory` (typically five to ten minutes idle) or `24h` (around 30 minutes, up to a day). Codex names neither, so it gets whatever the organization defaults to. Over 12,114 archived Codex requests on gpt-5.5 (2026-09-18 to 10-31), turns that came back after more than five minutes idle failed to read back 46–76% of the prefix the turn before had cached — the in-memory lifetime — but only 135 turns came back that late, because Codex blocks on its tools rather than waiting on background jobs, and the 476K tokens they lost came to about 0.35% of the Codex bill, against 12.6% for Claude Code on Opus 5.5 without keep-warm. Pinging would recover at most that, at $30 per million output tokens a ping, so OpenAI is not pinged; `"24h"` costs nothing on these models, so it is offered. It is added only where it is documented to be read: Chat Completions and Responses requests through the `openai` upstream or any upstream on `api.openai.com`, not the ChatGPT-subscription route on the same mount, not a request that names a retention itself, and only for the models OpenAI lists for `24h` (`retention::SUPPORTED`, matched whole so `gpt-5` does not take in `gpt-5.6`). GPT-5.6 and later take `prompt_cache_options.ttl` instead and price their writes, 1.25x for 30 minutes and 2.5x for 12 hours, which makes them an `adaptive` question like Anthropic's and is not built. A 400 whose body names the field is answered inside `Outbound::send` by sending the same request again without it, and the upstream and model are remembered (`retention::Rejections`) so the field is not added there again; any other answer, a 400 that does not name it included, reaches the client as the provider sent it. The websocket relay is left alone: a `response.create` frame has not been shown to accept the field.
+
 The current rules in three charts, drawn from the code as of 1.5.15 (the two above predate the background cap of 11, `Monitor`, `ScheduleWakeup` and `TaskStop`). Who does what across a tool call: the ping runs on its own tokio task, spawned once the response has been relayed, which the client's next request aborts before it is forwarded:
 
 ![keep-warm across a tool call](charts/keepwarm/tool-call-sequence.drawio.png)
@@ -1742,6 +1744,7 @@ min_elision_saving_chars = 4000
 
 [proxy.providers.openai]
 compress = true
+prompt_cache_retention = "24h"
 ```
 
 **`min_elision_saving_chars`** is the Anthropic setting that is not a switch. In `recoverable` mode `compress_content` ships a payload whole, rolling back what it retained, when its compression leaves a handle but saves fewer characters than this. A handle invites a fetch, and a fetch is a whole extra model answer: about $0.03 on Claude Opus 5.5, where re-sent history is billed as cache reads at $0.20 against $4.00. A 2,000-character elision re-sent twenty times saves about $0.004. Across ten recoverable Claude runs (four full, six panels), tool results that saved under 4,000 characters were fetched back 30% of the time. Replaying all ten runs' tool outputs through the current engine and linking each live fetch round to its payload by content hash:
@@ -2260,6 +2263,7 @@ retrieve_max_rounds = 3
 retrieve_max_tokens_per_request = 16384
 frozen_prefix = "marker"            # marker | first_seen, §12.10
 cache_ttl = "default"               # default | 1h | adaptive (Anthropic), §12.10
+prompt_cache_retention = "default"  # default | 24h (OpenAI, gpt-5.5 and earlier), §12.10
 cache_keep_warm = false             # ping a tool-waiting conversation to keep its cache (Anthropic), §12.10
 cache_keep_warm_interval = "270s"   # between pings; must be under the 5-minute TTL
 cache_keep_warm_max_pings = 11      # per wait, about 50 minutes
