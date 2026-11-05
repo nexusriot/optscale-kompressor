@@ -1330,6 +1330,7 @@ prefix answers 404 rather than an empty report — an empty report would read as
 | `GET /v1/stats/requests?request_id=` | one request's economy row plus its events |
 | `GET /v1/stats/store` | live refs/bytes, oldest, purge counters |
 | `GET /v1/stats/live?window&recent&tenant&format&refresh` | a live snapshot ending now: totals, 1m/5m/15m rates, a timeline, upstream status/cache/latency percentiles, by provider/model/type, skip reasons, retrievals, the latest requests, and process info (version, uptime, dropped events). JSON, or a self-refreshing HTML dashboard for `?format=html` or a browser's `Accept` |
+| `GET /v1/stats/cache?window&conversations&conversation&tenant&format&refresh` | prompt-cache analysis over `proxy_requests`: input split into fresh, read, 5-minute and 1-hour writes, with its cost in input-equivalent tokens against an uncached baseline; every lost prefix classified as `ttl_expiry` or `prefix_change`; keep-warm pings (warm, cold, failed, cost, pauses bridged); client turns by idle gap; per model; per conversation, costliest losses first, and with `conversation=<16 hex>` that conversation's rows one by one. JSON, or a page for `?format=html` or a browser's `Accept` |
 | `GET /v1/refs?q&kind&request_id&expired&order&offset&limit&preview&tenant&format` | the ref browser (§8.3.1): one page of the tenant's fragments with a preview each, the match total, a count per kind and what the tenant holds live. JSON, or a page for `?format=html` or a browser's `Accept`. Off — 404 — unless `refs.browse = true` |
 | `GET /v1/refs/{handle}?history&tenant` | one fragment in full, read without touching it, with its retention and every recorded ask for it (`retrieval_events`) |
 | `DELETE /v1/refs/{handle}?tenant` | remove a fragment from the store and the recent-write cache; a later retrieval is a miss |
@@ -1348,6 +1349,22 @@ listener runs whatever surfaces were selected, so `serve --proxy` has one too.
 The HTML shell is served without credentials because it holds no data; with
 `auth.mode = "api_keys"` its polls send a key the viewer types in, kept in the
 tab's `sessionStorage`.
+
+`/v1/stats/cache` walks each conversation's `proxy_requests` rows in time
+order, keep-warm pings included, and compares every row with what the row
+before left cached: for Anthropic its reads plus writes, for OpenAI (which
+caches unasked) its whole prompt. A shortfall of 1,024 tokens or more is a
+lost prefix — `partial` if something was read, `miss` if nothing — put down
+to `ttl_expiry` when the conversation had been idle (since its last request or
+ping) past the cache lifetime, five minutes or an hour once it has written
+one-hour entries, and to `prefix_change` otherwise. A client request with fewer
+messages than the one before it is a `branch` (a subagent summary or side
+query re-sending an earlier history) and is compared with nothing. Costs are in
+input-equivalent tokens — fresh input 1, a read at the model's read rate, a
+write at 1.25 or 2 — from `kompressor_stats::cache::rates`, a copy of the
+proxy's `CachePrices` kept in step by a test. The page is served at `/cache` on
+the statistics listener; `window` defaults to `6h`, `conversations` to 50 (at
+most 500), and one report reads at most the newest 200,000 rows.
 
 The ref browser follows the same shape: `/v1/refs` is JSON or a page, the page
 fetches the JSON with the key from the same `sessionStorage` entry, and the

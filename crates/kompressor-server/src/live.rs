@@ -210,11 +210,14 @@ pub struct LiveResponse {
 
 /// The live routes, mounted under each version prefix by the API router.
 pub(crate) fn live_routes() -> Router<Arc<ServerState>> {
-    Router::new().route("/stats/live", get(live))
+    Router::new()
+        .route("/stats/live", get(live))
+        .route("/stats/cache", get(crate::cache::cache))
 }
 
 /// Everything the dedicated statistics listener serves: the page at `/`, the
-/// ref browser at `/refs`, the versioned live and ref routes, and the probes.
+/// ref browser at `/refs`, the cache analysis at `/cache`, the versioned live,
+/// cache and ref routes, and the probes.
 pub fn stats_listener_router(state: Arc<ServerState>) -> Router {
     let routes = live_routes()
         .merge(crate::refs::refs_routes())
@@ -222,6 +225,7 @@ pub fn stats_listener_router(state: Arc<ServerState>) -> Router {
     let router = Router::new()
         .route("/", get(page_at_root))
         .route("/refs", get(crate::refs::page_on_stats_listener))
+        .route("/cache", get(crate::cache::page_on_stats_listener))
         .with_state(state.clone())
         .nest("/v1", routes.clone())
         .nest("/v2", routes)

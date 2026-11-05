@@ -566,6 +566,7 @@ are in [docs/charts/](docs/charts/).
 | LLM proxy  | `kompressor serve --proxy`: OpenAI Chat Completions, OpenAI Responses, Anthropic Messages, and a WebSocket relay                                                            |
 | HTTP API   | `POST /v1/compress`, `/v1/compress/raw`, `/v1/retrieve`, `/v1/detect`; `GET /v1/stats/*`, `/healthz`, `/readyz`, `/metrics`                                                 |
 | Live stats | `GET /v1/stats/live`: JSON, or a self-refreshing dashboard in a browser; on its own port with `server.stats_listen`                                                       |
+| Cache      | `GET /v1/stats/cache`: prompt-cache reads, writes and losses per conversation, each loss put down to expiry or a prefix change, and what keep-warm bridged                |
 | Ref store  | `GET /v1/refs`: search, inspect and delete stored fragments, as JSON or a page; off unless `refs.browse = true`                                                           |
 | MCP server | `kompressor serve --mcp` (streamable HTTP): `optscale_kompressor_retrieve`, `optscale_kompressor_compress`, `optscale_kompressor_compress_raw`, `optscale_kompressor_stats` |
 | CLI        | `kompressor compress`, `retrieve`, `detect`, `stats`, `bench`, `check-config`                                                                                               |
@@ -596,6 +597,14 @@ days) — throughput, tokens removed, net of retrieval, cache reads, upstream
 status and latency, savings by provider, model and content type, why messages
 were left alone, and the latest requests — refreshed every two seconds. The
 same data is JSON at `/v1/stats/live`. It shows the dropped-event count too.
+
+`http://127.0.0.1:8818/cache` is the provider's prompt cache over the last six
+hours (or one, or 30 days): how much of the input was read from cache, what
+the cache saved against no cache at all, every turn that failed to read back
+the prefix the turn before left — put down to expiry when the conversation
+had idled past the cache lifetime, to a prefix change otherwise — the idle
+gaps before each turn, and what the keep-warm pings cost and bridged. Click a
+conversation for its turns one by one. The JSON is `/v1/stats/cache`.
 
 ---
 

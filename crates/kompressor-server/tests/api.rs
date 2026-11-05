@@ -1475,3 +1475,171 @@ async fn the_statistics_listener_serves_the_ref_browser_beside_the_dashboard() {
         "the dashboard links it"
     );
 }
+
+// ---------------------------------------------------------------------------
+// cache analysis
+// ---------------------------------------------------------------------------
+
+fn proxied_turn(
+    time_ms: i64,
+    tenant: &str,
+    read: u32,
+    write: u32,
+    keep_warm: bool,
+) -> kompressor_stats::Event {
+    kompressor_stats::Event::ProxyRequest(kompressor_stats::ProxyRequestEvent {
+        time_ms,
+        tenant: tenant.into(),
+        request_id: format!("req-{time_ms}-{keep_warm}"),
+        api_family: "anthropic_messages".into(),
+        model: Some("claude-opus-5-5".into()),
+        upstream: "https://api.anthropic.com".into(),
+        status: Some(200),
+        stream: !keep_warm,
+        strip_usage: false,
+        prompt_tokens: Some(8),
+        completion_tokens: Some(if keep_warm { 1 } else { 120 }),
+        cache_read_tokens: Some(read),
+        cache_write_tokens: Some(write),
+        cache_write_1h_tokens: Some(0),
+        shadow_prompt_tokens: None,
+        conversation: Some("0123456789abcdef".into()),
+        retrieve_rounds: 0,
+        retrieve_tokens_injected: 0,
+        upstream_ms: Some(800.0),
+        total_ms: (!keep_warm).then_some(900.0),
+        error: None,
+        keep_warm,
+    })
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
+#[tokio::test]
+async fn the_cache_view_classifies_each_turn_and_names_the_cause() {
+    let harness = Harness::with_stats();
+    let (status, empty) = harness.get("/v1/stats/cache").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(empty["window"], "6h");
+    assert_eq!(empty["rows"], 0);
+    let tenant = text(&empty["tenant"]);
+
+    const MIN: i64 = 60_000;
+    let t0 = now_ms() - 60 * MIN;
+    for event in [
+        proxied_turn(t0, &tenant, 0, 40_000, false),
+        // a ping holds the cache across a seven-minute pause
+        proxied_turn(t0 + 4 * MIN, &tenant, 40_000, 0, true),
+        proxied_turn(t0 + 7 * MIN, &tenant, 40_000, 2_000, false),
+        // then a twenty-minute pause nobody bridged
+        proxied_turn(t0 + 27 * MIN, &tenant, 0, 42_500, false),
+    ] {
+        harness.sink.send(event);
+    }
+    harness.sink.flush().expect("the batch commits");
+
+    let (status, report) = harness
+        .get("/v1/stats/cache?window=2h&conversation=0123456789abcdef")
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(report["rows"], 4);
+    assert_eq!(report["clients"]["requests"], 3);
+    assert_eq!(report["keep_warm"]["pings"], 1);
+    assert_eq!(report["keep_warm"]["warm"], 1);
+    assert_eq!(report["keep_warm"]["bridged"], 1);
+    assert_eq!(report["losses"]["ttl_expiry_events"], 1);
+    assert_eq!(report["losses"]["ttl_expiry_tokens"], 42_000);
+    assert_eq!(report["losses"]["prefix_change_events"], 0);
+    assert_eq!(report["conversations_total"], 1);
+    assert_eq!(
+        report["conversations"][0]["conversation"],
+        "0123456789abcdef"
+    );
+    let kinds: Vec<&str> = report["turns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["first", "hit", "hit", "miss"]);
+    assert_eq!(report["turns"][3]["cause"], "ttl_expiry");
+    assert!(report["totals"]["saved_share"].as_f64().unwrap() > 0.0);
+
+    // without a conversation named, no turns are listed
+    let (_, report) = harness.get("/v2/stats/cache?window=2h").await;
+    assert!(report["turns"].is_null());
+}
+
+#[tokio::test]
+async fn a_cache_query_it_cannot_honour_is_refused() {
+    let harness = Harness::with_stats();
+    for query in [
+        "window=2w",
+        "conversations=501",
+        "conversation=XYZ",
+        "format=xml",
+        "refresh=0",
+        "colour=red",
+    ] {
+        let (status, body) = harness.get(&format!("/v1/stats/cache?{query}")).await;
+        assert!(status.is_client_error(), "{query} answered {status}");
+        assert!(body["error"]["message"].is_string(), "{query} says why");
+    }
+    let harness = Harness::memory();
+    let (status, body) = harness.get("/v1/stats/cache").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(text(&body["error"]["message"]).contains("disabled"));
+}
+
+#[tokio::test]
+async fn the_cache_data_needs_a_key_where_keys_are_required_but_the_page_does_not() {
+    let harness = Harness::with_stats_and(keyed_config, kompressor_server::router);
+    let (status, _) = harness.get("/v1/stats/cache?format=json").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, page) = harness.get("/v1/stats/cache?format=html").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(text(&page).contains("x-kompressor-key"));
+    let (status, report, _) = harness
+        .get_with("/v1/stats/cache", &[("x-kompressor-key", "sk-alpha")])
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(report["tenant"], "team-a");
+    let (status, _, _) = harness
+        .get_with(
+            "/v1/stats/cache?tenant=team-b",
+            &[("x-kompressor-key", "sk-alpha")],
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn the_statistics_listener_serves_the_cache_page_beside_the_dashboard() {
+    let harness = Harness::with_stats_and(|_| {}, kompressor_server::stats_listener_router);
+    let (status, page) = harness.get("/cache?window=24h").await;
+    assert_eq!(status, StatusCode::OK);
+    let page = text(&page);
+    assert!(page.contains("Kompressor cache"));
+    assert!(
+        page.contains("\"endpoint\":\"/v1/stats/cache\""),
+        "the page at /cache must poll the JSON path, not itself"
+    );
+    assert!(page.contains("\"window\":\"24h\""));
+    assert!(
+        page.contains("\"refs\":false"),
+        "the ref browser is off here"
+    );
+    let (status, report) = harness.get("/v1/stats/cache").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(report["rows"], 0);
+    let (_, dashboard) = harness.get("/").await;
+    assert!(
+        text(&dashboard).contains("cache-link"),
+        "the dashboard links it"
+    );
+}

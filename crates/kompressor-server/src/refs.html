@@ -85,6 +85,7 @@ form.key input { flex: 1; }
     <span class="meta"><span id="status-dot" class="dot"></span><span id="status">connecting…</span></span>
     <div class="controls">
       <a id="live-link" href="#">Live stats</a>
+      <a id="cache-link" href="#">Cache</a>
       <button id="pause" aria-pressed="false" title="Re-list automatically">Pause</button>
     </div>
   </header>
@@ -555,6 +556,7 @@ window.addEventListener("hashchange", () => {
 // Where the live statistics are: given by the server on the statistics
 // listener, else the sibling of this page under the same version prefix.
 $("live-link").href = SETTINGS.live || location.pathname.replace(/refs\/?$/, "stats/live");
+$("cache-link").href = SETTINGS.live ? "/cache" : location.pathname.replace(/refs\/?$/, "stats/cache");
 $("q").value = state.q;
 $("order").value = state.order;
 $("limit").value = String(state.limit);

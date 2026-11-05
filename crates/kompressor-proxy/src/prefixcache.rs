@@ -1273,6 +1273,41 @@ mod tests {
         );
     }
 
+    /// The cache report (`/v1/stats/cache`) prices rows with its own copy of
+    /// this table, because the statistics crate cannot depend on the proxy.
+    /// The two must not drift.
+    #[test]
+    fn the_cache_report_prices_reads_and_writes_as_the_proxy_does() {
+        for family in [
+            ApiFamily::AnthropicMessages,
+            ApiFamily::OpenAiChat,
+            ApiFamily::OpenAiResponses,
+        ] {
+            for model in [
+                None,
+                Some("claude-opus-5-5"),
+                Some("anthropic/claude-sonnet-5-5"),
+                Some("claude-fable-5-1"),
+                Some("claude-mythos-5-1"),
+                Some("claude-haiku-5-5"),
+                Some("claude-opus-4-8"),
+                Some("gpt-5.5"),
+            ] {
+                let report = kompressor_stats::cache::rates(family.as_str(), model);
+                let short = CachePrices::for_model(family, model, false);
+                let long = CachePrices::for_model(family, model, true);
+                let ppm = |rate: f64| (rate * 1_000_000.0).round() as u32;
+                assert_eq!(ppm(report.read), short.read_ppm, "{family:?} {model:?}");
+                assert_eq!(
+                    ppm(report.write_5m),
+                    short.write_ppm,
+                    "{family:?} {model:?}"
+                );
+                assert_eq!(ppm(report.write_1h), long.write_ppm, "{family:?} {model:?}");
+            }
+        }
+    }
+
     /// Demand is what the last few requests asked for, not what the
     /// conversation ever did.
     #[test]

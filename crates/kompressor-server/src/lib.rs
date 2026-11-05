@@ -38,6 +38,7 @@ pub mod state;
 pub mod wire;
 
 mod api;
+pub mod cache;
 pub mod live;
 mod ops;
 pub mod refs;

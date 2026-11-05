@@ -45,7 +45,8 @@ pub struct ServerConfig {
     pub api_listen: String,
     pub mcp_listen: String,
     pub proxy_listen: String,
-    /// A listener of its own for the live statistics page and its JSON, e.g.
+    /// A listener of its own for the live statistics and cache analysis pages
+    /// and their JSON, e.g.
     /// `127.0.0.1:8818`. Empty serves them only on the API listener, at
     /// `/v1/stats/live`; set, they are served here too, whatever surfaces the
     /// process runs, so a proxy-only deployment still has a dashboard.
