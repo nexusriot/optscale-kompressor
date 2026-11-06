@@ -24,7 +24,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::authenticate;
 use crate::error::ApiError;
-use crate::live::{parse_window, prefers_html};
+use crate::export::jsonl_response;
+use crate::live::{Format, parse_window};
 use crate::middleware::json_response;
 use crate::state::ServerState;
 
@@ -52,22 +53,15 @@ pub(crate) struct CacheQuery {
     conversations: Option<usize>,
     /// One conversation's id, to list its rows.
     conversation: Option<String>,
-    /// `json` or `html`. Without it, the `Accept` header decides.
+    /// `json`, `jsonl` or `html`. Without it, the `Accept` header decides.
     format: Option<String>,
     /// Seconds between the page's polls, 1 to 3600. HTML only.
     refresh: Option<u32>,
 }
 
 impl CacheQuery {
-    fn wants_html(&self, headers: &HeaderMap) -> Result<bool, ApiError> {
-        match self.format.as_deref() {
-            Some("json") => Ok(false),
-            Some("html") => Ok(true),
-            Some(other) => Err(ApiError::Invalid(format!(
-                "format must be json or html, not {other}"
-            ))),
-            None => Ok(prefers_html(headers)),
-        }
+    fn format(&self, headers: &HeaderMap) -> Result<Format, ApiError> {
+        Format::parse(self.format.as_deref(), headers)
     }
 
     fn conversations(&self) -> Result<usize, ApiError> {
@@ -159,7 +153,7 @@ async fn respond(
     live: &str,
     refs: &str,
 ) -> Result<Response, ApiError> {
-    let html = query.wants_html(&headers)?;
+    let format = query.format(&headers)?;
     let label = query
         .window
         .clone()
@@ -183,7 +177,7 @@ async fn respond(
 
     // As on the live page: the shell is served to anyone, and the data only
     // to a poll that presents a key.
-    if html {
+    if format == Format::Html {
         let browse = state.core.config().refs.browse;
         return Ok(page(
             &label,
@@ -217,7 +211,7 @@ async fn respond(
             )
         })
         .await?;
-    Ok(json_response(&CacheResponse {
+    let response = CacheResponse {
         generated_at_ms: to_ms,
         window: if fixed.is_some() {
             "fixed range".into()
@@ -225,7 +219,11 @@ async fn respond(
             label
         },
         report,
-    }))
+    };
+    Ok(match format {
+        Format::Jsonl => jsonl_response(&response, "cache", to_ms),
+        _ => json_response(&response),
+    })
 }
 
 fn now_ms() -> i64 {
@@ -291,7 +289,7 @@ mod tests {
             query.conversations().is_err()
                 || query.refresh().is_err()
                 || query.conversation().is_err()
-                || query.wants_html(&HeaderMap::new()).is_err()
+                || query.format(&HeaderMap::new()).is_err()
         };
         assert!(bad(|q| q.conversations = Some(MAX_CONVERSATIONS + 1)));
         assert!(bad(|q| q.refresh = Some(0)));
@@ -300,6 +298,7 @@ mod tests {
         assert!(bad(|q| q.format = Some("xml".into())));
         assert!(!bad(|q| q.conversation = Some("00000000000000aa".into())));
         assert!(!bad(|q| q.conversation = Some("  ".into())));
+        assert!(!bad(|q| q.format = Some("jsonl".into())));
     }
 
     #[test]

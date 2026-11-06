@@ -1887,3 +1887,741 @@ async fn analysis_diagnostics_require_keys_and_scope_every_new_report() {
         );
     }
 }
+
+/// A GET whose body is kept as text, with the headers a download is judged by.
+async fn get_raw(
+    harness: &Harness,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> (StatusCode, String, String, String) {
+    let mut request = Request::builder().method("GET").uri(path);
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    let response = harness
+        .router
+        .clone()
+        .oneshot(request.body(Body::empty()).expect("a request"))
+        .await
+        .expect("the router answers");
+    let status = response.status();
+    let header = |name| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let (content_type, disposition) = (header("content-type"), header("content-disposition"));
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("a body")
+        .to_bytes();
+    (
+        status,
+        content_type,
+        disposition,
+        String::from_utf8(bytes.to_vec()).expect("utf-8"),
+    )
+}
+
+fn jsonl_lines(body: &str) -> Vec<Value> {
+    assert!(body.ends_with('\n'), "every line is terminated");
+    body.lines()
+        .map(|line| serde_json::from_str(line).expect("every line is one JSON value"))
+        .collect()
+}
+
+#[tokio::test]
+async fn every_dashboard_downloads_its_report_as_json_lines() {
+    let harness = Harness::with_stats();
+    let (status, _) = harness
+        .post(
+            "/v1/compress/raw",
+            json!({"content": log_payload(400), "request_id": "export-1"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, empty) = harness.get("/v1/stats/cache").await;
+    let tenant = text(&empty["tenant"]);
+    let t = now_ms() - 60_000;
+    harness
+        .sink
+        .send(proxied_turn(t, &tenant, 0, 40_000, false));
+    harness
+        .sink
+        .send(proxied_turn(t + 1_000, &tenant, 40_000, 0, false));
+    harness.sink.flush().expect("the batch commits");
+
+    let from = t - 1;
+    let to = now_ms() + 1;
+    for (path, name, list) in [
+        (
+            "/v1/stats/live?format=jsonl&window=15m".to_string(),
+            "live",
+            "recent",
+        ),
+        (
+            "/v1/stats/cache?format=jsonl&window=2h".to_string(),
+            "cache",
+            "conversations",
+        ),
+        (
+            format!("/v1/stats/analysis?format=jsonl&from={from}&to={to}"),
+            "analysis",
+            "report.conversations",
+        ),
+        (
+            format!("/v1/stats/analysis/latency?format=jsonl&from={from}&to={to}"),
+            "analysis-latency",
+            "",
+        ),
+        (
+            format!("/v2/stats/analysis/retrievals?format=jsonl&from={from}&to={to}"),
+            "analysis-retrievals",
+            "",
+        ),
+    ] {
+        let (status, content_type, disposition, body) = get_raw(&harness, &path, &[]).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+        assert_eq!(content_type, "application/x-ndjson", "{path}");
+        assert!(
+            disposition.starts_with(&format!("attachment; filename=\"kompressor-{name}-"))
+                && disposition.ends_with(".jsonl\""),
+            "{path}: {disposition}"
+        );
+        let lines = jsonl_lines(&body);
+        assert_eq!(lines[0]["record"], "summary", "{path}: the summary leads");
+        assert!(
+            lines
+                .iter()
+                .skip(1)
+                .all(|line| line["record"].is_string() && line["record"] != "summary"),
+            "{path}: every other line names its list"
+        );
+        if !list.is_empty() {
+            assert!(
+                lines.iter().any(|line| line["record"] == list),
+                "{path}: has {list} rows"
+            );
+        }
+    }
+
+    // The rows match what the JSON form reports.
+    let (_, live) = harness.get("/v1/stats/live?window=15m").await;
+    let (_, _, _, body) = get_raw(&harness, "/v1/stats/live?format=jsonl&window=15m", &[]).await;
+    let lines = jsonl_lines(&body);
+    assert_eq!(lines[0]["totals"], live["totals"]);
+    assert_eq!(lines[0]["server"]["version"], env!("CARGO_PKG_VERSION"));
+    let recent: Vec<_> = lines.iter().filter(|l| l["record"] == "recent").collect();
+    assert_eq!(recent.len(), live["recent"].as_array().unwrap().len());
+    assert_eq!(recent[0]["request_id"], "export-1");
+
+    let (_, cache) = harness.get("/v1/stats/cache?window=2h").await;
+    let (_, _, _, body) = get_raw(&harness, "/v1/stats/cache?format=jsonl&window=2h", &[]).await;
+    let lines = jsonl_lines(&body);
+    assert_eq!(lines[0]["rows"], 2);
+    assert_eq!(lines[0]["totals"], cache["totals"]);
+    let timeline = lines.iter().filter(|l| l["record"] == "timeline").count();
+    assert_eq!(timeline, cache["timeline"].as_array().unwrap().len());
+
+    // An unknown format is still refused.
+    let (status, _) = harness.get("/v1/stats/cache?format=csv").await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn a_json_lines_download_needs_the_same_key_as_the_json() {
+    let harness = Harness::with_stats_and(keyed_config, kompressor_server::stats_listener_router);
+    for path in [
+        "/v1/stats/live?format=jsonl",
+        "/v1/stats/cache?format=jsonl",
+        "/v1/stats/analysis?format=jsonl",
+    ] {
+        let (status, _, _, _) = get_raw(&harness, path, &[]).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}");
+        let (status, content_type, _, body) =
+            get_raw(&harness, path, &[("x-kompressor-key", "sk-alpha")]).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+        assert_eq!(content_type, "application/x-ndjson");
+        assert!(body.contains("\"team-a\""), "{path}: the caller's tenant");
+    }
+    let (status, _, _, _) = get_raw(
+        &harness,
+        "/v1/stats/cache?format=jsonl&tenant=team-b",
+        &[("x-kompressor-key", "sk-alpha")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn every_dashboard_page_offers_the_download() {
+    let harness = Harness::with_stats();
+    for path in [
+        "/v1/stats/live?format=html",
+        "/v1/stats/cache?format=html",
+        "/v1/stats/analysis?format=html",
+    ] {
+        let (status, page) = harness.get(path).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        let page = text(&page);
+        assert!(page.contains("id=\"download\""), "{path}: has the button");
+        assert!(page.contains("\"jsonl\""), "{path}: asks for jsonl");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// the statistics JSON API, as automation uses it
+// ---------------------------------------------------------------------------
+
+/// Every read-only statistics route that answers JSON, with a query that is
+/// valid on each. `{from}`/`{to}` are filled in by [`stats_routes`].
+const STATS_ROUTES: [&str; 12] = [
+    "stats/summary",
+    "stats/histogram?bucket=1h",
+    "stats/by_type",
+    "stats/retrievals",
+    "stats/requests?request_id=auto-1",
+    "stats/store",
+    "stats/live?window=15m",
+    "stats/cache?window=2h",
+    "stats/analysis?from={from}&to={to}",
+    "stats/analysis/retrievals?from={from}&to={to}",
+    "stats/analysis/latency?from={from}&to={to}",
+    "stats/analysis/compare?from={from}&to={to}",
+];
+
+fn stats_routes(version: &str, from: i64, to: i64) -> Vec<String> {
+    STATS_ROUTES
+        .iter()
+        .map(|route| {
+            format!("/{version}/")
+                + &route
+                    .replace("{from}", &from.to_string())
+                    .replace("{to}", &to.to_string())
+        })
+        .collect()
+}
+
+/// A server holding one compression, one retrieval and two proxied turns for
+/// `tenant`, all inside the returned `(from, to)`.
+async fn seeded(harness: &Harness, tenant: &str, headers: &[(&str, &str)]) -> (i64, i64) {
+    let (status, compressed, _) = harness
+        .post_with(
+            "/v1/compress",
+            json!({
+                "messages": [{"role": "user", "content": log_payload(400)}],
+                "request_id": "auto-1"
+            }),
+            headers,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{compressed}");
+    let handle = handle_in(&compressed["messages"]);
+    let (status, _, _) = harness
+        .post_with(
+            "/v1/retrieve",
+            json!({ "ref": handle, "request_id": "auto-1" }),
+            headers,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let t = now_ms() - 60_000;
+    harness.sink.send(proxied_turn(t, tenant, 0, 40_000, false));
+    harness
+        .sink
+        .send(proxied_turn(t + 1_000, tenant, 40_000, 2_000, false));
+    harness.sink.flush().expect("the batch commits");
+    (t - 1, now_ms() + 1)
+}
+
+fn keys(value: &Value) -> Vec<&str> {
+    let mut keys: Vec<&str> = value
+        .as_object()
+        .unwrap_or_else(|| panic!("an object, not {value}"))
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    keys
+}
+
+fn sorted(mut keys: Vec<&str>) -> Vec<&str> {
+    keys.sort_unstable();
+    keys
+}
+
+fn has_keys(value: &Value, expected: &[&str], what: &str) {
+    for key in expected {
+        assert!(
+            value.get(key).is_some(),
+            "{what} is missing {key:?}: has {:?}",
+            keys(value)
+        );
+    }
+}
+
+#[tokio::test]
+async fn every_stats_route_answers_automation_with_json_whatever_it_accepts() {
+    let harness = Harness::with_stats();
+    let (from, to) = seeded(&harness, "", &[]).await;
+    for version in ["v1", "v2"] {
+        for path in stats_routes(version, from, to) {
+            for accept in [None, Some("*/*"), Some("application/json")] {
+                let headers: Vec<(&str, &str)> =
+                    accept.map(|a| vec![("accept", a)]).unwrap_or_default();
+                let (status, content_type, disposition, body) =
+                    get_raw(&harness, &path, &headers).await;
+                assert_eq!(status, StatusCode::OK, "{path} {accept:?}: {body}");
+                assert_eq!(content_type, "application/json", "{path} {accept:?}");
+                assert!(disposition.is_empty(), "{path}: JSON is not a download");
+                let value: Value = serde_json::from_str(&body).expect("JSON");
+                assert!(value.is_object(), "{path}: one object");
+            }
+        }
+    }
+    // And `?format=json` wins over a browser's Accept on every dashboard route.
+    let browser = [("accept", "text/html,application/xhtml+xml,*/*;q=0.8")];
+    for path in &stats_routes("v1", from, to)[6..] {
+        let sep = if path.contains('?') { '&' } else { '?' };
+        let (status, content_type, _, body) =
+            get_raw(&harness, &format!("{path}{sep}format=json"), &browser).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+        assert_eq!(content_type, "application/json", "{path}");
+    }
+}
+
+#[tokio::test]
+async fn the_live_json_keeps_its_contract() {
+    let harness = Harness::with_stats();
+    seeded(&harness, "", &[]).await;
+    let (status, live) = harness.get("/v1/stats/live?window=15m&recent=1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        keys(&live),
+        sorted(vec![
+            "generated_at_ms",
+            "server",
+            "window",
+            "tenant",
+            "from_ms",
+            "to_ms",
+            "bucket_ms",
+            "totals",
+            "rates",
+            "timeline",
+            "upstream",
+            "by_provider",
+            "by_model",
+            "by_type",
+            "skipped_by_reason",
+            "retrievals",
+            "recent",
+        ])
+    );
+    assert_eq!(
+        keys(&live["server"]),
+        sorted(vec![
+            "version",
+            "started_at_ms",
+            "uptime_s",
+            "mode",
+            "proxy_enabled",
+            "stats_dropped",
+            "inflight_limit",
+            "inflight_free",
+        ])
+    );
+    assert_eq!(
+        keys(&live["window"]),
+        sorted(vec!["label", "from_ms", "to_ms", "bucket_ms"])
+    );
+    let window = &live["window"];
+    assert_eq!(window["label"], "15m");
+    assert_eq!(
+        window["to_ms"].as_i64().unwrap() - window["from_ms"].as_i64().unwrap(),
+        15 * 60_000
+    );
+    assert_eq!(window["bucket_ms"], live["bucket_ms"]);
+    assert!(live["generated_at_ms"].as_i64().unwrap() >= window["to_ms"].as_i64().unwrap());
+    assert_eq!(
+        live["recent"].as_array().unwrap().len(),
+        1,
+        "recent=1 is honoured"
+    );
+    assert_eq!(live["totals"]["compressions"], 1);
+    for list in [
+        "rates",
+        "timeline",
+        "by_provider",
+        "by_model",
+        "by_type",
+        "skipped_by_reason",
+    ] {
+        assert!(live[list].is_array(), "{list} is a list");
+    }
+    let (_, none) = harness.get("/v1/stats/live?recent=0").await;
+    assert_eq!(none["recent"], json!([]));
+    assert_eq!(none["window"]["label"], "1h", "the default window");
+}
+
+#[tokio::test]
+async fn the_cache_json_keeps_its_contract() {
+    let harness = Harness::with_stats();
+    let (_, empty) = harness.get("/v1/stats/cache").await;
+    let tenant = text(&empty["tenant"]);
+    let (from, to) = seeded(&harness, &tenant, &[]).await;
+    let report_keys = [
+        "tenant",
+        "from_ms",
+        "to_ms",
+        "bucket_ms",
+        "rows",
+        "truncated",
+        "totals",
+        "clients",
+        "pings",
+        "losses",
+        "keep_warm",
+        "gaps",
+        "timeline",
+        "by_model",
+        "conversations",
+        "conversations_total",
+        "unattributed",
+        "turns",
+    ];
+    let (status, report) = harness.get("/v1/stats/cache?window=2h").await;
+    assert_eq!(status, StatusCode::OK);
+    let mut expected = vec!["generated_at_ms", "window"];
+    expected.extend(report_keys);
+    assert_eq!(keys(&report), sorted(expected));
+    assert_eq!(report["window"], "2h");
+    assert_eq!(report["rows"], 2);
+    assert_eq!(report["truncated"], false);
+    assert!(report["turns"].is_null(), "no conversation named");
+    for list in ["gaps", "timeline", "by_model", "conversations"] {
+        assert!(report[list].is_array(), "{list} is a list");
+    }
+
+    // A fixed range is reported as one, with exactly the bounds asked for.
+    let (status, fixed) = harness
+        .get(&format!(
+            "/v1/stats/cache?from={from}&to={to}&conversation=0123456789abcdef&conversations=0"
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{fixed}");
+    assert_eq!(fixed["window"], "fixed range");
+    assert_eq!(fixed["from_ms"], from);
+    assert_eq!(fixed["to_ms"], to);
+    assert_eq!(
+        fixed["conversations"],
+        json!([]),
+        "conversations=0 is honoured"
+    );
+    assert_eq!(fixed["conversations_total"], 1);
+    assert_eq!(fixed["turns"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn the_analysis_json_keeps_its_contract() {
+    let harness = Harness::with_stats();
+    let (_, empty) = harness.get("/v1/stats/cache").await;
+    let tenant = text(&empty["tenant"]);
+    let (from, to) = seeded(&harness, &tenant, &[]).await;
+
+    let (status, overview) = harness
+        .get(&format!("/v1/stats/analysis?from={from}&to={to}"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{overview}");
+    assert_eq!(
+        keys(&overview),
+        sorted(vec!["report", "stats_dropped", "retention_days"])
+    );
+    let report = &overview["report"];
+    assert_eq!(
+        keys(report),
+        sorted(vec![
+            "tenant",
+            "from_ms",
+            "to_ms",
+            "conversations",
+            "unattributed",
+            "outcomes",
+            "skips",
+            "breakdowns",
+            "turns",
+            "turns_total",
+            "turns_truncated",
+            "cache_truncated",
+            "usage",
+            "ping_usage",
+            "raw_available_from_ms",
+        ])
+    );
+    assert_eq!(report["from_ms"], from);
+    assert_eq!(report["to_ms"], to);
+    assert!(
+        report["turns"].is_null(),
+        "turns only for a named conversation"
+    );
+
+    let scope = ["tenant", "from_ms", "to_ms", "stats_dropped"];
+    let (status, retrievals) = harness
+        .get(&format!(
+            "/v1/stats/analysis/retrievals?from={from}&to={to}"
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{retrievals}");
+    has_keys(&retrievals, &scope, "retrievals");
+    has_keys(
+        &retrievals,
+        &[
+            "attempts",
+            "hits",
+            "missing",
+            "expired",
+            "withheld",
+            "ranged_tokens",
+            "full_tokens",
+            "saved_gross",
+            "retrieved_tokens",
+            "debit_to_gross",
+            "requests",
+            "requests_total",
+            "repeated_refs",
+            "repeated_refs_total",
+            "rounds",
+            "raw_only",
+        ],
+        "retrievals",
+    );
+    assert_eq!(retrievals["hits"], 1);
+    assert_eq!(retrievals["from_ms"], from);
+
+    let (status, latency) = harness
+        .get(&format!("/v1/stats/analysis/latency?from={from}&to={to}"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{latency}");
+    has_keys(&latency, &scope, "latency");
+    has_keys(
+        &latency,
+        &[
+            "requests",
+            "rows_total",
+            "truncated",
+            "errors",
+            "with_timing",
+            "total",
+            "groups",
+            "slowest",
+            "errors_over_time",
+            "raw_only",
+        ],
+        "latency",
+    );
+    has_keys(
+        &latency["total"],
+        &["samples", "mean", "p50", "p95", "p99", "max"],
+        "a distribution",
+    );
+    assert_eq!(latency["requests"], 2);
+
+    let (status, compare) = harness
+        .get(&format!("/v1/stats/analysis/compare?from={from}&to={to}"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{compare}");
+    has_keys(&compare, &scope, "compare");
+    has_keys(&compare, &["current", "baseline", "changes"], "compare");
+    for side in ["current", "baseline"] {
+        has_keys(
+            &compare[side],
+            &[
+                "from_ms",
+                "to_ms",
+                "metrics",
+                "conversations",
+                "net_reduction",
+            ],
+            side,
+        );
+    }
+    assert_eq!(compare["current"]["from_ms"], from);
+    assert_eq!(compare["baseline"]["to_ms"], from, "the window just before");
+    assert_eq!(
+        compare["baseline"]["from_ms"].as_i64().unwrap(),
+        from - (to - from)
+    );
+    assert!(compare["changes"].is_object());
+}
+
+#[tokio::test]
+async fn the_reports_agree_with_one_another_over_the_same_range() {
+    let harness = Harness::with_stats();
+    let (_, empty) = harness.get("/v1/stats/cache").await;
+    let tenant = text(&empty["tenant"]);
+    let (from, to) = seeded(&harness, &tenant, &[]).await;
+    let (_, cache) = harness
+        .get(&format!("/v1/stats/cache?from={from}&to={to}"))
+        .await;
+    let (_, analysis) = harness
+        .get(&format!("/v1/stats/analysis?from={from}&to={to}"))
+        .await;
+    let (_, live) = harness.get("/v1/stats/live?window=15m").await;
+    let (_, summary) = harness.get("/v1/stats/summary").await;
+    assert_eq!(cache["totals"]["requests"], 2);
+    assert_eq!(
+        analysis["report"]["usage"]["requests"],
+        cache["totals"]["requests"]
+    );
+    assert_eq!(live["totals"]["compressions"], summary["requests"]);
+    assert_eq!(live["tenant"], cache["tenant"]);
+    assert_eq!(analysis["report"]["tenant"], cache["tenant"]);
+}
+
+#[tokio::test]
+async fn every_stats_route_applies_the_same_credentials() {
+    let harness = Harness::with_stats_and(keyed_config, kompressor_server::router);
+    let alpha = [("x-kompressor-key", "sk-alpha")];
+    let (from, to) = seeded(&harness, "team-a", &alpha).await;
+    // Something for team-b too, so a cross-tenant read has rows to leak.
+    harness
+        .sink
+        .send(proxied_turn(from + 2, "team-b", 0, 9_000, false));
+    harness.sink.flush().unwrap();
+
+    for path in stats_routes("v1", from, to) {
+        let sep = if path.contains('?') { '&' } else { '?' };
+        let (status, body) = harness.get(&path).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}: no key");
+        assert_eq!(body["error"]["code"], "unauthorized", "{path}");
+
+        let (status, _, _) = harness
+            .get_with(&path, &[("x-kompressor-key", "sk-nobody")])
+            .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}: unknown key");
+
+        let (status, _, _) = harness
+            .get_with(&path, &[("x-kompressor-key", "sk-retired")])
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}: disabled key");
+
+        let (status, body, _) = harness.get_with(&path, &alpha).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+
+        let (status, body, _) = harness
+            .get_with(&format!("{path}{sep}tenant=team-a"), &alpha)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{path}: naming its own tenant");
+        if let Some(tenant) = body
+            .get("tenant")
+            .or_else(|| body.get("report").and_then(|r| r.get("tenant")))
+        {
+            assert_eq!(tenant, "team-a", "{path}");
+        }
+
+        let (status, body, _) = harness
+            .get_with(&format!("{path}{sep}tenant=team-b"), &alpha)
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}: another tenant");
+        assert_eq!(body["error"]["code"], "forbidden");
+
+        let (status, _, _) = harness
+            .get_with(
+                &format!("{path}{sep}tenant=team-b"),
+                &[("x-kompressor-secret", "wrong")],
+            )
+            .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}: wrong secret");
+    }
+
+    // The cluster secret may read any tenant: the trusted path automation
+    // inside the deployment uses.
+    let trusted = [("x-kompressor-secret", "cluster-secret")];
+    for path in [
+        "/v1/stats/live?tenant=team-b".to_string(),
+        "/v1/stats/cache?window=2h&tenant=team-b".to_string(),
+        format!("/v1/stats/analysis?from={from}&to={to}&tenant=team-b"),
+        format!("/v1/stats/analysis/latency?from={from}&to={to}&tenant=team-b"),
+    ] {
+        let (status, body, _) = harness.get_with(&path, &trusted).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+        let tenant = body
+            .get("tenant")
+            .or_else(|| body["report"].get("tenant"))
+            .unwrap();
+        assert_eq!(tenant, "team-b", "{path}");
+    }
+    let (_, cache, _) = harness
+        .get_with("/v1/stats/cache?window=2h&tenant=team-b", &trusted)
+        .await;
+    assert_eq!(cache["rows"], 1, "only team-b's row");
+    let (_, cache, _) = harness.get_with("/v1/stats/cache?window=2h", &alpha).await;
+    assert_eq!(cache["rows"], 2, "only team-a's rows");
+}
+
+#[tokio::test]
+async fn every_stats_route_says_so_when_statistics_are_off() {
+    let harness = Harness::memory();
+    for path in stats_routes("v1", 1, 2) {
+        if path.starts_with("/v1/stats/store") {
+            // The ref store's own figures need no statistics database.
+            let (status, store) = harness.get(&path).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(store["live_refs"].is_u64());
+            continue;
+        }
+        let (status, body) = harness.get(&path).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+        assert!(
+            text(&body["error"]["message"]).contains("disabled"),
+            "{path}: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn every_stats_route_refuses_what_it_cannot_honour_in_the_error_envelope() {
+    let harness = Harness::with_stats();
+    for path in stats_routes("v1", 10, 20) {
+        let sep = if path.contains('?') { '&' } else { '?' };
+        let (status, body) = harness.get(&format!("{path}{sep}nonsense=1")).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{path}");
+        assert_eq!(body["error"]["code"], "invalid_request", "{path}");
+        assert!(body["error"]["message"].is_string(), "{path} says why");
+    }
+    for path in [
+        "/v1/stats/analysis/retrievals?format=html",
+        "/v1/stats/analysis/latency?format=html",
+        "/v1/stats/analysis/compare?format=html",
+    ] {
+        let (status, body) = harness.get(path).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{path}");
+        assert!(text(&body["error"]["message"]).contains("diagnostics serve JSON"));
+    }
+    for path in [
+        "/v1/stats/live?format=csv",
+        "/v1/stats/cache?format=csv",
+        "/v1/stats/analysis?format=csv",
+    ] {
+        let (status, body) = harness.get(path).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{path}");
+        assert!(text(&body["error"]["message"]).contains("json, jsonl or html"));
+    }
+    // Statistics listener: the same JSON routes, the same answers.
+    let listener = Harness::with_stats_and(|_| {}, kompressor_server::stats_listener_router);
+    for path in [
+        "/v1/stats/live",
+        "/v1/stats/cache",
+        "/v1/stats/analysis",
+        "/v2/stats/analysis/latency",
+    ] {
+        let (status, content_type, _, body) = get_raw(&listener, path, &[]).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+        assert_eq!(content_type, "application/json", "{path}");
+    }
+}

@@ -156,6 +156,7 @@ pre { background: var(--bg); border-color: var(--line); }
     <a id="analysis-link" href="#">Analysis</a>
     <a id="live-link" href="#">Live</a>
     <a id="refs-link" href="#" hidden>Ref store</a>
+    <button id="download" type="button" title="Download this view as JSON Lines">Download JSONL</button>
     <button id="pause" aria-pressed="false">Pause</button>
   <button id="theme-toggle" type="button" aria-label="Switch to light theme">Light theme</button>
 </header>
@@ -442,15 +443,56 @@ function showBanner(text, askKey) {
 
 function storedKey() { try { return sessionStorage.getItem("kompressor-key") || ""; } catch (_) { return ""; } }
 
-async function poll() {
-  if (state.paused) return;
+function dataUrl(format) {
   const url = new URL(state.endpoint, location.origin);
-  const params = { format: "json", window: state.window };
+  const params = { format, window: state.window };
   if (state.conversation) params.conversation = state.conversation;
   if (state.fixed) { params.from = state.fixed[0]; params.to = state.fixed[1]; }
   const tenant = new URLSearchParams(location.search).get("tenant");
   if (tenant) params.tenant = tenant;
   url.search = new URLSearchParams(params).toString();
+  return url;
+}
+
+// Fetch a JSON Lines export with the key header (a plain link could not carry
+// it) and hand it to the browser as a file named by the server.
+async function downloadJsonl(url, keyValue, button) {
+  const headers = { accept: "application/x-ndjson" };
+  if (keyValue) headers["x-kompressor-key"] = keyValue;
+  const label = button.textContent;
+  button.disabled = true;
+  button.textContent = "Downloading…";
+  try {
+    const response = await fetch(url, { headers, cache: "no-store" });
+    if (!response.ok) {
+      let message = "HTTP " + response.status;
+      try { const body = await response.json(); message = (body.error && body.error.message) || message; } catch (_) {}
+      throw new Error(message);
+    }
+    const blob = await response.blob();
+    const match = /filename="([^"]+)"/.exec(response.headers.get("content-disposition") || "");
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = match ? match[1] : "kompressor.jsonl";
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+  } catch (error) {
+    alert("Download failed: " + error.message);
+  } finally {
+    button.disabled = false;
+    button.textContent = label;
+  }
+}
+
+document.getElementById("download").addEventListener("click", event => {
+  downloadJsonl(dataUrl("jsonl"), storedKey(), event.currentTarget);
+});
+
+async function poll() {
+  if (state.paused) return;
+  const url = dataUrl("json");
   const headers = { accept: "application/json" };
   const key = storedKey();
   if (key) headers["x-kompressor-key"] = key;

@@ -30,6 +30,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::authenticate;
 use crate::error::ApiError;
+use crate::export::jsonl_response;
 use crate::middleware::{json_response, with_request_middleware};
 use crate::state::ServerState;
 
@@ -73,25 +74,30 @@ struct LiveQuery {
     window: Option<String>,
     /// How many recent requests to list, 0 to 200.
     recent: Option<usize>,
-    /// `json` or `html`. Without it, the `Accept` header decides.
+    /// `json`, `jsonl` or `html`. Without it, the `Accept` header decides.
     format: Option<String>,
     /// Seconds between the page's polls, 1 to 3600. HTML only.
     refresh: Option<u32>,
 }
 
+/// How a reporting route answers: JSON for clients, the page for browsers,
+/// or a JSON Lines download (see [`crate::export`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Format {
+pub(crate) enum Format {
     Json,
+    Jsonl,
     Html,
 }
 
-impl LiveQuery {
-    fn format(&self, headers: &HeaderMap) -> Result<Format, ApiError> {
-        match self.format.as_deref() {
+impl Format {
+    /// Read `?format=`; without one, the `Accept` header picks JSON or HTML.
+    pub(crate) fn parse(format: Option<&str>, headers: &HeaderMap) -> Result<Self, ApiError> {
+        match format {
             Some("json") => Ok(Format::Json),
+            Some("jsonl") => Ok(Format::Jsonl),
             Some("html") => Ok(Format::Html),
             Some(other) => Err(ApiError::Invalid(format!(
-                "format must be json or html, not {other}"
+                "format must be json, jsonl or html, not {other}"
             ))),
             None => Ok(if prefers_html(headers) {
                 Format::Html
@@ -99,6 +105,12 @@ impl LiveQuery {
                 Format::Json
             }),
         }
+    }
+}
+
+impl LiveQuery {
+    fn format(&self, headers: &HeaderMap) -> Result<Format, ApiError> {
+        Format::parse(self.format.as_deref(), headers)
     }
 
     fn recent(&self) -> Result<usize, ApiError> {
@@ -303,7 +315,7 @@ async fn respond(
     let stats = state
         .with_stats(move |reader| reader.live(&tenant, from_ms, to_ms + 1, recent))
         .await?;
-    Ok(json_response(&LiveResponse {
+    let response = LiveResponse {
         generated_at_ms: to_ms,
         server: server_info(&state),
         window: WindowInfo {
@@ -313,7 +325,11 @@ async fn respond(
             bucket_ms: stats.bucket_ms,
         },
         stats,
-    }))
+    };
+    Ok(match format {
+        Format::Jsonl => jsonl_response(&response, "live", to_ms),
+        _ => json_response(&response),
+    })
 }
 
 fn server_info(state: &ServerState) -> ServerInfo {
@@ -404,6 +420,11 @@ mod tests {
             ..Default::default()
         };
         assert!(wrong.format(&HeaderMap::new()).is_err());
+        let jsonl = LiveQuery {
+            format: Some("jsonl".into()),
+            ..Default::default()
+        };
+        assert_eq!(jsonl.format(&accept(browser)).unwrap(), Format::Jsonl);
     }
 
     #[test]
