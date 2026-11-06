@@ -400,7 +400,7 @@ struct Row {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-struct Usage {
+pub(crate) struct Usage {
     uncached: i64,
     read: i64,
     write_5m: i64,
@@ -408,16 +408,47 @@ struct Usage {
 }
 
 impl Usage {
-    fn input(self) -> i64 {
+    pub(crate) fn input(self) -> i64 {
         self.uncached + self.read + self.write_5m + self.write_1h
     }
 
-    fn cost(self, rates: Rates) -> f64 {
+    pub(crate) fn cost(self, rates: Rates) -> f64 {
         self.uncached as f64
             + self.read as f64 * rates.read
             + self.write_5m as f64 * rates.write_5m
             + self.write_1h as f64 * rates.write_1h
     }
+}
+
+pub(crate) fn normalize_usage(
+    api_family: &str,
+    prompt: Option<i64>,
+    read: Option<i64>,
+    write: Option<i64>,
+    write_1h: Option<i64>,
+) -> Option<Usage> {
+    if prompt.is_none() && read.is_none() && write.is_none() {
+        return None;
+    }
+    let prompt = prompt.unwrap_or(0).max(0);
+    let read = read.unwrap_or(0).max(0);
+    let write = write.unwrap_or(0).max(0);
+    let write_1h = write_1h.unwrap_or(0).clamp(0, write);
+    Some(if is_anthropic(api_family) {
+        Usage {
+            uncached: prompt,
+            read,
+            write_5m: write - write_1h,
+            write_1h,
+        }
+    } else {
+        Usage {
+            uncached: (prompt - read).max(0),
+            read,
+            write_5m: 0,
+            write_1h: 0,
+        }
+    })
 }
 
 impl Row {
@@ -429,28 +460,13 @@ impl Row {
     /// and writes as three disjoint counts; OpenAI's prompt already includes
     /// its cached part and it reports no writes.
     fn usage(&self) -> Option<Usage> {
-        if self.prompt.is_none() && self.read.is_none() && self.write.is_none() {
-            return None;
-        }
-        let prompt = self.prompt.unwrap_or(0).max(0);
-        let read = self.read.unwrap_or(0).max(0);
-        let write = self.write.unwrap_or(0).max(0);
-        let write_1h = self.write_1h.unwrap_or(0).clamp(0, write);
-        Some(if is_anthropic(&self.api_family) {
-            Usage {
-                uncached: prompt,
-                read,
-                write_5m: write - write_1h,
-                write_1h,
-            }
-        } else {
-            Usage {
-                uncached: (prompt - read).max(0),
-                read,
-                write_5m: 0,
-                write_1h: 0,
-            }
-        })
+        normalize_usage(
+            &self.api_family,
+            self.prompt,
+            self.read,
+            self.write,
+            self.write_1h,
+        )
     }
 
     /// What the provider holds after this row, for the next to read back.
@@ -1240,6 +1256,8 @@ mod db_tests {
 
     fn event(time_ms: i64, tenant: &str, read: u32, write: u32, keep_warm: bool) -> Event {
         Event::ProxyRequest(ProxyRequestEvent {
+            context: None,
+            timing: None,
             time_ms,
             tenant: tenant.into(),
             request_id: format!("r{time_ms}{keep_warm}"),

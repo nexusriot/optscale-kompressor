@@ -1488,6 +1488,8 @@ fn proxied_turn(
     keep_warm: bool,
 ) -> kompressor_stats::Event {
     kompressor_stats::Event::ProxyRequest(kompressor_stats::ProxyRequestEvent {
+        context: None,
+        timing: None,
         time_ms,
         tenant: tenant.into(),
         request_id: format!("req-{time_ms}-{keep_warm}"),
@@ -1678,6 +1680,7 @@ async fn analysis_joins_events_and_preserves_fixed_window_accounting() {
         (None, true, false, 50),
     ] {
         harness.sink.send(Event::Retrieval(RetrievalEvent {
+            context: None,
             time_ms: t,
             tenant: "".into(),
             request_id: request,
@@ -1808,4 +1811,79 @@ async fn analysis_turn_limit_keeps_the_latest_turns_in_time_order() {
     assert_eq!(r["turns"][0]["time_ms"], t + 2);
     assert_eq!(r["turns"][1999]["time_ms"], t + 2001);
     assert_eq!(r["conversations"][0]["client_turns"], 2002);
+}
+
+#[tokio::test]
+async fn analysis_diagnostics_require_keys_and_scope_every_new_report() {
+    use kompressor_stats::context::{ProxyTiming, RunContext};
+    let harness = Harness::with_stats_and(keyed_config, kompressor_server::stats_listener_router);
+    let t = now_ms() - 120_000;
+    for tenant in ["team-a", "team-b"] {
+        let mut e = proxied_turn(t, tenant, 1000, 100, false);
+        if let kompressor_stats::Event::ProxyRequest(p) = &mut e {
+            p.context = Some(RunContext {
+                build_version: "2.0.5".into(),
+                config_fingerprint: "cfg-a".into(),
+                experiment_id: Some("experiment-a".into()),
+                run_id: "run-a".into(),
+                settings: json!({"engine":{"mode":"recoverable"},"proxy":{"compress":true}}),
+            });
+            p.timing = Some(ProxyTiming::default());
+        }
+        harness.sink.send(e);
+    }
+    harness.sink.flush().unwrap();
+    for suffix in ["retrievals", "latency", "compare"] {
+        for version in ["v1", "v2"] {
+            let path = format!(
+                "/{version}/stats/analysis/{suffix}?from={t}&to={}&format=json",
+                t + 1
+            );
+            assert_eq!(harness.get(&path).await.0, StatusCode::UNAUTHORIZED);
+            let (status, data, _) = harness
+                .get_with(&path, &[("x-kompressor-key", "sk-alpha")])
+                .await;
+            assert_eq!(status, StatusCode::OK, "{data}");
+            assert_eq!(data["tenant"], "team-a");
+            if suffix == "latency" {
+                assert_eq!(data["requests"], 1);
+            }
+            if suffix == "compare" {
+                assert_eq!(data["current"]["metrics"]["client_requests"], 1);
+                assert_eq!(data["current"]["rows"][0]["dimension"]["run_id"], "run-a");
+            }
+            let (status, _, _) = harness
+                .get_with(
+                    &format!("{path}&tenant=team-b"),
+                    &[("x-kompressor-key", "sk-alpha")],
+                )
+                .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+        }
+    }
+    let (status, data, _) = harness
+        .get_with(
+            &format!(
+                "/v1/stats/analysis/compare?from={t}&to={}&experiment_id=missing",
+                t + 1
+            ),
+            &[("x-kompressor-key", "sk-alpha")],
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(data["current"]["metrics"]["client_requests"], 0);
+    for path in [
+        "/v1/stats/analysis/compare?compare_from=10",
+        "/v1/stats/analysis/compare?compare_from=20&compare_to=10",
+        "/v1/stats/analysis/compare?mode=invalid",
+        "/v1/stats/analysis/latency?model=ignored",
+        "/v1/stats/analysis/retrievals?conversation=0123456789abcdef",
+        "/v1/stats/analysis?compare_from=1&compare_to=2",
+    ] {
+        assert_eq!(
+            harness.get(path).await.0,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{path}"
+        );
+    }
 }

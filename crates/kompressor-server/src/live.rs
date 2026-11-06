@@ -214,6 +214,12 @@ pub(crate) fn live_routes() -> Router<Arc<ServerState>> {
         .route("/stats/live", get(live))
         .route("/stats/cache", get(crate::cache::cache))
         .route("/stats/analysis", get(crate::analysis::analysis))
+        .route(
+            "/stats/analysis/retrievals",
+            get(crate::analysis::retrieval),
+        )
+        .route("/stats/analysis/latency", get(crate::analysis::latency))
+        .route("/stats/analysis/compare", get(crate::analysis::comparison))
 }
 
 /// Everything the dedicated statistics listener serves: the page at `/`, the

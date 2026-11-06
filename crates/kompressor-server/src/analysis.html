@@ -224,6 +224,9 @@ pre {
     <button aria-controls="opportunities" aria-selected="false" id="opportunities-tab" role="tab" tabindex="-1">
      Compression opportunities
     </button>
+<button id="retrieval-tab" role="tab" tabindex="-1" aria-selected="false" aria-controls="retrieval">Retrieval amplification</button>
+<button id="comparison-tab" role="tab" tabindex="-1" aria-selected="false" aria-controls="comparison">Historical comparison</button>
+<button id="latency-tab" role="tab" tabindex="-1" aria-selected="false" aria-controls="latency">Latency & reliability</button>
    </nav>
    <div aria-labelledby="efficiency-tab" id="efficiency" role="tabpanel">
     <section>
@@ -309,6 +312,39 @@ pre {
      <pre id="example-body"></pre>
     </section>
    </div>
+
+<div id="retrieval" role="tabpanel" aria-labelledby="retrieval-tab" hidden>
+ <p class="muted">Retained raw events only. Debit/gross is undefined when gross reduction is zero or negative. Counts of withheld asks are separate from store attempts.</p>
+ <p id="retrieval-status" role="status"></p><div id="retrieval-tiles" class="tiles"></div>
+ <section><h2>Requests with the largest retrieval penalty</h2><p id="retrieval-count" class="muted"></p><div id="retrieval-requests" class="scroll"></div></section>
+ <section><h2>Repeated asks for a reference</h2><p id="repeat-count" class="muted"></p><div id="repeat-refs" class="scroll"></div></section>
+ <section><h2>Retrieval rounds per client request</h2><div id="retrieval-rounds" class="scroll"></div></section>
+</div>
+<div id="comparison" role="tabpanel" aria-labelledby="comparison-tab" hidden>
+ <p class="muted">Compare the selected dates above with a baseline. Filters below apply to both comparison periods. Differences are descriptive; workload and task quality are not controlled. Daily experiment archives are collected from this version onward; older legacy rollups lack these dimensions and are excluded. Archived data requires complete UTC days; partial archived days are reported as omitted.</p>
+ <form id="comparison-form" class="filters">
+  <label>Baseline from <input id="baseline-from" type="datetime-local" step="0.001" required></label>
+  <label>Baseline to (exclusive) <input id="baseline-to" type="datetime-local" step="0.001" required></label>
+  <label>Model <input id="compare-model" placeholder="All models"></label>
+  <label>Mode <select id="compare-mode"><option value="">All modes</option><option>recoverable</option><option>lossless</option><option>aggressive</option><option>off</option><option>unrecorded</option></select></label>
+  <label>Surface <select id="compare-surface"><option value="">All surfaces</option><option>proxy</option><option>api</option><option>mcp</option><option>cli</option></select></label>
+  <label>Experiment <input id="compare-experiment_id" placeholder="All experiments"></label>
+  <label>Run <input id="compare-run_id" placeholder="All runs"></label>
+  <button>Compare</button>
+ </form>
+ <p id="comparison-status" role="status"></p><section><h2>Period comparison</h2><p class="muted">Provider totals include keep-warm usage. Normalized values divide by client requests or distinct conversation fingerprints; missing denominators display as unavailable.</p><div id="comparison-metrics" class="scroll"></div></section>
+ <section><h2>Recorded cohorts</h2><div id="comparison-cohorts" class="scroll"></div></section>
+ <section id="cohort-settings" hidden><h2>Recorded policy settings</h2><pre id="cohort-settings-body"></pre></section>
+</div>
+<div id="latency" role="tabpanel" aria-labelledby="latency-tab" hidden>
+ <p class="muted">Client requests only; retained raw events. Response-head wait ends when headers arrive, not at the first token. End-to-end time includes generation and relay. Measured retrieval execution excludes network round trips. Phases overlap and must not be added. Breakdowns show correlations, not compression overhead.</p>
+ <p id="latency-status" role="status"></p>
+ <section><h2>Measured latency distributions</h2><div id="latency-distributions" class="scroll"></div></section>
+ <section><h2>By model, retrieval rounds, prompt size and status</h2><div id="latency-groups" class="scroll"></div></section>
+ <section><h2>Slowest requests</h2><div id="latency-slowest" class="scroll"></div></section>
+ <section id="phase-detail" hidden><h2>Measured upstream attempts</h2><p id="phase-note" class="muted"></p><div id="phase-attempts" class="scroll"></div></section>
+ <section><h2>Errors over time</h2><div id="latency-errors" class="scroll"></div></section>
+</div>
    <section hidden="" id="detail">
     <header>
      <h2 id="detail-title">
@@ -528,12 +564,15 @@ async function load() {
     table("unattributed", [report.unattributed], columns);
     for (const id of ["outcomes", "skips", "breakdowns"]) opportunities(id, report[id]);
     timeline();
+    if (activeTab !== "efficiency") $("detail").hidden = true;
     $("status").textContent = "Analyzed " + stamp(from) + " to " + stamp(to) + " (exclusive)";
     const u = new URL(location.href);
     u.searchParams.set("from", from);
     u.searchParams.set("to", to);
     if (selected) u.searchParams.set("conversation", selected);else u.searchParams.delete("conversation");
     history.replaceState(null, "", u);
+    extraCache.clear();
+    loadExtra(activeTab);
   } catch (e) {
     if (seq === serial) {
       $("status").textContent = "Analysis unavailable; displayed results may be from the previous range.";
@@ -542,6 +581,7 @@ async function load() {
   }
 }
 function openConversation(id) {
+  $("efficiency-tab").click();
   selected = id;
   load().then(() => {
     if (selected === id) $("detail").scrollIntoView({
@@ -550,21 +590,28 @@ function openConversation(id) {
     });
   });
 }
-for (const id of ["efficiency", "opportunities"]) {
+const tabIds = ["efficiency", "opportunities", "retrieval", "comparison", "latency"];
+let activeTab = "efficiency";
+const extraCache = new Map();
+for (const id of tabIds) {
   $(id + "-tab").onkeydown = e => {
     if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) {
       e.preventDefault();
-      const target = e.key === "Home" ? "efficiency" : e.key === "End" ? "opportunities" : id === "efficiency" ? "opportunities" : "efficiency";
+      const i = tabIds.indexOf(id);
+      const target = e.key === "Home" ? tabIds[0] : e.key === "End" ? tabIds.at(-1) : tabIds[(i + (e.key === "ArrowLeft" ? -1 : 1) + tabIds.length) % tabIds.length];
       $(target + "-tab").click();
       $(target + "-tab").focus();
     }
   };
   $(id + "-tab").onclick = () => {
-    for (const other of ["efficiency", "opportunities"]) {
+    activeTab = id;
+    for (const other of tabIds) {
       $(other).hidden = other !== id;
       $(other + "-tab").setAttribute("aria-selected", String(other === id));
       $(other + "-tab").tabIndex = other === id ? 0 : -1;
     }
+    $("detail").hidden = id !== "efficiency" || !selected;
+    loadExtra(id);
   };
 }
 $("filters").onsubmit = e => {
@@ -603,6 +650,139 @@ $("close").onclick = () => {
   const u = new URL(location.href);
   u.searchParams.delete("conversation");
   history.replaceState(null, "", u);
+};
+const pct = v => v == null ? "–" : (v * 100).toFixed(1) + "%";
+const ms = v => v == null ? "–" : num(v) + " ms";
+function refLink(ref) {
+  if (!SETTINGS.refs) return ref;
+  const a = el("a", ref),
+    u = url(path("refs"));
+  u.hash = ref;
+  a.href = u;
+  return a;
+}
+function conversationLink(c) {
+  return c ? button(c, () => openConversation(c)) : "Unattributed";
+}
+function renderRetrieval(d) {
+  $("retrieval-tiles").replaceChildren(tile("Retrieval debit / gross", d.debit_to_gross == null ? "–" : d.debit_to_gross.toFixed(2) + "×", num(d.retrieved_tokens) + " returned / " + num(d.saved_gross) + " removed"), tile("Store attempts / hits", num(d.attempts) + " / " + num(d.hits), num(d.expired) + " expired · " + num(d.missing) + " missing"), tile("Budget-withheld asks", num(d.withheld), "Not store misses"), tile("Ranged / full tokens", num(d.ranged_tokens) + " / " + num(d.full_tokens), "Successful retrieval debit"));
+  $("retrieval-count").textContent = `Showing ${d.requests.length} of ${d.requests_total} requests with retrieval asks; largest debit minus gross first.`;
+  table("retrieval-requests", d.requests, [["Request", r => button(r.request_id, () => exampleFromDiagnostic(r.request_id))], ["Conversation", r => conversationLink(r.conversation)], ["Time", r => stamp(r.time_ms)], ["Gross est.", r => num(r.saved_gross), "num"], ["Retrieved", r => num(r.retrieved_tokens), "num"], ["Net est.", r => num(r.net_reduction), "num"], ["Debit / gross", r => r.debit_to_gross == null ? "–" : r.debit_to_gross.toFixed(2) + "×", "num"], ["Rounds", r => num(r.rounds), "num"]]);
+  $("repeat-count").textContent = `Showing ${d.repeated_refs.length} of ${d.repeated_refs_total} repeated reference groups. Without a fingerprint, repeats are grouped within a request only.`;
+  table("repeat-refs", d.repeated_refs, [["Conversation", r => conversationLink(r.conversation)], ["Reference", r => refLink(r.reference)], ["Asks", r => num(r.asks), "num"], ["Returned tokens", r => num(r.returned_tokens), "num"]]);
+  table("retrieval-rounds", d.rounds, [["Rounds", r => r.name], ["Client requests", r => num(r.count), "num"]]);
+}
+function exampleFromDiagnostic(id) {
+  $("opportunities-tab").click();
+  example(id);
+}
+function renderLatency(d) {
+  $("latency-status").textContent = `${d.requests} of ${d.rows_total} client rows analyzed; ${d.errors} errors; ${d.with_timing} rows with detailed timing. ${d.attempt_details_omitted || 0} upstream attempt details omitted by the per-request cap. ${d.truncated ? "PARTIAL: latest 200,000 rows only." : ""}`;
+  const distributions = [["End-to-end", d.total], ["Summed upstream response-head wait", d.upstream_head_wait], ["Request start to first upstream head", d.first_head], ["Engine execution", d.engine], ["Local retrieval execution (requests with calls)", d.retrieval_execution], ["Individual upstream attempts", d.attempt_wait]];
+  table("latency-distributions", distributions, [["Measurement", r => r[0]], ["Samples", r => num(r[1].samples), "num"], ["Mean", r => ms(r[1].mean), "num"], ["p50", r => ms(r[1].p50), "num"], ["p95", r => ms(r[1].p95), "num"], ["p99", r => ms(r[1].p99), "num"], ["Max", r => ms(r[1].max), "num"]]);
+  table("latency-groups", d.groups, [["Dimension", r => r.dimension], ["Value", r => r.name], ["Requests", r => num(r.requests), "num"], ["Errors", r => num(r.errors), "num"], ["Latency samples", r => num(r.latency.samples), "num"], ["p50", r => ms(r.latency.p50), "num"], ["p95", r => ms(r.latency.p95), "num"]]);
+  table("latency-slowest", d.slowest, [["Request", r => button(r.request_id, () => showPhases(r))], ["Conversation", r => conversationLink(r.conversation)], ["Time", r => stamp(r.time_ms)], ["Model", r => r.model || "–"], ["Total", r => ms(r.total_ms), "num"], ["Retrieval rounds", r => num(r.rounds), "num"], ["Error", r => r.error ? "yes" : "no"], ["First head", r => ms(r.timing?.first_head_ms), "num"]]);
+  table("latency-errors", d.errors_over_time, [["Interval start", r => stamp(r.time_ms)], ["Requests", r => num(r.requests), "num"], ["Errors", r => num(r.errors), "num"], ["Error share", r => pct(r.requests ? r.errors / r.requests : null), "num"]]);
+}
+function showPhases(r) {
+  $("phase-detail").hidden = false;
+  const t = r.timing;
+  $("phase-note").textContent = t ? `${r.request_id}: ${t.attempts_total} upstream attempts (${t.attempts.length} detailed, capped at 64); ${t.retrieval_calls} local answer/refusal executions took ${ms(t.retrieval_execution_ms)}. First response head: ${ms(t.first_head_ms)} from request start.` : "Detailed phase timing was not recorded for this request.";
+  table("phase-attempts", t ? t.attempts.map((a, i) => ({
+    ...a,
+    index: i + 1
+  })) : [], [["Attempt", a => a.index], ["Response-head wait", a => ms(a.duration_ms), "num"], ["Status", a => a.status ?? "no response"], ["Transport failure", a => a.failed ? "yes" : "no"]]);
+  $("phase-detail").scrollIntoView({
+    behavior: "smooth",
+    block: "nearest"
+  });
+}
+let baselineEdited = false;
+function defaultBaseline() {
+  if (!report || baselineEdited) return;
+  const span = report.to_ms - report.from_ms;
+  $("baseline-from").value = local(Math.max(0, report.from_ms - span));
+  $("baseline-to").value = local(report.from_ms);
+}
+function comparisonQuery() {
+  defaultBaseline();
+  const query = {
+    compare_from: new Date($("baseline-from").value).getTime(),
+    compare_to: new Date($("baseline-to").value).getTime()
+  };
+  for (const field of ["model", "mode", "surface", "experiment_id", "run_id"]) {
+    const value = $("compare-" + field).value.trim();
+    if (value) query[field] = value;
+  }
+  return query;
+}
+function metricValue(name, value) {
+  return value == null ? "–" : name.includes("share") ? pct(value) : new Intl.NumberFormat(undefined, {
+    maximumFractionDigits: 2
+  }).format(value);
+}
+function renderComparison(d) {
+  const omitted = d.current.archived_partial_days_omitted + d.baseline.archived_partial_days_omitted;
+  $("comparison-status").textContent = `Current: ${stamp(d.current.from_ms)} → ${stamp(d.current.to_ms)}. Baseline: ${stamp(d.baseline.from_ms)} → ${stamp(d.baseline.to_ms)}. ${omitted ? "INCOMPLETE: " + omitted + " partial archived days omitted; align dates to UTC midnights for complete totals." : ""}`;
+  table("comparison-metrics", Object.entries(d.changes), [["Metric", r => r[0]], ["Current", r => metricValue(r[0], r[1].current), "num"], ["Baseline", r => metricValue(r[0], r[1].baseline), "num"], ["Difference", r => metricValue(r[0], r[1].absolute), "num"], ["Relative change", r => pct(r[1].relative), "num"]]);
+  const rows = [...d.current.rows.map(r => ({
+    ...r,
+    period: "Current"
+  })), ...d.baseline.rows.map(r => ({
+    ...r,
+    period: "Baseline"
+  }))];
+  table("comparison-cohorts", rows, [["Period", r => r.period], ["Model / mode / surface", r => [r.dimension.model, r.dimension.mode, r.dimension.surface].join(" / "), "wrap"], ["Build", r => r.dimension.build_version || "unrecorded"], ["Configuration", r => r.dimension.config_fingerprint ? button(r.dimension.config_fingerprint.slice(0, 12), () => {
+    $("cohort-settings").hidden = false;
+    $("cohort-settings-body").textContent = JSON.stringify(JSON.parse(r.dimension.settings_json), null, 2);
+  }) : "unrecorded"], ["Experiment", r => r.dimension.experiment_id || "unrecorded"], ["Run", r => r.dimension.run_id || "unrecorded"], ["Clients", r => num(r.metrics.client_requests), "num"], ["Conversations", r => num(r.conversations), "num"], ["Net est.", r => num(r.metrics.saved_gross - r.metrics.retrieved_tokens), "num"], ["Provider input", r => num(r.metrics.input_tokens), "num"], ["Usage rows", r => num(r.metrics.usage_rows), "num"]]);
+}
+let extraSerial = 0;
+async function loadExtra(id) {
+  if (!report || !["retrieval", "latency", "comparison"].includes(id)) return;
+  const seq = ++extraSerial,
+    range = {
+      from: report.from_ms,
+      to: report.to_ms
+    };
+  const query = {
+    format: "json",
+    ...range,
+    ...(id === "comparison" ? comparisonQuery() : {})
+  };
+  const cacheKey = JSON.stringify([id, query]);
+  const status = $(id + "-status");
+  status.textContent = "Loading…";
+  try {
+    let data = extraCache.get(cacheKey);
+    if (!data) {
+      const suffix = {
+        retrieval: "retrievals",
+        latency: "latency",
+        comparison: "compare"
+      }[id];
+      data = await call(url(endpoint.replace(/\/$/, "") + "/" + suffix, query));
+      extraCache.set(cacheKey, data);
+    }
+    if (seq !== extraSerial || report.from_ms !== range.from || report.to_ms !== range.to) return;
+    status.textContent = id === "retrieval" ? "Retained-event retrieval analysis." : "";
+    ({
+      retrieval: renderRetrieval,
+      latency: renderLatency,
+      comparison: renderComparison
+    })[id](data);
+  } catch (e) {
+    if (seq === extraSerial) status.textContent = "Analysis unavailable: " + e.message;
+  }
+}
+$("comparison-form").onsubmit = e => {
+  e.preventDefault();
+  baselineEdited = true;
+  extraCache.clear();
+  loadExtra("comparison");
+};
+for (const id of ["baseline-from", "baseline-to"]) $(id).oninput = () => {
+  baselineEdited = true;
 };
 load();
 </script></body></html>

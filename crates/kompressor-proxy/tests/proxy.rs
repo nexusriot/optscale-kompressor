@@ -1053,7 +1053,20 @@ async fn the_provider_wait_is_recorded_and_is_not_the_whole_request() {
         .drain()
         .into_iter()
         .filter_map(|event| match event {
-            kompressor_stats::events::Event::ProxyRequest(e) => e.upstream_ms,
+            kompressor_stats::events::Event::ProxyRequest(e) => {
+                let timing = e.timing.as_ref().expect("HTTP proxy records phase timing");
+                assert_eq!(timing.attempts_total, 1);
+                assert_eq!(timing.attempts.len(), 1);
+                assert_eq!(timing.attempts[0].status, Some(200));
+                assert!(!timing.attempts[0].failed);
+                assert!(timing.first_head_ms.unwrap() >= timing.attempts[0].duration_ms);
+                assert!(
+                    e.context
+                        .as_ref()
+                        .is_some_and(|c| c.build_version == env!("CARGO_PKG_VERSION"))
+                );
+                e.upstream_ms
+            }
             _ => None,
         })
         .collect();

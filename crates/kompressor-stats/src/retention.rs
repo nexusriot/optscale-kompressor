@@ -284,6 +284,7 @@ fn day_after_ms(conn: &rusqlite::Connection, day: &str) -> Result<i64, StatsErro
 }
 
 fn prune_on(conn: &rusqlite::Connection, older_than_ms: i64) -> Result<PruneCounts, StatsError> {
+    crate::history::archive_before(conn, older_than_ms)?;
     let counts = PruneCounts {
         optimization_events: conn.execute(
             "DELETE FROM optimization_events WHERE time_ms < ?1",
@@ -306,5 +307,6 @@ fn prune_on(conn: &rusqlite::Connection, older_than_ms: i64) -> Result<PruneCoun
             params![older_than_ms],
         )?,
     };
+    conn.execute("DELETE FROM request_context WHERE time_ms<?1 AND NOT EXISTS(SELECT 1 FROM optimization_events o WHERE o.tenant=request_context.tenant AND o.request_id=request_context.request_id) AND NOT EXISTS(SELECT 1 FROM proxy_requests p WHERE p.tenant=request_context.tenant AND p.request_id=request_context.request_id) AND NOT EXISTS(SELECT 1 FROM retrieval_events r WHERE r.tenant=request_context.tenant AND r.request_id=request_context.request_id)",[older_than_ms])?;
     Ok(counts)
 }
