@@ -76,6 +76,49 @@ input { font: inherit; padding: 4px 8px; border: 1px solid var(--line); border-r
 form.key input { flex: 1; }
 .note { color: var(--muted); font-size: 12px; margin: 8px 0 0; }
 .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+
+/* Shared visual language with the Analysis dashboard. */
+:root {
+  color-scheme: dark;
+  --bg: #101419; --panel: #191f27; --ink: #e3eaf2;
+  --muted: #9caaba; --line: #303a46; --accent: #70d8b6;
+  --good: #70d8b6; --warn: #e9c27b; --bad: #ffa096;
+  --sel: #253b36; --hit: #63521f;
+  --kept: #52677e; --read: #70d8b6; --write: #e9c27b; --fresh: #7188a2;
+}
+body { background: var(--bg); color: var(--ink); font: 14px system-ui, sans-serif; }
+main { max-width: 1600px; padding: 24px; margin: auto; }
+header { gap: 14px; flex-wrap: wrap; }
+h1 { font-size: 24px; margin-right: auto; }
+h2 { font-size: 18px; text-transform: none; letter-spacing: normal; color: var(--ink); }
+a, button.link { color: var(--accent); }
+button, input, select {
+  font: inherit; color: var(--ink); background: var(--panel);
+  border: 1px solid var(--line); border-radius: 5px; padding: 8px;
+}
+button { cursor: pointer; }
+button:hover, select:hover { border-color: var(--accent); }
+button.active, button[aria-pressed="true"] {
+  background: var(--panel); color: var(--accent); border-color: var(--accent);
+}
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+section, .tile { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 18px; }
+.tiles { grid-template-columns: repeat(auto-fit, minmax(min(185px, 100%), 1fr)); gap: 12px; }
+.tile .value { font-size: 25px; margin: 8px 0; }
+.tile .label, .tile .sub, .meta { color: var(--muted); }
+.grid2 { gap: 16px; }
+.grid2 > section { min-width: 0; }
+th, td { border-bottom: 1px solid var(--line); padding: 10px; }
+th { color: var(--muted); font-size: 12px; }
+.num { font-variant-numeric: tabular-nums; }
+.banner { border-radius: 8px; border-color: var(--warn); }
+pre { background: var(--bg); border-color: var(--line); }
+@media (max-width: 700px) {
+  main { padding: 18px; }
+  .grid2 { grid-template-columns: minmax(0, 1fr); }
+  header, .filters { gap: 10px; }
+  input, select { max-width: 100%; }
+}
 </style>
 </head>
 <body>
