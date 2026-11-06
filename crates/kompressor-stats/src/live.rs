@@ -658,6 +658,8 @@ mod tests {
 
     fn proxied(time_ms: i64, tenant: &str, id: &str, status: Option<u16>, total_ms: f64) -> Event {
         Event::ProxyRequest(ProxyRequestEvent {
+            context: None,
+            timing: None,
             time_ms,
             tenant: tenant.into(),
             request_id: id.into(),
@@ -685,6 +687,7 @@ mod tests {
 
     fn fetched(time_ms: i64, tenant: &str, id: &str, tokens: u32) -> Event {
         Event::Retrieval(RetrievalEvent {
+            context: None,
             time_ms,
             tenant: tenant.into(),
             request_id: Some(id.into()),

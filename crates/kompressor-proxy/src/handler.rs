@@ -288,7 +288,7 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
         if let Some(json) = prepared.json.clone() {
             outbound = outbound.with_json(json);
         }
-        outbound = outbound.with_retention(retention);
+        outbound = outbound.with_retention(retention).with_started(started);
         if !prepared.stream {
             outbound = outbound.with_timeout(proxy.upstream_read_timeout);
         }
@@ -324,6 +324,7 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
                 // compression itself declined.
                 prepared.prefix,
             )
+            .with_timing(outbound.timing())
         });
     let budget = Budget::new(
         proxy.retrieve_max_rounds,
@@ -340,6 +341,7 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
         // Taken before `outbound` is moved into whichever path sends it.
         outbound.waited(),
     );
+    recorder.timing = Some(outbound.timing());
     recorder.keep_warm = keep_warm;
 
     if prepared.stream {
@@ -2165,6 +2167,7 @@ pub(crate) struct Recorder {
     /// Provider wait, accumulated by the `Outbound` this request sends through.
     /// Shared rather than copied so the retrieve loop's extra rounds are in it.
     waited: Arc<AtomicU64>,
+    timing: Option<Arc<std::sync::Mutex<kompressor_stats::context::ProxyTiming>>>,
     /// The keep-warm ping to arm if the response stops on `tool_use`, or on
     /// `end_turn` with a background task running.
     pub(crate) keep_warm: Option<KeepWarmPlan>,
@@ -2188,6 +2191,8 @@ impl Recorder {
         waited: Arc<AtomicU64>,
     ) -> Recorder {
         let event = ProxyRequestEvent {
+            context: None,
+            timing: None,
             time_ms: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_millis() as i64)
@@ -2228,6 +2233,7 @@ impl Recorder {
             core: state.core.clone(),
             event,
             waited,
+            timing: None,
             prefixes: state.prefixes.clone(),
             prefix: prepared.prefix,
             keep_warm: None,
@@ -2277,6 +2283,10 @@ impl Recorder {
         started: Instant,
         error: Option<String>,
     ) {
+        self.event.timing = self
+            .timing
+            .as_ref()
+            .map(|t| t.lock().unwrap_or_else(|e| e.into_inner()).clone());
         self.event.status = status;
         self.event.retrieve_rounds = rounds;
         self.event.retrieve_tokens_injected = injected;

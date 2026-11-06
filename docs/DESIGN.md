@@ -1223,7 +1223,7 @@ aggregate history beyond that.
   That last key exists because `content_types` counts only successes. A git workload where every diff is declined by the §7.6 gates reported `diff: 0`, which is indistinguishable from "no diffs were present" — and on one measured run 1,374 of 1,483 messages were skipped with the most interesting fact about the run inside them. The decline path detects a second time rather than widening `compress_content`'s return, which is `Option<Kind>` and `None` for every decline: one extra pass on the declines alone is cheaper than touching every caller, and a declined message is one the compressors have already finished with. `v_skip_reasons` unrolls the map one row per reason.
 - `retrieval_events(id, time_ms, tenant, request_id, surface, ref, found, expired, ranged, fragment_bytes, fragment_chars, fragment_tokens, returned_chars, returned_tokens, rolled_up, withheld)`. `withheld` arrived in v10: an ask the per-request token budget refused before the store was read, which is neither a hit nor a miss and is excluded from every rate computed over this table (§12.5b).
 - `protected_ref_events(id, time_ms, tenant, request_id, refs JSON, refs_total, reasons JSON, messages, touched)`.
-- `proxy_requests(id, time_ms, tenant, request_id, api_family, model, upstream, status, stream, compression_event_id, prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens, shadow_prompt_tokens, retrieve_rounds, retrieve_tokens_injected, upstream_ms, total_ms, error, conversation, rolled_up, strip_usage, cache_write_1h_tokens, keep_warm)`. `compression_event_id` and `shadow_prompt_tokens` are never populated — see E.2 for why the join goes through `request_id` instead. `conversation` arrived in v5, `rolled_up` in v7, `strip_usage` in v9, `cache_write_1h_tokens` in v11 and `keep_warm` in v12; this prose listing had drifted three columns behind the ladder. `check_schema` does compare table columns — but against the DDL blocks in E.1, not against prose, so a sentence like this one can rot while the gate stays green.
+- `proxy_requests(id, time_ms, tenant, request_id, api_family, model, upstream, status, stream, compression_event_id, prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens, shadow_prompt_tokens, retrieve_rounds, retrieve_tokens_injected, upstream_ms, total_ms, error, conversation, rolled_up, strip_usage, cache_write_1h_tokens, keep_warm, timing_json, analysis_archived)`. `compression_event_id` and `shadow_prompt_tokens` are never populated — see E.2 for why the join goes through `request_id` instead. `conversation` arrived in v5, `rolled_up` in v7, `strip_usage` in v9, `cache_write_1h_tokens` in v11, `keep_warm` in v12, and `timing_json` and `analysis_archived` in v13; this prose listing had drifted three columns behind the ladder. `check_schema` does compare table columns — but against the DDL blocks in E.1, not against prose, so a sentence like this one can rot while the gate stays green.
 
   **A relayed websocket files one row for the whole connection.** The HTTP path's unit — a request — does not exist on that transport: every frame shares one `request_id`, so the connection is what has an identity. The row carries `status = 101` (the handshake succeeded, and it keeps relayed sessions separable from forwarded 200s), `stream = 1`, the duration, and the error when the relay ends badly. **Token counters are NULL, not zero**, because the relay never reads a `response.completed` frame and so does not know what the provider billed; zero would read as "this cost nothing" and quietly deflate every cost report, the same distinction `opaque` draws in the skip taxonomy. `retrieve_rounds` is genuinely 0, because the retrieve tool cannot be offered on a transport whose tool tree executes inside the client; fragments do come back on that path, but as an append to the client's next frame rather than as a round (§12.5b), so there is no round to count. Without this row a relayed session was invisible to `kompressor stats summary`, the HTML report and the Harbor bench, all of which read `proxy_requests` — it contributed compression events and nothing else, and a relay failure had nowhere to land but a log line nobody tails.
 
@@ -1329,8 +1329,8 @@ prefix answers 404 rather than an empty report — an empty report would read as
 | `GET /v1/stats/retrievals?…` | hit/miss/expired counts, ranged share, top refs by retrieval count |
 | `GET /v1/stats/requests?request_id=` | one request's economy row plus its events |
 | `GET /v1/stats/store` | live refs/bytes, oldest, purge counters |
-| `GET /v1/stats/live?window&recent&tenant&format&refresh` | a live snapshot ending now: totals, 1m/5m/15m rates, a timeline, upstream status/cache/latency percentiles, by provider/model/type, skip reasons, retrievals, the latest requests, and process info (version, uptime, dropped events). JSON, or a self-refreshing HTML dashboard for `?format=html` or a browser's `Accept` |
-| `GET /v1/stats/cache?window&conversations&conversation&tenant&format&refresh` | prompt-cache analysis over `proxy_requests`: input split into fresh, read, 5-minute and 1-hour writes, with its cost in input-equivalent tokens against an uncached baseline; every lost prefix classified as `ttl_expiry` or `prefix_change`; keep-warm pings (warm, cold, failed, cost, pauses bridged); client turns by idle gap; per model; per conversation, costliest losses first, and with `conversation=<16 hex>` that conversation's rows one by one. JSON, or a page for `?format=html` or a browser's `Accept` |
+| `GET /v1/stats/live?window&recent&tenant&format&refresh` | a live snapshot ending now: totals, 1m/5m/15m rates, a timeline, upstream status/cache/latency percentiles, by provider/model/type, skip reasons, retrievals, the latest requests, and process info (version, uptime, dropped events). JSON, JSON Lines for `?format=jsonl`, or a self-refreshing HTML dashboard for `?format=html` or a browser's `Accept` |
+| `GET /v1/stats/cache?window&conversations&conversation&tenant&format&refresh` | prompt-cache analysis over `proxy_requests`: input split into fresh, read, 5-minute and 1-hour writes, with its cost in input-equivalent tokens against an uncached baseline; every lost prefix classified as `ttl_expiry` or `prefix_change`; keep-warm pings (warm, cold, failed, cost, pauses bridged); client turns by idle gap; per model; per conversation, costliest losses first, and with `conversation=<16 hex>` that conversation's rows one by one. JSON, JSON Lines for `?format=jsonl`, or a page for `?format=html` or a browser's `Accept` |
 | `GET /v1/refs?q&kind&request_id&expired&order&offset&limit&preview&tenant&format` | the ref browser (§8.3.1): one page of the tenant's fragments with a preview each, the match total, a count per kind and what the tenant holds live. JSON, or a page for `?format=html` or a browser's `Accept`. Off — 404 — unless `refs.browse = true` |
 | `GET /v1/refs/{handle}?history&tenant` | one fragment in full, read without touching it, with its retention and every recorded ask for it (`retrieval_events`) |
 | `DELETE /v1/refs/{handle}?tenant` | remove a fragment from the store and the recent-write cache; a later retrieval is a miss |
@@ -3646,6 +3646,32 @@ ALTER TABLE proxy_requests ADD COLUMN cache_write_1h_tokens INTEGER;
 -- (`proxy.cache_keep_warm`, §12.10). Its usage is real spend, so cost totals
 -- include it; counts of client requests and latency should filter it out.
 ALTER TABLE proxy_requests ADD COLUMN keep_warm INTEGER NOT NULL DEFAULT 0;
+
+-- v13: request provenance, phase timing, and daily experiment aggregates.
+-- `request_context` holds the run context (model, mode, experiment/run ids,
+-- settings) a request arrived with, keyed like the event tables so the
+-- analysis joins on (tenant, request_id). `timing_json` is a proxied request's
+-- per-phase timing; `context_json` is the context a retrieval carried itself.
+-- Once a day's raw events are folded into `daily_analysis` (one row of metrics
+-- per day, tenant and dimension) and `daily_analysis_conversations` (the
+-- conversation ids behind it, kept as a set so days union rather than add),
+-- the rows are marked `analysis_archived = 1` and the analysis reads the
+-- aggregate instead, so raw and archived copies never count twice.
+CREATE TABLE request_context (
+ tenant TEXT NOT NULL, request_id TEXT NOT NULL, time_ms INTEGER NOT NULL,
+ context TEXT, model TEXT, mode TEXT, PRIMARY KEY(tenant,request_id));
+CREATE INDEX request_context_time ON request_context(time_ms);
+ALTER TABLE proxy_requests ADD COLUMN timing_json TEXT;
+ALTER TABLE proxy_requests ADD COLUMN analysis_archived INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE optimization_events ADD COLUMN analysis_archived INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE retrieval_events ADD COLUMN analysis_archived INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE retrieval_events ADD COLUMN context_json TEXT;
+CREATE TABLE daily_analysis (
+ day_ms INTEGER NOT NULL, tenant TEXT NOT NULL, dimension TEXT NOT NULL,
+ metrics TEXT NOT NULL, PRIMARY KEY(day_ms,tenant,dimension));
+CREATE TABLE daily_analysis_conversations (
+ day_ms INTEGER NOT NULL, tenant TEXT NOT NULL, dimension TEXT NOT NULL,
+ conversation TEXT NOT NULL, PRIMARY KEY(day_ms,tenant,dimension,conversation));
 ```
 
 ## C. Configuration reference — flat environment mapping

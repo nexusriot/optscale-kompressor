@@ -618,6 +618,97 @@ had idled past the cache lifetime, to a prefix change otherwise — the idle
 gaps before each turn, and what the keep-warm pings cost and bridged. Click a
 conversation for its turns one by one. The JSON is `/v1/stats/cache`.
 
+`http://127.0.0.1:8818/analysis` analyzes a fixed date range: conversation
+compression credits and retrieval debits, provider usage, cache losses, latency,
+and errors, plus compression outcomes and skipped categories ranked by token
+volume. Open a conversation for its turn timeline, with links to cache details
+and retrieved fragments (when ref browsing is enabled). The JSON endpoint is
+`/v1/stats/analysis?from=<epoch-ms>&to=<epoch-ms>`; `to` is exclusive, ranges
+span at most 90 days, and `conversation=<fingerprint>` adds turn details.
+Both `/v1` and `/v2` routes serve HTML with `?format=html`. Cache deep links also
+accept the same `from`/`to` pair. Analysis uses retained raw events; daily
+archives cannot reconstruct turn history. Token reduction remains an estimate
+per request, not a monetary saving or a count of unique content.
+
+### Statistics JSON API for automation
+
+Every dashboard is backed by a JSON route, and a client that sends no `Accept`
+header, `*/*` or `application/json` always gets JSON (`?format=json` forces it
+even for a browser). The same routes are served under `/v2`, and on the
+statistics listener (`server.stats_listen`) as well.
+
+| Route | Answers |
+|---|---|
+| `GET /v1/stats/live?window=1h&recent=25` | the live dashboard's snapshot: totals, rates, timeline, upstream, by provider/model/type, skips, retrievals, recent requests, process info |
+| `GET /v1/stats/cache?window=6h` or `?from=&to=` | the cache dashboard's report; `conversation=<16 hex>` adds that conversation's turns |
+| `GET /v1/stats/analysis?from=&to=` | the analysis overview (`report`, `stats_dropped`, `retention_days`); defaults to the last 24 h |
+| `GET /v1/stats/analysis/retrievals?from=&to=` | retrieval amplification |
+| `GET /v1/stats/analysis/latency?from=&to=` | latency and reliability |
+| `GET /v1/stats/analysis/compare?from=&to=` | historical comparison; `compare_from`/`compare_to`, `model`, `mode`, `surface`, `experiment_id`, `run_id` |
+| `GET /v1/stats/summary`, `histogram`, `by_type`, `retrievals`, `requests?request_id=`, `store` | the aggregate reports `kompressor stats` prints |
+
+`from`/`to` are epoch milliseconds (`to` exclusive, at most 90 days apart).
+Authenticate with `x-kompressor-key` (or `Authorization: Bearer`); a key reads
+only its own tenant, and a caller holding the cluster secret
+(`x-kompressor-secret`) may name any tenant with `?tenant=`. Unknown query
+parameters are refused with `422`, and every error uses the same
+`{"error":{"code","message"}}` envelope. With statistics off, the routes answer
+`404` saying so.
+
+```bash
+curl -s -H 'x-kompressor-key: sk-…' "http://127.0.0.1:8840/v1/stats/analysis/latency?from=$(( ($(date +%s) - 3600) * 1000 ))&to=$(( $(date +%s) * 1000 ))" | jq .total
+```
+
+Every dashboard (live, cache and analysis) has a **Download JSONL** button, and
+each of their JSON routes — `/v1/stats/live`, `/v1/stats/cache`,
+`/v1/stats/analysis` and its `retrievals`, `latency` and `compare` views —
+also answers `?format=jsonl` with a JSON Lines attachment, under the same key
+and tenant rules as the JSON. The first line is `{"record":"summary",…}` with
+every field that is not a list; each list element follows on its own line,
+tagged with the list's dotted path, e.g. `{"record":"timeline",…}` or
+`{"record":"report.conversations",…}`:
+
+```bash
+curl -H 'x-kompressor-key: sk-…' 'http://127.0.0.1:8840/v1/stats/cache?window=24h&format=jsonl' > cache.jsonl
+```
+
+The Analysis page also includes retrieval amplification (negative-net requests,
+repeated reference asks, ranged/full retrieval volume, and budget refusals),
+historical comparison, and latency/reliability tabs. Their JSON endpoints are
+`/v1/stats/analysis/retrievals`, `/v1/stats/analysis/compare`, and
+`/v1/stats/analysis/latency`, each accepting `from`/`to` and the existing tenant
+credentials. They are also available under `/v2`.
+
+Comparison accepts `compare_from`/`compare_to` for the baseline (default: the
+preceding equal-length window) and exact `model`, `mode`, `surface`,
+`experiment_id`, and `run_id` filters applied to both periods. It reports totals,
+per-client/per-conversation values, absolute differences, and relative changes;
+zero denominators remain unavailable. To label a benchmark, set optional
+`stats.experiment_id` and `stats.run_id`. Otherwise each AppCore instance generates
+its own run ID. Events also carry the build version and a canonical fingerprint
+of an explicit allowlist of deployment compression/cache/retrieval settings,
+including provider policy overrides. Credentials and payloads are excluded.
+Actual compression mode is recorded separately; other per-request overrides
+are not separate configuration fingerprints.
+
+Schema v13 preserves daily experiment totals and conversation fingerprint sets
+before retention deletes raw events. Late arrivals are added once, and archived
+and raw totals can be combined. Archived comparisons require complete UTC days;
+partial archived days are explicitly omitted. Older legacy daily rollups lack
+experiment dimensions and are excluded from this comparison. Turn ordering,
+retrieval rankings, and latency percentiles still require retained raw events.
+
+New HTTP requests record upstream response-head wait for each attempt (including
+retries/failures), request-start-to-first-response-head time, and local retrieval
+answer/refusal execution time. Attempt detail is capped at 64 with the total
+count retained. This measures headers, not time to first token, and phases
+must not be added together. Latency reports exclude keep-warm pings, preserve
+missing sample counts, and show distributions, model/round/prompt-size/status
+breakdowns, slow requests, and error trends. Reports over more than 200,000 client
+rows explicitly use the newest 200,000. Detailed timing is unavailable for old
+rows and the WebSocket relay. Comparisons are observational and do not measure
+task-quality preservation or prove causation.
+
 ---
 
 ## Not built yet

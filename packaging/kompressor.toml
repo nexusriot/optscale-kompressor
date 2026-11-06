@@ -55,6 +55,9 @@ path = "/var/lib/kompressor/refs.db"
 # browse = true
 
 [stats]
+# Optional labels recorded with requests for historical comparisons.
+# experiment_id = "compression-v2"
+# run_id = "baseline-01" # Otherwise generated once for each AppCore instance.
 enabled = true
 path = "/var/lib/kompressor/stats.db"
 

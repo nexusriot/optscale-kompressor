@@ -252,6 +252,9 @@ impl Default for InterceptConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct StatsFileConfig {
+    /// Optional experiment and run labels for historical analysis.
+    pub experiment_id: Option<String>,
+    pub run_id: Option<String>,
     pub enabled: bool,
     pub path: PathBuf,
     pub queue_size: usize,
@@ -263,6 +266,8 @@ pub struct StatsFileConfig {
 impl Default for StatsFileConfig {
     fn default() -> Self {
         StatsFileConfig {
+            experiment_id: None,
+            run_id: None,
             enabled: true,
             path: PathBuf::from("./data/stats.db"),
             queue_size: 16_384,
