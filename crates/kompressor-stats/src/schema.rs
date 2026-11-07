@@ -381,6 +381,25 @@ const V12: &str = r#"
 ALTER TABLE proxy_requests ADD COLUMN keep_warm INTEGER NOT NULL DEFAULT 0;
 "#;
 
+// v13: request provenance, phase timing, and daily experiment aggregates.
+const V13: &str = r#"
+CREATE TABLE request_context (
+ tenant TEXT NOT NULL, request_id TEXT NOT NULL, time_ms INTEGER NOT NULL,
+ context TEXT, model TEXT, mode TEXT, PRIMARY KEY(tenant,request_id));
+CREATE INDEX request_context_time ON request_context(time_ms);
+ALTER TABLE proxy_requests ADD COLUMN timing_json TEXT;
+ALTER TABLE proxy_requests ADD COLUMN analysis_archived INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE optimization_events ADD COLUMN analysis_archived INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE retrieval_events ADD COLUMN analysis_archived INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE retrieval_events ADD COLUMN context_json TEXT;
+CREATE TABLE daily_analysis (
+ day_ms INTEGER NOT NULL, tenant TEXT NOT NULL, dimension TEXT NOT NULL,
+ metrics TEXT NOT NULL, PRIMARY KEY(day_ms,tenant,dimension));
+CREATE TABLE daily_analysis_conversations (
+ day_ms INTEGER NOT NULL, tenant TEXT NOT NULL, dimension TEXT NOT NULL,
+ conversation TEXT NOT NULL, PRIMARY KEY(day_ms,tenant,dimension,conversation));
+"#;
+
 pub const MIGRATIONS: &[(u32, &str)] = &[
     (1, V1),
     (2, V2),
@@ -394,6 +413,7 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
     (10, V10),
     (11, V11),
     (12, V12),
+    (13, V13),
 ];
 
 /// The version a freshly migrated database reports in `PRAGMA user_version`.

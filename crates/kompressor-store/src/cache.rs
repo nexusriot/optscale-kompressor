@@ -17,6 +17,7 @@
 //! one deadline a read is not allowed to extend; covering the write gap needs
 //! no such guess, because the writer supplied the whole policy.
 
+use crate::browse::{BrowsePage, BrowseQuery, RefBrowse, RefDetail};
 use crate::clock::Clock;
 use crate::types::{
     Lookup, PutMeta, RefRecord, RefStore, StoreError, StoreStats, Tenant, is_expired,
@@ -151,36 +152,28 @@ impl<S: RefStore> RefStore for CachedRefStore<S> {
         refs: &[(RefId, String)],
         meta: &PutMeta,
     ) -> Result<(), StoreError> {
+        self.put_many_created(tenant, refs, meta).map(|_| ())
+    }
+
+    fn put_many_created(
+        &self,
+        tenant: &Tenant,
+        refs: &[(RefId, String)],
+        meta: &PutMeta,
+    ) -> Result<Option<Vec<u64>>, StoreError> {
         let now = self.clock.now();
+        let mut seqs = Vec::with_capacity(refs.len());
         {
             let mut state = self.state.lock();
             for (id, fragment) in refs {
                 let key = (tenant.0.clone(), *id);
                 // `created_at` decides the absolute lifetime cap. The cached
                 // copy carries it when there is one; when there is not, this
-                // assumes the fragment is new.
-                //
-                // **That assumption is wrong after an eviction, a restart or
-                // another writer**, and this comment used to claim otherwise —
-                // that the cache "never reports a later creation than the inner
-                // store, so it cannot extend the absolute lifetime cap". The
-                // durable row preserves the original `created_at` through the
-                // upsert, so a re-store of an evicted key records a *newer* one
-                // here. Measured with a manual clock: created at 100, absolute
-                // lifetime 10, evicted and re-stored at 105 — `verify` reported
-                // expired at 110 while `get` went on returning a hit.
-                //
-                // Not repaired, deliberately. The only authoritative answer is
-                // the inner store's, and asking it on every uncached write is
-                // the one thing this type exists not to do:
-                // `the_cache_serves_a_fragment_the_inner_store_has_not_been_asked_for`
-                // and two tests beside it assert exactly that. The exposure is
-                // bounded by the cache window — past `cached_at +
-                // cache_ttl_seconds` nothing here is servable and the inner
-                // store decides again — so a shorter `cache_ttl` bounds it
-                // tighter. Closing it properly means carrying the deadline on
-                // the write path, which is a change to `PutMeta` rather than to
-                // this line.
+                // assumes the fragment is new until the inner store says
+                // otherwise below. That assumption is wrong after an eviction,
+                // a restart or another writer: the durable row keeps its first
+                // `created_at` through the upsert, and a cached copy stamped
+                // "now" was served past the deadline the row enforced.
                 let created_at = state
                     .entries
                     .get(&key)
@@ -188,6 +181,7 @@ impl<S: RefStore> RefStore for CachedRefStore<S> {
                     .unwrap_or(now);
                 let seq = state.next_seq;
                 state.next_seq += 1;
+                seqs.push(seq);
                 let entry = Entry {
                     record: RefRecord {
                         id: *id,
@@ -207,15 +201,33 @@ impl<S: RefStore> RefStore for CachedRefStore<S> {
         }
         // Keep the cache ahead of a write in flight, but clear this batch if
         // the backing write fails so no temporary handles escape.
-        let result = self.inner.put_many(tenant, refs, meta);
-        if result.is_err() {
-            let mut state = self.state.lock();
-            for (id, _) in refs {
-                state.entries.remove(&(tenant.0.clone(), *id));
+        let result = self.inner.put_many_created(tenant, refs, meta);
+        match &result {
+            Err(_) => {
+                let mut state = self.state.lock();
+                for (id, _) in refs {
+                    state.entries.remove(&(tenant.0.clone(), *id));
+                }
             }
-            return result;
+            // The row's own creation time, from the write that was happening
+            // anyway, so the deadline is the authoritative one without the
+            // read this type exists to avoid. Only the copies this call put
+            // there are corrected: a newer write may have replaced one since.
+            Ok(Some(created)) => {
+                let mut state = self.state.lock();
+                for (((id, _), seq), created_at) in refs.iter().zip(&seqs).zip(created) {
+                    if let Some(entry) = state.entries.get_mut(&(tenant.0.clone(), *id))
+                        && entry.seq == *seq
+                    {
+                        entry.record.created_at = *created_at;
+                    }
+                }
+            }
+            // An inner store that cannot say keeps the guess, bounded by the
+            // cache window: past `cached_at + cache_ttl_seconds` the inner
+            // store decides again.
+            Ok(None) => {}
         }
-
         result
     }
 
@@ -304,6 +316,44 @@ impl<S: RefStore> RefStore for CachedRefStore<S> {
         // Same reasoning as `stats`: the inner store is the only count that is
         // not double counting the cache's own copies.
         self.inner.stats_for(tenant)
+    }
+
+    fn browser(&self) -> Option<&dyn RefBrowse> {
+        // Browsable exactly when the inner store is. The wrapper itself is
+        // what is handed out, so a removal also drops the cached copy.
+        self.inner.browser().map(|_| self as &dyn RefBrowse)
+    }
+}
+
+/// Reads go to the inner store, the only one holding every row; the cache is
+/// a subset of it, written through. A removal clears both layers, or the
+/// deleted fragment would stay servable for the rest of the cache window.
+impl<S: RefStore> RefBrowse for CachedRefStore<S> {
+    fn browse(&self, tenant: &Tenant, query: &BrowseQuery) -> Result<BrowsePage, StoreError> {
+        match self.inner.browser() {
+            Some(inner) => inner.browse(tenant, query),
+            None => Ok(BrowsePage::default()),
+        }
+    }
+
+    fn inspect(&self, tenant: &Tenant, id: &RefId) -> Result<Option<RefDetail>, StoreError> {
+        match self.inner.browser() {
+            Some(inner) => inner.inspect(tenant, id),
+            None => Ok(None),
+        }
+    }
+
+    fn remove(&self, tenant: &Tenant, ids: &[RefId]) -> Result<usize, StoreError> {
+        {
+            let mut state = self.state.lock();
+            for id in ids {
+                state.entries.remove(&(tenant.0.clone(), *id));
+            }
+        }
+        match self.inner.browser() {
+            Some(inner) => inner.remove(tenant, ids),
+            None => Ok(0),
+        }
     }
 }
 
@@ -651,6 +701,28 @@ mod tests {
     }
 
     #[test]
+    fn removing_through_the_cache_stops_the_cached_copy_being_served() {
+        let store = CachedRefStore::new(MemoryRefStore::new());
+        let fragment = "a secret that should not have been stored";
+        let id = ref_for(fragment);
+        store
+            .put_many(&tenant("t"), &[(id, fragment.to_owned())], &meta())
+            .unwrap();
+        assert_eq!(store.cached_len(), 1);
+
+        let browser = store.browser().expect("browsable through the cache");
+        assert_eq!(browser.remove(&tenant("t"), &[id]).unwrap(), 1);
+        assert_eq!(store.cached_len(), 0);
+        assert_eq!(store.get(&tenant("t"), &id, false).unwrap(), Lookup::Miss);
+    }
+
+    #[test]
+    fn a_cache_over_an_unbrowsable_store_is_not_browsable() {
+        let store = CachedRefStore::new(StalledStore::default());
+        assert!(store.browser().is_none());
+    }
+
+    #[test]
     fn purging_drops_cached_copies_of_the_rows_it_deletes() {
         let clock = ManualClock::at(1_000);
         let inner = MemoryRefStore::new().with_clock(clock.clock());
@@ -667,5 +739,70 @@ mod tests {
         assert_eq!(store.purge_expired(clock.now()).unwrap(), 1);
         assert_eq!(store.cached_len(), 0);
         assert_eq!(store.get(&acme, &id, false).unwrap(), Lookup::Miss);
+    }
+
+    fn short_lived() -> PutMeta {
+        PutMeta {
+            ttl_seconds: 100,
+            max_lifetime_seconds: 10,
+            ..meta()
+        }
+    }
+
+    /// The durable row keeps its first `created_at` through an upsert, so the
+    /// absolute deadline is set then. A re-store after an eviction must not
+    /// give the cached copy a later one than the row it copies.
+    fn a_re_store_after_eviction_keeps_the_original_deadline_on<S: RefStore>(
+        inner: impl FnOnce(Clock) -> S,
+    ) {
+        let clock = ManualClock::at(100);
+        let store = CachedRefStore::new(inner(clock.clock()))
+            .with_capacity(1)
+            .with_clock(clock.clock());
+        let acme = tenant("acme");
+        let a = ref_for("fragment a");
+        store
+            .put_many(&acme, &[(a, "fragment a".into())], &short_lived())
+            .unwrap();
+        store
+            .put_many(
+                &acme,
+                &[(ref_for("fragment b"), "fragment b".into())],
+                &short_lived(),
+            )
+            .unwrap();
+
+        clock.set(105);
+        store
+            .put_many(&acme, &[(a, "fragment a".into())], &short_lived())
+            .unwrap();
+
+        clock.set(111);
+        assert!(
+            matches!(store.verify(&acme, &a).unwrap(), Lookup::Expired { .. }),
+            "the inner store's verdict"
+        );
+        assert!(
+            !matches!(store.get(&acme, &a, false).unwrap(), Lookup::Hit(_)),
+            "the cache must agree with it, not serve past the deadline"
+        );
+    }
+
+    #[test]
+    fn a_re_store_after_eviction_keeps_the_original_deadline_in_sqlite() {
+        a_re_store_after_eviction_keeps_the_original_deadline_on(|clock| {
+            crate::sqlite::SqliteRefStore::open_in_memory(crate::sqlite::SqliteOptions {
+                clock,
+                ..Default::default()
+            })
+            .unwrap()
+        });
+    }
+
+    #[test]
+    fn a_re_store_after_eviction_keeps_the_original_deadline_in_memory() {
+        a_re_store_after_eviction_keeps_the_original_deadline_on(|clock| {
+            MemoryRefStore::new().with_clock(clock)
+        });
     }
 }

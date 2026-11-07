@@ -7,7 +7,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "1.5.14"
+version = "2.0.6"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -88,7 +88,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
 
 # --- storage ---
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 
 # --- cli / config ---
 clap = { version = "4", features = ["derive", "env"] }

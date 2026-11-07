@@ -20,3 +20,5 @@ pub use config::Config;
 pub use core::{AppCore, CompressOutcome, RequestInfo, build_ref_store};
 pub use error::{AuthError, ConfigError, CoreError};
 pub use retrieve::{RetrieveRange, Retrieved};
+
+mod analysis_context;

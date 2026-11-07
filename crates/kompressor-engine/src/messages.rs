@@ -15,7 +15,7 @@ use crate::detect::detect_result;
 use crate::markers::stale_read_marker;
 use crate::options::EngineOptions;
 use crate::pipeline::compress_content;
-use crate::read_lifecycle::{ReadMessage, ReadState, classify_reads};
+use crate::read_lifecycle::{ReadMessage, ReadState, classify_reads, reports_failure};
 use crate::refs::{RefCollector, RefId, refs_in};
 use crate::text::chars_len;
 use crate::tokens::estimate_tokens;
@@ -166,6 +166,11 @@ pub struct MessageMeta {
     /// `compress_messages`.
     #[serde(default)]
     pub one_text_block: bool,
+    /// The tool reported that it failed: Anthropic's `is_error`, or the same
+    /// flag on the message API. A failed write changed nothing, so it must not
+    /// mark the read before it stale.
+    #[serde(default)]
+    pub tool_error: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -831,6 +836,8 @@ pub fn compress_messages(
                 tool_name: m.meta.tool_name.as_deref(),
                 path: m.meta.file_path.as_deref(),
                 protected: m.meta.cache_control || m.meta.protected,
+                failed: m.meta.tool_error
+                    || (m.meta.file_path.is_some() && reports_failure(&m.content.joined_text())),
             })
             .collect();
         classify_reads(&view, req.effective_frozen())
@@ -1865,6 +1872,68 @@ mod tests {
         }
         assert_eq!(stats.by_type.get("stale_read"), Some(&1));
         assert!(!refs.is_empty());
+    }
+
+    fn read_then_write(write_result: &str, tool_error: bool) -> Vec<Message> {
+        vec![
+            Message {
+                role: "tool".into(),
+                content: MessageContent::Text("x = 1\n".repeat(200)),
+                meta: MessageMeta {
+                    tool_name: Some("Read".into()),
+                    file_path: Some("src/a.rs".into()),
+                    ..Default::default()
+                },
+            },
+            Message {
+                role: "tool".into(),
+                content: MessageContent::Text(write_result.into()),
+                meta: MessageMeta {
+                    tool_name: Some("Write".into()),
+                    file_path: Some("src/a.rs".into()),
+                    tool_error,
+                    ..Default::default()
+                },
+            },
+        ]
+    }
+
+    /// A write that failed left the file as it was, so the read before it is
+    /// still the truth — and the one thing the agent needs to retry.
+    #[test]
+    fn a_write_that_failed_leaves_the_read_before_it_alone() {
+        let opts = EngineOptions::default();
+        for (result, flagged) in [
+            ("ERROR: permission denied; file unchanged", false),
+            (
+                "<tool_use_error>File has not been read yet.</tool_use_error>",
+                false,
+            ),
+            ("Error: old_string not found in file", false),
+            ("String to replace not found in file.", true),
+        ] {
+            let mut messages = read_then_write(result, flagged);
+            let mut refs = opts.collector();
+            let stats =
+                compress_messages(&mut messages, &opts, &RequestOptions::default(), &mut refs);
+            assert_eq!(stats.by_type.get("stale_read"), None, "{result}");
+            match &messages[0].content {
+                MessageContent::Text(t) => {
+                    assert!(!t.starts_with("[Read content stale"), "{result}: {t}")
+                }
+                _ => panic!(),
+            }
+        }
+    }
+
+    #[test]
+    fn a_write_that_succeeded_still_makes_the_read_stale() {
+        let opts = EngineOptions::default();
+        let mut messages =
+            read_then_write("The file src/a.rs has been updated successfully.", false);
+        let mut refs = opts.collector();
+        let stats = compress_messages(&mut messages, &opts, &RequestOptions::default(), &mut refs);
+        assert_eq!(stats.by_type.get("stale_read"), Some(&1));
     }
 
     #[test]

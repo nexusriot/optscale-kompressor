@@ -45,6 +45,12 @@ pub struct ServerConfig {
     pub api_listen: String,
     pub mcp_listen: String,
     pub proxy_listen: String,
+    /// A listener of its own for the live statistics and cache analysis pages
+    /// and their JSON, e.g.
+    /// `127.0.0.1:8818`. Empty serves them only on the API listener, at
+    /// `/v1/stats/live`; set, they are served here too, whatever surfaces the
+    /// process runs, so a proxy-only deployment still has a dashboard.
+    pub stats_listen: String,
     pub max_body_bytes: usize,
     /// 0 means twice the detected parallelism.
     ///
@@ -75,6 +81,7 @@ impl Default for ServerConfig {
             api_listen: String::new(),
             mcp_listen: String::new(),
             proxy_listen: String::new(),
+            stats_listen: String::new(),
             max_body_bytes: 64 * 1024 * 1024,
             max_inflight_compressions: 0,
             queue_timeout: Duration::from_secs(2),
@@ -161,6 +168,15 @@ pub struct RefsConfig {
     #[serde(with = "humantime_serde")]
     pub purge_interval: Duration,
     pub max_bytes: u64,
+    /// Serve the ref browser: `/v1/refs`, which lists, shows and deletes
+    /// stored fragments for the caller's tenant.
+    ///
+    /// Off by default. Fragments are tool output — a `.env` read, a cloud
+    /// API response — and until this is on, reading one back needs its
+    /// unguessable handle. With it on, any credential for a tenant can list
+    /// that tenant's fragments, and with `auth.mode = "none"` anyone who can
+    /// reach the listener can.
+    pub browse: bool,
 }
 
 impl Default for RefsConfig {
@@ -171,6 +187,7 @@ impl Default for RefsConfig {
             recent_cache_entries: 4096,
             purge_interval: Duration::from_secs(60),
             max_bytes: 1024 * 1024 * 1024,
+            browse: false,
         }
     }
 }
@@ -235,6 +252,9 @@ impl Default for InterceptConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct StatsFileConfig {
+    /// Optional experiment and run labels for historical analysis.
+    pub experiment_id: Option<String>,
+    pub run_id: Option<String>,
     pub enabled: bool,
     pub path: PathBuf,
     pub queue_size: usize,
@@ -246,6 +266,8 @@ pub struct StatsFileConfig {
 impl Default for StatsFileConfig {
     fn default() -> Self {
         StatsFileConfig {
+            experiment_id: None,
+            run_id: None,
             enabled: true,
             path: PathBuf::from("./data/stats.db"),
             queue_size: 16_384,
@@ -334,6 +356,33 @@ pub enum CacheTtl {
     Adaptive,
 }
 
+/// How long OpenAI should keep the prompt-cache entries a request writes.
+///
+/// OpenAI caches every prompt of 1,024 tokens or more without being asked and
+/// bills nothing to write it. How long an entry lives is the request's
+/// `prompt_cache_retention`: `in_memory`, typically five to ten minutes idle,
+/// or `24h`, around 30 minutes and up to a day. Which one a request gets when
+/// it names neither depends on the organization (zero-data-retention
+/// organizations get `in_memory`), and Codex names neither.
+///
+/// Measured over 12,114 archived Codex requests on gpt-5.5 (2026-09-18 to
+/// 10-31), turns that followed more than five minutes idle failed to read back
+/// 46–76% of their cached prefix: the in-memory lifetime, not a day. Those
+/// losses came to about 0.35% of the Codex bill, because Codex seldom idles,
+/// so this is a small, free saving rather than the large one keep-warm is on
+/// Anthropic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptCacheRetention {
+    /// The client's request goes out as written. The shipped default.
+    #[default]
+    Default,
+    /// Ask for `24h` retention where the client named none, on the models
+    /// OpenAI documents it for. Free to write on those models.
+    #[serde(rename = "24h")]
+    Extended,
+}
+
 /// Where the frozen prefix ends: what the client says, or what the provider
 /// has actually cached.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -416,6 +465,16 @@ pub struct ProxyConfig {
     pub frozen_prefix: FrozenPrefix,
     /// The cache TTL Anthropic requests ask for. See [`CacheTtl`].
     pub cache_ttl: CacheTtl,
+    /// The prompt-cache retention OpenAI requests ask for. See
+    /// [`PromptCacheRetention`].
+    ///
+    /// Applied only to Chat Completions and Responses requests through the
+    /// `openai` upstream (or any upstream on `api.openai.com`), never on its
+    /// ChatGPT-subscription route, never to a request that names a retention
+    /// of its own, and only for the models OpenAI documents `24h` for. A 400
+    /// that names the field is answered by sending the request again without
+    /// it, and the field is not added again for that upstream and model.
+    pub prompt_cache_retention: PromptCacheRetention,
     /// Keep an Anthropic conversation's cached prefix alive while the client
     /// is busy running a tool. **Off by default.**
     ///
@@ -437,7 +496,11 @@ pub struct ProxyConfig {
     /// Measured live on one such run: cache-write spend per agent step −20% and
     /// cache-loss turns 13 → 2, for 25 pings costing $0.15.
     ///
-    /// Anthropic only: OpenAI does not bill cache writes. Not armed for a
+    /// Anthropic only. OpenAI does not bill cache writes on the models Codex
+    /// runs, and Codex seldom idles past five minutes: on archived Codex runs
+    /// the expiry a ping could prevent came to about 0.35% of the bill, less
+    /// than the pings' output tokens would cost. There the lever is
+    /// [`Self::prompt_cache_retention`]. Not armed for a
     /// request that asked for one-hour entries, which do not need it, nor for
     /// one whose `thinking` has a token budget, since `max_tokens` cannot go
     /// below the budget without changing the cache key.
@@ -730,6 +793,8 @@ pub struct ProviderOverrides {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_ttl: Option<CacheTtl>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_retention: Option<PromptCacheRetention>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_keep_warm: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stale_read: Option<bool>,
@@ -759,6 +824,7 @@ impl ProviderOverrides {
             retrieve_tool,
             frozen_prefix,
             cache_ttl,
+            prompt_cache_retention,
             cache_keep_warm,
             stale_read
         );
@@ -823,6 +889,7 @@ impl Default for ProxyConfig {
             retrieve_tool: RetrieveTool::Auto,
             frozen_prefix: FrozenPrefix::Marker,
             cache_ttl: CacheTtl::Default,
+            prompt_cache_retention: PromptCacheRetention::Default,
             cache_keep_warm: false,
             cache_keep_warm_interval: Duration::from_secs(270),
             cache_keep_warm_max_pings: 11,
@@ -1042,6 +1109,7 @@ impl Config {
                 "api_listen" => self.server.api_listen = value.to_string(),
                 "mcp_listen" => self.server.mcp_listen = value.to_string(),
                 "proxy_listen" => self.server.proxy_listen = value.to_string(),
+                "stats_listen" => self.server.stats_listen = value.to_string(),
                 _ => {}
             },
             "auth" => match field {
@@ -1057,6 +1125,9 @@ impl Config {
                 "path" => self.refs.path = PathBuf::from(value),
                 "backend" if value.eq_ignore_ascii_case("memory") => {
                     self.refs.backend = RefsBackend::Memory;
+                }
+                "browse" => {
+                    self.refs.browse = parse_bool_setting("refs.browse", value, self.refs.browse)
                 }
                 _ => {}
             },
@@ -1244,6 +1315,14 @@ impl Config {
                     "1h" => CacheTtl::OneHour,
                     "adaptive" => CacheTtl::Adaptive,
                     _ => self.proxy.cache_ttl,
+                };
+            }
+            "prompt_cache_retention" => {
+                // A typo leaves the setting alone, as `cache_ttl` does.
+                self.proxy.prompt_cache_retention = match value.to_ascii_lowercase().as_str() {
+                    "default" => PromptCacheRetention::Default,
+                    "24h" => PromptCacheRetention::Extended,
+                    _ => self.proxy.prompt_cache_retention,
                 };
             }
             "cache_keep_warm" => {
@@ -1686,6 +1765,47 @@ mod tests {
     }
 
     #[test]
+    fn prompt_cache_retention_is_off_by_default_and_set_per_provider_or_from_the_environment() {
+        let mut config = Config::default();
+        assert_eq!(
+            config.proxy.prompt_cache_retention,
+            PromptCacheRetention::Default
+        );
+        config.apply_env(&[(
+            "KOMPRESSOR__PROXY__PROMPT_CACHE_RETENTION".into(),
+            "24h".into(),
+        )]);
+        assert_eq!(
+            config.proxy.prompt_cache_retention,
+            PromptCacheRetention::Extended
+        );
+        // A typo changes nothing: it is what the provider is asked to store.
+        config.apply_env(&[(
+            "KOMPRESSOR__PROXY__PROMPT_CACHE_RETENTION".into(),
+            "1d".into(),
+        )]);
+        assert_eq!(
+            config.proxy.prompt_cache_retention,
+            PromptCacheRetention::Extended
+        );
+
+        let parsed: Config =
+            toml::from_str("[proxy.providers.openai]\nprompt_cache_retention = \"24h\"\n")
+                .expect("parses");
+        assert_eq!(
+            parsed.proxy.prompt_cache_retention,
+            PromptCacheRetention::Default
+        );
+        let openai = parsed.for_provider("openai").expect("openai has overrides");
+        assert_eq!(
+            openai.proxy.prompt_cache_retention,
+            PromptCacheRetention::Extended
+        );
+        assert!(parsed.for_provider("anthropic").is_none());
+        assert!(toml::from_str::<Config>("[proxy]\nprompt_cache_retention = \"12h\"\n").is_err());
+    }
+
+    #[test]
     fn the_cache_ttl_setting_can_be_set_from_the_environment_and_a_typo_changes_nothing() {
         let mut config = Config::default();
         assert_eq!(config.proxy.cache_ttl, CacheTtl::Default);
@@ -1917,5 +2037,28 @@ mod tests {
     fn an_unknown_key_in_a_config_file_is_an_error_not_a_silent_typo() {
         let text = "[engine]\nmax_array_itemz = 5\n";
         assert!(toml::from_str::<Config>(text).is_err());
+    }
+    #[test]
+    fn the_statistics_listener_is_off_until_a_file_or_the_environment_names_it() {
+        assert!(Config::default().server.stats_listen.is_empty());
+        let from_file: Config =
+            toml::from_str("[server]\nstats_listen = \"127.0.0.1:8818\"\n").expect("parses");
+        assert_eq!(from_file.server.stats_listen, "127.0.0.1:8818");
+        let mut config = Config::default();
+        config.apply_env(&[(
+            "KOMPRESSOR__SERVER__STATS_LISTEN".into(),
+            "0.0.0.0:9000".into(),
+        )]);
+        assert_eq!(config.server.stats_listen, "0.0.0.0:9000");
+    }
+
+    #[test]
+    fn the_ref_browser_is_off_until_a_file_or_the_environment_turns_it_on() {
+        assert!(!Config::default().refs.browse);
+        let from_file: Config = toml::from_str("[refs]\nbrowse = true\n").expect("parses");
+        assert!(from_file.refs.browse);
+        let mut config = Config::default();
+        config.apply_env(&[("KOMPRESSOR__REFS__BROWSE".into(), "true".into())]);
+        assert!(config.refs.browse);
     }
 }

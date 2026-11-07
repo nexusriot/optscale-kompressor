@@ -24,7 +24,7 @@ use tracing::Instrument;
 
 use kompressor_core::auth::{Credentials, Identity};
 use kompressor_core::config::{
-    CacheTtl, FrozenPrefix, ProxyConfig, RetrieveExecution, RetrieveTool,
+    CacheTtl, FrozenPrefix, PromptCacheRetention, ProxyConfig, RetrieveExecution, RetrieveTool,
 };
 use kompressor_core::{AppCore, RequestInfo};
 use kompressor_engine::estimate_tokens;
@@ -39,6 +39,7 @@ use crate::bodycodec;
 use crate::failopen::Stage;
 use crate::mode::ProxyMode;
 use crate::prefixcache;
+use crate::retention;
 use crate::retrieve::{Budget, Retriever};
 use crate::stream::{ClientChunk, StreamRelay};
 use crate::upstream::Outbound;
@@ -187,6 +188,9 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
     } else {
         detect_family(&route.path)
     };
+    // After `decoded` is taken, so a renamed model reads as a rewritten body and
+    // is re-encoded rather than forwarded as the bytes that arrived.
+    let body = model_for_upstream(body, family, route.origin());
     let identity = resolve_identity(&state, &parts.headers);
     let mode = resolve_mode(
         &state,
@@ -200,7 +204,7 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
         mode = mode.as_str(),
         "routing"
     );
-    let prepared = prepare(
+    let mut prepared = prepare(
         &state,
         &identity,
         mode,
@@ -212,12 +216,22 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
         upstream.name.as_str(),
     )
     .await;
+    // After every rewrite, so it rides on whatever goes out, compressed or
+    // not, and before the capture, so the capture shows it.
+    let retention = ask_for_retention(
+        &state,
+        family,
+        upstream.name.as_str(),
+        route.origin(),
+        auth_mode.is_subscription(),
+        &mut prepared,
+    );
 
     // The client is back in this conversation, so whatever was keeping its
     // cache warm has done its job. Cancelled before this request is sent, so a
     // ping cannot race the request it was waiting for.
     if let Some(conversation) = prepared.prefix {
-        state.keepwarm.cancel(conversation);
+        state.keepwarm.cancel(conversation, prepared.messages);
     }
 
     // Both bodies, before either is re-encoded, when a capture is asked for.
@@ -274,6 +288,7 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
         if let Some(json) = prepared.json.clone() {
             outbound = outbound.with_json(json);
         }
+        outbound = outbound.with_retention(retention).with_started(started);
         if !prepared.stream {
             outbound = outbound.with_timeout(proxy.upstream_read_timeout);
         }
@@ -309,6 +324,7 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
                 // compression itself declined.
                 prepared.prefix,
             )
+            .with_timing(outbound.timing())
         });
     let budget = Budget::new(
         proxy.retrieve_max_rounds,
@@ -325,6 +341,7 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
         // Taken before `outbound` is moved into whichever path sends it.
         outbound.waited(),
     );
+    recorder.timing = Some(outbound.timing());
     recorder.keep_warm = keep_warm;
 
     if prepared.stream {
@@ -356,6 +373,54 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
         )
         .await
     }
+}
+
+/// Ask OpenAI to keep this prompt's cache entry for a day, when
+/// `proxy.prompt_cache_retention = "24h"` and the request is one that field is
+/// known to be understood on. See [`crate::retention`].
+///
+/// Returns what the sender needs to take the field back out should the
+/// upstream refuse it, or `None` when it was not added.
+fn ask_for_retention(
+    state: &ProxyState,
+    family: Option<ApiFamily>,
+    upstream: &str,
+    origin: &str,
+    subscription: bool,
+    prepared: &mut Prepared,
+) -> Option<retention::Guard> {
+    if subscription || !retention::family_supported(family) {
+        return None;
+    }
+    let config = state.core.config_for(family.map(ApiFamily::provider));
+    if config.proxy.prompt_cache_retention != PromptCacheRetention::Extended {
+        return None;
+    }
+    let model = prepared.model.clone()?;
+    if !retention::model_supported(&model)
+        || !retention::upstream_is_openai(upstream, origin)
+        || state.retention.refused(upstream, &model)
+    {
+        return None;
+    }
+    let mut parsed = None;
+    let value = match prepared.json.as_mut() {
+        Some(value) => value,
+        None => parsed.insert(serde_json::from_slice::<Value>(&prepared.body).ok()?),
+    };
+    if !retention::extend(value) {
+        return None;
+    }
+    // As for the Anthropic TTL: re-serializing changes JSON bytes, never the
+    // prompt the provider keys its cache on.
+    prepared.body = Bytes::from(serde_json::to_vec(value).ok()?);
+    tracing::debug!(model = %model, "asked for 24h prompt-cache retention");
+    Some(retention::Guard::new(
+        state.retention.clone(),
+        upstream,
+        &model,
+        config.proxy.max_body_bytes,
+    ))
 }
 
 /// The keep-warm ping this request would leave behind, if its conversation is
@@ -451,6 +516,9 @@ struct Prepared {
     /// provider reports can be filed against it for next turn. `None` when
     /// nothing was frozen — there is no prefix to have an opinion about.
     prefix: Option<u64>,
+    /// How many messages the request carried, stamped with `prefix`: what tells
+    /// the conversation coming back from another that opened the same way.
+    messages: Option<usize>,
     /// The request asked for one-hour cache entries, which outlast any pause a
     /// keep-warm ping would bridge.
     one_hour: bool,
@@ -461,6 +529,7 @@ impl Prepared {
     fn passthrough(body: Bytes, stream: bool, model: Option<String>) -> Prepared {
         Prepared {
             prefix: None,
+            messages: None,
             one_hour: false,
             body,
             json: None,
@@ -565,6 +634,7 @@ fn passthrough_with_stable_tools(
         // Stamped by `prepare`, which computes it for every request however
         // this one turned out.
         prefix: None,
+        messages: None,
         one_hour: false,
     }
 }
@@ -640,7 +710,7 @@ fn prefix_identity(
     family: Option<ApiFamily>,
     body: &Bytes,
     provider: &str,
-) -> Option<u64> {
+) -> Option<(u64, usize)> {
     // Identified with compression off too. The control arm of a comparison has
     // to be observed the way the treated arm is: without a conversation its
     // rows filed no conversation, its cache-read drops went untracked — an
@@ -665,7 +735,11 @@ fn prefix_identity(
     // mid-session finds a watermark describing what the client established
     // rather than whatever this turn happens to mark.
     state.prefixes.floor(fingerprint, walk.frozen_message_count);
-    Some(fingerprint)
+    let messages = value
+        .get("messages")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    Some((fingerprint, messages))
 }
 
 /// Decide what to send, then stamp the conversation's cache identity on it.
@@ -689,7 +763,8 @@ async fn prepare(
     request_id: &str,
     provider: &str,
 ) -> Prepared {
-    let fingerprint = prefix_identity(state, identity, family, &body, provider);
+    let identified = prefix_identity(state, identity, family, &body, provider);
+    let fingerprint = identified.map(|(key, _)| key);
     // Decided once, here: under `adaptive` the question itself moves the
     // conversation's state. Anthropic only; the TTL is its field.
     let long_ttl = family == Some(ApiFamily::AnthropicMessages)
@@ -720,6 +795,7 @@ async fn prepare(
     if prepared.prefix.is_none() {
         prepared.prefix = fingerprint;
     }
+    prepared.messages = identified.map(|(_, messages)| messages);
     // After every way `prepare_inner` can decline, for the reason the identity
     // is stamped here: under the default marker floor Claude Code freezes its
     // whole conversation, so nearly every request is a passthrough, and a TTL
@@ -865,6 +941,20 @@ async fn prepare_inner(
         && held < walk.frozen_message_count
     {
         thaw_the_uncached_tail(&mut walk, held);
+    }
+
+    // Recoverable means the model can ask for what was elided. A `tool_choice`
+    // of `"none"`, or one forcing a different tool, takes that away for this
+    // request: it would answer from markers it is not allowed to resolve.
+    if options.mode == kompressor_engine::Mode::Recoverable
+        && proxy.retrieve_tool != RetrieveTool::Never
+        && tool::choice_forbids_retrieval(&value, family)
+    {
+        tracing::debug!(
+            request_id,
+            "tool_choice forbids the retrieve tool; forwarding as it arrived"
+        );
+        return passthrough_with_stable_tools(proxy, options.mode, family, body, stream, model);
     }
 
     let before = compressible_tokens(&walk);
@@ -1100,6 +1190,7 @@ async fn prepare_inner(
                 strip_usage,
                 model,
                 prefix: fingerprint,
+                messages: None,
                 one_hour: false,
             }
         }
@@ -1331,6 +1422,52 @@ fn force_usage(value: &mut Value, family: ApiFamily) -> bool {
         }
     }
     true
+}
+
+/// The body with a namespaced Anthropic model name made one the API accepts.
+///
+/// Gateways such as OpenRouter name Claude models `anthropic/<id>`, and
+/// clients configured for one keep the namespace: Harbor's claude-code agent
+/// hands it to Claude Code, which sends it on every subagent request. Anthropic's
+/// own API answers that name with a 404, so each subagent died on its first call
+/// ("Agent terminated early due to an API error: There's an issue with the
+/// selected model"). Measured on the three 1.5.14 Harbor runs of 2026-11-02:
+/// every subagent launched failed this way, two in `protein-assembly` and
+/// `dna-assembly` on the last one, while the main agent ran on the bare name
+/// `suite.sh` sets.
+///
+/// Only Messages requests bound for `api.anthropic.com`, the one place the
+/// namespace can never be right: a gateway behind this proxy wants it kept.
+/// Every other body comes back untouched, and so does one that does not parse.
+fn model_for_upstream(body: Bytes, family: Option<ApiFamily>, origin: &str) -> Bytes {
+    const NAMESPACE: &str = "anthropic/";
+    let anthropic_api = origin
+        .strip_prefix("https://")
+        .is_some_and(|host| host == "api.anthropic.com" || host.starts_with("api.anthropic.com:"));
+    if family != Some(ApiFamily::AnthropicMessages)
+        || !anthropic_api
+        || !body
+            .windows(NAMESPACE.len())
+            .any(|window| window == NAMESPACE.as_bytes())
+    {
+        return body;
+    }
+    let Ok(mut value) = serde_json::from_slice::<Value>(&body) else {
+        return body;
+    };
+    let Some(model) = value
+        .get("model")
+        .and_then(Value::as_str)
+        .and_then(|model| model.strip_prefix(NAMESPACE))
+        .map(str::to_string)
+    else {
+        return body;
+    };
+    value["model"] = Value::String(model);
+    match serde_json::to_vec(&value) {
+        Ok(out) => Bytes::from(out),
+        Err(_) => body,
+    }
 }
 
 fn is_json(headers: &HeaderMap) -> bool {
@@ -2030,6 +2167,7 @@ pub(crate) struct Recorder {
     /// Provider wait, accumulated by the `Outbound` this request sends through.
     /// Shared rather than copied so the retrieve loop's extra rounds are in it.
     waited: Arc<AtomicU64>,
+    timing: Option<Arc<std::sync::Mutex<kompressor_stats::context::ProxyTiming>>>,
     /// The keep-warm ping to arm if the response stops on `tool_use`, or on
     /// `end_turn` with a background task running.
     pub(crate) keep_warm: Option<KeepWarmPlan>,
@@ -2053,6 +2191,8 @@ impl Recorder {
         waited: Arc<AtomicU64>,
     ) -> Recorder {
         let event = ProxyRequestEvent {
+            context: None,
+            timing: None,
             time_ms: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_millis() as i64)
@@ -2093,6 +2233,7 @@ impl Recorder {
             core: state.core.clone(),
             event,
             waited,
+            timing: None,
             prefixes: state.prefixes.clone(),
             prefix: prepared.prefix,
             keep_warm: None,
@@ -2142,6 +2283,10 @@ impl Recorder {
         started: Instant,
         error: Option<String>,
     ) {
+        self.event.timing = self
+            .timing
+            .as_ref()
+            .map(|t| t.lock().unwrap_or_else(|e| e.into_inner()).clone());
         self.event.status = status;
         self.event.retrieve_rounds = rounds;
         self.event.retrieve_tokens_injected = injected;
@@ -2222,6 +2367,58 @@ fn billed(usage: &Value, keys: &[&str]) -> Option<u32> {
 mod tests {
     use super::{RefId, inline_set_under_ceiling};
     use kompressor_engine::refs::ref_for;
+
+    #[test]
+    fn a_namespaced_model_is_renamed_for_anthropics_own_api() {
+        use bytes::Bytes;
+        use kompressor_wire::ApiFamily;
+        let body = |model: &str| {
+            Bytes::from(
+                serde_json::json!({"model": model, "max_tokens": 64000,
+                                   "messages": [{"role": "user", "content": "anthropic/ stays"}]})
+                .to_string(),
+            )
+        };
+        let model = |bytes: &Bytes| {
+            serde_json::from_slice::<serde_json::Value>(bytes).unwrap()["model"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let anthropic = Some(ApiFamily::AnthropicMessages);
+        let renamed = super::model_for_upstream(
+            body("anthropic/claude-opus-5-5"),
+            anthropic,
+            "https://api.anthropic.com",
+        );
+        assert_eq!(model(&renamed), "claude-opus-5-5");
+        let content = serde_json::from_slice::<serde_json::Value>(&renamed).unwrap();
+        assert_eq!(
+            content["messages"][0]["content"], "anthropic/ stays",
+            "only the model field is touched"
+        );
+
+        // A gateway wants the namespace; so does every other family.
+        for (family, origin) in [
+            (anthropic, "https://openrouter.ai"),
+            (anthropic, "http://127.0.0.1:8080"),
+            (Some(ApiFamily::OpenAiChat), "https://api.anthropic.com"),
+            (None, "https://api.anthropic.com"),
+        ] {
+            let sent = body("anthropic/claude-opus-5-5");
+            assert_eq!(
+                super::model_for_upstream(sent.clone(), family, origin),
+                sent,
+                "{family:?} to {origin}"
+            );
+        }
+        // A bare name is forwarded byte for byte.
+        let bare = body("claude-opus-5-5");
+        assert_eq!(
+            super::model_for_upstream(bare.clone(), anthropic, "https://api.anthropic.com"),
+            bare
+        );
+    }
 
     #[test]
     fn the_prompt_outside_the_messages_is_its_system_prompt_and_tools() {
@@ -2445,6 +2642,7 @@ mod tests {
                 &body(model),
                 provider,
             )
+            .map(|(key, _)| key)
         };
 
         let tenant_a = make_identity("tenant-a");

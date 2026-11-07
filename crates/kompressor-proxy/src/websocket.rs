@@ -223,6 +223,8 @@ pub async fn relay(
             .core
             .stats()
             .send(Event::ProxyRequest(ProxyRequestEvent {
+                context: None,
+                timing: None,
                 time_ms,
                 tenant: context.identity.tenant.as_str().to_string(),
                 request_id: request_id.clone(),

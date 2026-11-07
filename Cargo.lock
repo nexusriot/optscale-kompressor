@@ -1264,7 +1264,7 @@ dependencies = [
 
 [[package]]
 name = "kompressor-bench"
-version = "1.5.14"
+version = "2.0.6"
 dependencies = [
  "flate2",
  "kompressor-engine",
@@ -1276,7 +1276,7 @@ dependencies = [
 
 [[package]]
 name = "kompressor-cli"
-version = "1.5.14"
+version = "2.0.6"
 dependencies = [
  "assert_cmd",
  "axum",
@@ -1303,8 +1303,9 @@ dependencies = [
 
 [[package]]
 name = "kompressor-core"
-version = "1.5.14"
+version = "2.0.6"
 dependencies = [
+ "blake2",
  "humantime-serde",
  "kompressor-engine",
  "kompressor-stats",
@@ -1320,7 +1321,7 @@ dependencies = [
 
 [[package]]
 name = "kompressor-engine"
-version = "1.5.14"
+version = "2.0.6"
 dependencies = [
  "base64 0.23.1",
  "blake2",
@@ -1346,7 +1347,7 @@ dependencies = [
 
 [[package]]
 name = "kompressor-mcp"
-version = "1.5.14"
+version = "2.0.6"
 dependencies = [
  "anyhow",
  "axum",
@@ -1370,7 +1371,7 @@ dependencies = [
 
 [[package]]
 name = "kompressor-proxy"
-version = "1.5.14"
+version = "2.0.6"
 dependencies = [
  "axum",
  "bytes",
@@ -1405,7 +1406,7 @@ dependencies = [
 
 [[package]]
 name = "kompressor-server"
-version = "1.5.14"
+version = "2.0.6"
 dependencies = [
  "axum",
  "bytes",
@@ -1429,7 +1430,7 @@ dependencies = [
 
 [[package]]
 name = "kompressor-stats"
-version = "1.5.14"
+version = "2.0.6"
 dependencies = [
  "humantime-serde",
  "kompressor-engine",
@@ -1443,7 +1444,7 @@ dependencies = [
 
 [[package]]
 name = "kompressor-store"
-version = "1.5.14"
+version = "2.0.6"
 dependencies = [
  "kompressor-engine",
  "parking_lot",
@@ -1455,7 +1456,7 @@ dependencies = [
 
 [[package]]
 name = "kompressor-wire"
-version = "1.5.14"
+version = "2.0.6"
 dependencies = [
  "kompressor-engine",
  "serde_json",
@@ -1486,9 +1487,9 @@ checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "libsqlite3-sys"
-version = "0.38.2"
+version = "0.39.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8"
+checksum = "14a5f01b87b92705d07b433c06f96cbc764637d81a0bffb5734ce17cf0f9a2b3"
 dependencies = [
  "cc",
  "pkg-config",
@@ -2211,9 +2212,9 @@ dependencies = [
 
 [[package]]
 name = "rusqlite"
-version = "0.40.2"
+version = "0.41.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23f2a97da3e3873c73cb2a2e71b35c40ff95e0b1eefa8d72d8499a6928c3b5b3"
+checksum = "da9bba6f3506135e120a6586df05be18b48d18896600646a4bec8f993d91a594"
 dependencies = [
  "bitflags",
  "fallible-iterator",
