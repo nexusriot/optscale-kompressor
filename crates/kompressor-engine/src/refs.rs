@@ -160,6 +160,10 @@ pub struct RefCollector {
     max_ref_bytes: usize,
     pairs: Vec<(RefId, String)>,
     seen: HashSet<RefId>,
+    /// Every handle `stash` answered, repeats included, in order. `pairs`
+    /// holds a fragment once, so a later message eliding the same bytes left
+    /// no trace of it; this is how a caller sees what one message elided.
+    stashed: Vec<RefId>,
     oversized_attempts: usize,
     /// Every fragment refused for size, for reporting rather than for control.
     ///
@@ -189,6 +193,7 @@ pub struct Mark {
     /// sliced from to read what a candidate added.
     pub pairs: usize,
     oversized: usize,
+    stashed: usize,
 }
 
 impl RefCollector {
@@ -200,6 +205,7 @@ impl RefCollector {
             max_ref_bytes,
             pairs: Vec::new(),
             seen: HashSet::new(),
+            stashed: Vec::new(),
             oversized_attempts: 0,
             oversized_refusals: 0,
             gated: 0,
@@ -214,6 +220,7 @@ impl RefCollector {
             max_ref_bytes: 0,
             pairs: Vec::new(),
             seen: HashSet::new(),
+            stashed: Vec::new(),
             oversized_attempts: 0,
             oversized_refusals: 0,
             gated: 0,
@@ -260,6 +267,7 @@ impl RefCollector {
         if self.seen.insert(id) {
             self.pairs.push((id, fragment.to_owned()));
         }
+        self.stashed.push(id);
         Some(id)
     }
 
@@ -268,6 +276,7 @@ impl RefCollector {
         Mark {
             pairs: self.pairs.len(),
             oversized: self.oversized_attempts,
+            stashed: self.stashed.len(),
         }
     }
 
@@ -319,6 +328,7 @@ impl RefCollector {
         for (id, _) in self.pairs.drain(mark.pairs..) {
             self.seen.remove(&id);
         }
+        self.stashed.truncate(mark.stashed);
         // The refusals go back too. A candidate that was discarded did not
         // ship, so neither did anything it could not store — and leaving the
         // count raised lets a losing reading veto a winning one whose
@@ -336,6 +346,7 @@ impl RefCollector {
             max_ref_bytes: self.max_ref_bytes,
             pairs: Vec::new(),
             seen: HashSet::new(),
+            stashed: Vec::new(),
             oversized_attempts: 0,
             oversized_refusals: 0,
             gated: 0,
@@ -360,6 +371,26 @@ impl RefCollector {
         for fragment in fragments {
             self.stash(fragment.as_ref());
         }
+    }
+
+    /// Each handle stashed since `mark`, once, in first-stashed order —
+    /// including fragments an earlier stash already holds, which
+    /// `pairs()[mark.pairs..]` does not show.
+    pub fn stashed_since(&self, mark: Mark) -> Vec<RefId> {
+        let mut seen = HashSet::new();
+        self.stashed[mark.stashed.min(self.stashed.len())..]
+            .iter()
+            .copied()
+            .filter(|id| seen.insert(*id))
+            .collect()
+    }
+
+    /// The fragment held under `id`.
+    pub fn fragment(&self, id: RefId) -> Option<&str> {
+        self.pairs
+            .iter()
+            .find(|(other, _)| *other == id)
+            .map(|(_, fragment)| fragment.as_str())
     }
 
     pub fn pairs(&self) -> &[(RefId, String)] {
