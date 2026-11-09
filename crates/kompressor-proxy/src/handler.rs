@@ -2707,11 +2707,15 @@ mod tests {
 
         let first = identify(&attempt("a", 0));
         assert_eq!(identify(&attempt("a", 4)), first);
-        // Its opening alone cannot be told apart, and nothing has parted yet.
-        assert_eq!(identify(&attempt("b", 0)), first);
-
-        let second = identify(&attempt("b", 1));
-        assert_ne!(second, first, "a departure is another conversation");
+        // Only the opening of a history eight messages longer: not that
+        // conversation's next turn, so another attempt from its first request.
+        let second = identify(&attempt("b", 0));
+        assert_ne!(second, first, "a fresh attempt is another conversation");
+        assert_eq!(
+            identify(&attempt("b", 1)),
+            second,
+            "and stays one once it parts"
+        );
         for turns in 2..6 {
             assert_eq!(identify(&attempt("b", turns)), second, "turn {turns}");
             assert_eq!(identify(&attempt("a", turns + 4)), first, "turn {turns}");
@@ -2738,8 +2742,50 @@ mod tests {
             identify(&["preamble", "task", "call", "retried", "reminder", "next"]),
             id
         );
-        // A replay of an earlier turn is not a departure either.
-        assert_eq!(identify(&["preamble", "task", "call"]), id);
+        // A replay that stops within the rewrite allowance is not a
+        // departure either.
+        assert_eq!(identify(&["preamble", "task", "call", "retried"]), id);
+    }
+
+    #[test]
+    fn a_fresh_attempt_leaves_the_running_one_its_identity() {
+        // Measured: a second attempt at a Harbor task started while the first
+        // was still working. Filed under the first, its opening request read
+        // as a 15k-token cache loss 52 s after the first's last turn.
+        let tracker = prefixcache::PrefixTracker::new(Duration::ZERO);
+        let identify = |texts: &[&str]| tracker.identify(&prefixcache::identity_chain(texts));
+        let running = ["preamble", "task", "a1", "r1", "a2", "r2", "a3", "r3"];
+        let first = identify(&running[..2]);
+        assert_eq!(identify(&running), first);
+
+        let fresh = identify(&["preamble", "task"]);
+        assert_ne!(fresh, first);
+        // Both carry on, interleaved, each as itself — the earlier one
+        // through a rewrite of its tail too.
+        assert_eq!(identify(&["preamble", "task", "b1", "s1"]), fresh);
+        assert_eq!(identify(&[&running[..], &["a4", "r4"]].concat()), first);
+        assert_eq!(identify(&["preamble", "task", "b1", "s1", "b2"]), fresh);
+        assert_eq!(identify(&[&running[..], &["a4b", "r4b"]].concat()), first);
+
+        // A third attempt is a third conversation.
+        let third = identify(&["preamble", "task"]);
+        assert!(third != first && third != fresh);
+        assert_eq!(identify(&["preamble", "task", "c1", "t1"]), third);
+        assert_eq!(
+            identify(&["preamble", "task", "b1", "s1", "b2", "s2"]),
+            fresh
+        );
+    }
+
+    #[test]
+    fn a_short_history_still_shares_its_opening_until_it_parts() {
+        // Within the rewrite allowance a replay is indistinguishable from a
+        // retry, so the two stay together until a departure.
+        let tracker = prefixcache::PrefixTracker::new(Duration::ZERO);
+        let identify = |texts: &[&str]| tracker.identify(&prefixcache::identity_chain(texts));
+        let first = identify(&["preamble", "task"]);
+        assert_eq!(identify(&["preamble", "task", "a1", "r1"]), first);
+        assert_eq!(identify(&["preamble", "task"]), first);
     }
 
     #[test]

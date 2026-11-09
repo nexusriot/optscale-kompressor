@@ -1045,26 +1045,44 @@ pub fn compress_messages(
         // later message folds against text that is not there.
         let mut kept_inline = false;
         if let Some(original) = before_compression {
+            // Unknown counts read as one demand; `u32::MAX` is a fragment an
+            // earlier turn already shipped whole.
+            let demand_of = |id: &RefId| {
+                req.fetches
+                    .iter()
+                    .find(|(other, _)| other == id)
+                    .map_or(1, |(_, n)| *n)
+            };
             // Only the fragments this message would re-elide, and only the ones
             // already fetched back.
-            let protected: u32 = refs.pairs()[inline_mark.pairs..]
+            let here: Vec<(RefId, u32)> = refs.pairs()[inline_mark.pairs..]
                 .iter()
                 .filter(|(id, _)| req.keep_inline.contains(id))
-                .map(|(_, fragment)| estimate_tokens(fragment, &role))
-                .sum();
-            // The most-demanded fragment in this message decides it: promoting
+                .map(|(id, fragment)| (*id, estimate_tokens(fragment, &role)))
+                .collect();
+            let pinned: Vec<RefId> = here
+                .iter()
+                .filter(|(id, _)| demand_of(id) == u32::MAX)
+                .map(|(id, _)| *id)
+                .collect();
+            // A promotion buys only the fragments not already inline. Their
+            // pinned siblings' rewrite was paid on the turn that pinned them,
+            // and lending a newly fetched neighbour their unbounded demand let
+            // one fetch of 309 tokens re-write message 14 of a conversation
+            // 22,528 cached tokens behind it (`ret-off` run of 2026-11-09).
+            let unpinned = here.iter().filter(|(id, _)| !pinned.contains(id));
+            let protected: u32 = if pinned.len() < here.len() {
+                unpinned.clone().map(|(_, tokens)| *tokens).sum()
+            } else {
+                here.iter().map(|(_, tokens)| *tokens).sum()
+            };
+            // The most-demanded fragment the rewrite buys decides it: promoting
             // the message serves all of them, so the one asked for most often
-            // is what the rewrite buys. Unknown counts read as one demand.
-            let fetches: u32 = refs.pairs()[inline_mark.pairs..]
-                .iter()
-                .filter(|(id, _)| req.keep_inline.contains(id))
-                .map(|(id, _)| {
-                    req.fetches
-                        .iter()
-                        .find(|(other, _)| other == id)
-                        .map_or(1, |(_, n)| *n)
-                })
+            // is what the rewrite is worth.
+            let fetches: u32 = unpinned
+                .map(|(id, _)| demand_of(id))
                 .max()
+                .or_else(|| (!here.is_empty()).then_some(u32::MAX))
                 .unwrap_or(0);
             if compressed_here && protected > 0 {
                 let demanded: Vec<_> = refs.pairs()[inline_mark.pairs..]
@@ -1107,12 +1125,38 @@ pub fn compress_messages(
                 let mut recovery_refs = refs.scratch();
                 let selective = repaid
                     .then(|| {
-                        compress_preserving_code(&original, &role, opts, req, &mut recovery_refs)
+                        compress_preserving_code(
+                            &original,
+                            &role,
+                            opts,
+                            req,
+                            req.keep_inline,
+                            &mut recovery_refs,
+                        )
                     })
                     .flatten();
                 let recovery_content = selective.as_ref().map_or(&original, |(content, _)| content);
+                // What this message shipped last turn when some of its
+                // fragments are already pinned: those whole, the rest elided.
+                // It is both the baseline a promotion gives compression up
+                // against and what a refusal ships, because re-eliding the
+                // pinned ones would be a second rewrite, not the absence of one.
+                let mixed = !pinned.is_empty() && pinned.len() < here.len();
+                let mut pinned_refs = refs.scratch();
+                let pinned_shape = if mixed {
+                    compress_preserving_code(&original, &role, opts, req, &pinned, &mut pinned_refs)
+                } else {
+                    None
+                };
+                let baseline = if mixed {
+                    pinned_shape
+                        .as_ref()
+                        .map_or(&original, |(content, _)| content)
+                } else {
+                    &messages[index].content
+                };
                 let forfeited = count_tokens(recovery_content, &role)
-                    .saturating_sub(count_tokens(&messages[index].content, &role));
+                    .saturating_sub(count_tokens(baseline, &role));
                 if keeping_it_inline_is_worth_it(
                     forfeited,
                     protected,
@@ -1147,6 +1191,22 @@ pub fn compress_messages(
                     };
                     kept_inline = true;
                 } else {
+                    if mixed {
+                        // The newly fetched fragment stays elided; its pinned
+                        // siblings stay where an earlier turn put them.
+                        kept_inline_ids.extend(pinned.iter().copied());
+                        refs.rollback(inline_mark);
+                        compressed_here = if let Some((content, kinds)) = pinned_shape {
+                            messages[index].content = content;
+                            applied = kinds;
+                            refs.adopt(pinned_refs);
+                            true
+                        } else {
+                            messages[index].content = original;
+                            false
+                        };
+                        kept_inline = true;
+                    }
                     // Said out loud, because the consequence is that the model
                     // may ask for this fragment again and spend another round
                     // doing it. The same reasoning put the ranged-retrieval
@@ -1220,7 +1280,7 @@ pub fn compress_messages(
     stats.finish(opts.mode, refs)
 }
 
-/// Build a recovery candidate with fetched source bodies held inline. Callers
+/// Build a recovery candidate with the source bodies in `keep` held inline. Callers
 /// can price it in a scratch collector before accepting the promotion. A
 /// fallback route must not hide a demanded body again; otherwise the caller
 /// must price and retain the original message instead.
@@ -1229,11 +1289,12 @@ fn compress_preserving_code(
     role: &str,
     opts: &EngineOptions,
     req: &RequestOptions,
+    keep: &[RefId],
     refs: &mut RefCollector,
 ) -> Option<(MessageContent, Vec<Kind>)> {
     let mut candidate = original.clone();
     let mut scratch = refs.scratch();
-    scratch.preserve_code(req.keep_inline);
+    scratch.preserve_code(keep);
     let mut applied = Vec::new();
     let mut changed = false;
     let mut compress = |text: &mut String| {
@@ -1259,12 +1320,7 @@ fn compress_preserving_code(
         }
         MessageContent::Opaque => return None,
     }
-    if !changed
-        || scratch
-            .pairs()
-            .iter()
-            .any(|(id, _)| req.keep_inline.contains(id))
-    {
+    if !changed || scratch.pairs().iter().any(|(id, _)| keep.contains(id)) {
         return None;
     }
     refs.adopt(scratch);
@@ -2383,6 +2439,119 @@ mod skip_reason_tests {
             original.content.joined_text(),
             "and ships whole"
         );
+    }
+
+    /// A source file whose function bodies are elided one handle each, the
+    /// handles in order, and a tail long enough that rewriting the file's
+    /// message is far from free.
+    #[cfg(feature = "code-aware")]
+    fn source_with_handles() -> (Message, Vec<(RefId, String)>, Message) {
+        let source: String = (0..18)
+            .map(|function| {
+                let body: String = (0..26)
+                    .map(|step| {
+                        format!(
+                            "    step_{step} = compute(entries, {})\n",
+                            function * 26 + step
+                        )
+                    })
+                    .collect();
+                format!("def reconcile_{function:02}(entries):\n{body}\n")
+            })
+            .collect();
+        let original = msg("tool", &source);
+        let mut first = vec![original.clone()];
+        let mut refs = RefCollector::new(1 << 20);
+        compress_messages(&mut first, &opts(), &RequestOptions::default(), &mut refs);
+        let handles = refs
+            .pairs()
+            .iter()
+            .map(|(id, f)| (*id, f.clone()))
+            .collect();
+        let tail: String = (0..6_000)
+            .map(|i| format!("a later turn carrying its own text, line {i}\n"))
+            .collect();
+        (original, handles, msg("user", &tail))
+    }
+
+    #[cfg(feature = "code-aware")]
+    fn ship(
+        original: &Message,
+        tail: &Message,
+        fetches: &[(RefId, u32)],
+    ) -> (String, CompressStats) {
+        let keep: Vec<RefId> = fetches.iter().map(|(id, _)| *id).collect();
+        let mut messages = vec![original.clone(), tail.clone()];
+        let mut refs = RefCollector::new(1 << 20);
+        let stats = compress_messages(
+            &mut messages,
+            &opts(),
+            &RequestOptions {
+                keep_inline: &keep,
+                fetches,
+                ..Default::default()
+            },
+            &mut refs,
+        );
+        (messages[0].content.joined_text(), stats)
+    }
+
+    /// Three bodies of a file already shipped whole, and a fourth fetched once.
+    ///
+    /// The fourth used to borrow its siblings' unbounded demand, so one fetch
+    /// of 309 tokens re-wrote the message with 22,528 cached tokens behind it
+    /// (`ret-off` run of 2026-11-09, conversation `21c3fb30`). Priced on its
+    /// own it does not repay that, and refusing it must leave the message
+    /// exactly as the turn before shipped it — not re-elide the three.
+    #[cfg(feature = "code-aware")]
+    #[test]
+    fn a_fragment_fetched_beside_pinned_ones_is_priced_on_its_own_demand() {
+        let (original, handles, tail) = source_with_handles();
+        let pinned: Vec<(RefId, u32)> =
+            handles[..3].iter().map(|(id, _)| (*id, u32::MAX)).collect();
+        let (before, _) = ship(&original, &tail, &pinned);
+
+        let mut fetched_once = pinned.clone();
+        fetched_once.push((handles[3].0, 1));
+        let (after, stats) = ship(&original, &tail, &fetched_once);
+
+        assert_eq!(
+            after, before,
+            "the message must not move in front of the tail"
+        );
+        for (_, body) in &handles[..3] {
+            assert!(after.contains(body.as_str()), "a pinned body was re-elided");
+        }
+        assert!(
+            !after.contains(handles[3].1.as_str()),
+            "one fetch must not buy the rewrite"
+        );
+        assert!(
+            after.contains(handles[3].0.to_string().as_str()),
+            "the fetched body stays recoverable"
+        );
+        let mut kept: Vec<RefId> = handles[..3].iter().map(|(id, _)| *id).collect();
+        kept.sort();
+        assert_eq!(stats.kept_inline_refs, kept);
+    }
+
+    /// And once the newcomer is asked for often enough, it joins them.
+    #[cfg(feature = "code-aware")]
+    #[test]
+    fn a_fragment_fetched_beside_pinned_ones_is_promoted_on_enough_demand() {
+        let (original, handles, tail) = source_with_handles();
+        let mut fetches: Vec<(RefId, u32)> =
+            handles[..3].iter().map(|(id, _)| (*id, u32::MAX)).collect();
+        fetches.push((handles[3].0, CACHE_DISCOUNT));
+        let (after, stats) = ship(&original, &tail, &fetches);
+        for (_, body) in &handles[..4] {
+            assert!(after.contains(body.as_str()));
+        }
+        assert!(
+            !after.contains(handles[4].1.as_str()),
+            "unfetched bodies stay elided"
+        );
+        assert_eq!(stats.kept_inline_refs.len(), 4);
     }
 
     fn cached(mut message: Message, blocks: u32, breakpoint: bool) -> Message {

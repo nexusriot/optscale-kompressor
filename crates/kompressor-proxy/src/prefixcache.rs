@@ -81,6 +81,10 @@ struct Identities {
     /// request that departs from it is another conversation that opened the
     /// same way.
     history: HashMap<u64, (Vec<u64>, Instant)>,
+    /// How many conversations have been told apart by [`Self::reopening`];
+    /// mixed into the identity each one gets, since its opening hash is
+    /// already the identity of the conversation it opened like.
+    reopened: u64,
 }
 
 /// How far from the end of a conversation's history a request may differ and
@@ -129,6 +133,31 @@ impl Identities {
             .take_while(|(a, b)| a == b)
             .count();
         (common < chain.len() && common + TAIL_REWRITE < history.len()).then_some(common)
+    }
+
+    /// Where to re-anchor `id` when `chain` replays its history from the
+    /// start but stops well short of it: another conversation that opened
+    /// the same way and has not parted yet.
+    ///
+    /// A later turn appends, and a retry or tail rewrite reaches at most
+    /// [`TAIL_REWRITE`] messages back, so a request that is only the opening
+    /// of a long history is not that conversation's next turn. Measured on a
+    /// 164-minute, 18-trial Harbor run: every one of the 16 requests that
+    /// replayed a strict prefix of a known history was the first or second
+    /// request of a fresh attempt at the same task, none a replay inside a
+    /// running session. Filed under the earlier attempt, each one read as a
+    /// cache loss of everything that attempt had cached (seven false
+    /// warnings, 129k tokens), switched `cache_ttl = "adaptive"` to one-hour
+    /// writes on the strength of the earlier attempt's idle gap, and moved
+    /// its keep-warm target.
+    ///
+    /// The depth returned keeps [`TAIL_REWRITE`] in hand, so the earlier
+    /// conversation is still recognised after rewriting its tail.
+    fn reopening(&self, id: u64, chain: &[u64]) -> Option<(usize, u64)> {
+        let (history, _) = self.history.get(&id)?;
+        let replays = chain.len() <= history.len() && history[..chain.len()] == *chain;
+        let depth = history.len() - TAIL_REWRITE.min(history.len());
+        (replays && chain.len() < depth).then(|| (depth, history[depth - 1]))
     }
 
     fn insert(&mut self, len: usize, hash: u64, id: u64) {
@@ -946,8 +975,13 @@ impl PrefixTracker {
     /// Two conversations that open identically match one entry, and are told
     /// apart at the first request that departs from the history the entry's
     /// conversation has sent: that request is filed as a new conversation,
-    /// registered at the message where the two part. Their very first request
-    /// cannot be told apart, and is filed under the earlier one.
+    /// registered at the message where the two part. Before that, a request
+    /// that replays only the start of a much longer history is the later one
+    /// opening (see `Identities::reopening`): it gets an identity of its own
+    /// and the opening's key, and the earlier conversation is re-registered
+    /// deeper in its own history. Only when the earlier history is itself no
+    /// more than `TAIL_REWRITE` messages past the opening are the two still
+    /// filed together until they part.
     ///
     /// `None` only for an empty chain. A poisoned lock degrades to the
     /// first-sight hash, which is stable for as long as the lock stays broken.
@@ -964,6 +998,17 @@ impl PrefixTracker {
             .filter(|&len| len <= chain.len())
             .find_map(|len| ids.by_prefix.get(&(len, chain[len - 1])).map(|e| e.id));
         if let Some(id) = found {
+            if let Some((depth, anchor)) = ids.reopening(id, chain) {
+                // Another conversation on the same opening. The earlier one
+                // is registered deeper, at a message only its own later
+                // turns reach, and gives up the shallower key to this one.
+                ids.insert(depth, anchor, id);
+                ids.reopened += 1;
+                let fresh = newest ^ ids.reopened.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                ids.insert(chain.len(), newest, fresh);
+                ids.extend(fresh, chain);
+                return Some(fresh);
+            }
             let Some(at) = ids.departure(id, chain) else {
                 ids.extend(id, chain);
                 return Some(id);
