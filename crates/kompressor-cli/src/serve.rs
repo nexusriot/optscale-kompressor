@@ -310,7 +310,7 @@ pub async fn run(config: Config, surfaces: Surfaces, listen: Option<String>) -> 
         });
     }
     if let Some((addr, listener)) = stats_listener {
-        tracing::info!(address = %addr, "live statistics at http://{addr}/");
+        tracing::info!(address = %addr, "live statistics at http://{addr}/, cache analysis at http://{addr}/cache");
         let app = kompressor_server::stats_listener_router(ServerState::new(core.clone()));
         let mut rx = shutdown_rx.clone();
         servers.spawn(async move {

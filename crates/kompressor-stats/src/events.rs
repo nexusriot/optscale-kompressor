@@ -68,6 +68,8 @@ impl fmt::Display for Surface {
 /// One compression of one request: the credit side of the token economy.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OptimizationEvent {
+    #[serde(default)]
+    pub context: Option<crate::context::RunContext>,
     /// Request start in milliseconds since the Unix epoch (see the module doc).
     pub time_ms: i64,
     /// Tenant the request was billed to.
@@ -147,6 +149,7 @@ impl OptimizationEvent {
         mode: Mode,
     ) -> OptimizationEvent {
         OptimizationEvent {
+            context: None,
             time_ms,
             tenant: tenant.into(),
             request_id: request_id.into(),
@@ -195,6 +198,8 @@ impl OptimizationEvent {
 /// One attempt to fetch a fragment back: the debit side of the token economy.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RetrievalEvent {
+    #[serde(default)]
+    pub context: Option<crate::context::RunContext>,
     /// Request start in milliseconds since the Unix epoch.
     pub time_ms: i64,
     /// Tenant the retrieval was billed to.
@@ -276,6 +281,10 @@ pub struct ProtectedRefEvent {
 /// saving the provider had already discounted as a cache read.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProxyRequestEvent {
+    #[serde(default)]
+    pub context: Option<crate::context::RunContext>,
+    #[serde(default)]
+    pub timing: Option<crate::context::ProxyTiming>,
     /// Request start in milliseconds since the Unix epoch.
     pub time_ms: i64,
     /// Tenant the request was billed to.

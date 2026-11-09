@@ -45,7 +45,7 @@ KOMPRESSOR="${KOMPRESSOR:-$REPO/target/release/kompressor}"
 OPENCODE="${OPENCODE:-$(command -v opencode || echo "$HOME/.opencode/bin/opencode")}"
 PORT="${PORT:-8821}"
 WORK="${WORK:-$HOME/.cache/kompressor-opencode-sweep}"
-MODEL="${OPENCODE_SWEEP_MODEL:-anthropic/claude-haiku-5-5}"
+MODEL="${OPENCODE_SWEEP_MODEL:-opencode-go/glm-5.3-flash}"
 CONFIG="$WORK/config.toml"
 STATS="$WORK/stats.db"
 REFS="$WORK/refs.db"
@@ -405,6 +405,9 @@ run_stage() {
   rm -f "$transcript" "$transcript.stderr"
   ( "stage_$stage" ) 2>&1 | tee "$WORK/reports/$stage.log" || status=${PIPESTATUS[0]}
   stop_proxy
+  # The next stage's start_proxy deletes $PROXY_LOG, and a failure verdict
+  # points at it, so by the end of `all` it is always the wrong stage's log.
+  [ -f "$PROXY_LOG" ] && cp "$PROXY_LOG" "$WORK/reports/$stage-proxy.log"
   if [ -f "$transcript" ]; then
     say "opencode session — $stage"
     session "$transcript"
@@ -695,12 +698,15 @@ usage() {
   sed -n '2,35p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
-trap stop_proxy EXIT
-
 # Serialise runs that share the databases and saved reports.
 mkdir -p "$WORK"
 exec 9>"$WORK/.sweep.lock"
 flock -n 9 || die "another opencode sweep is running in $WORK"
+
+# Only once the lock is ours. Installed before it, a second invocation that
+# lost the race died through this trap and killed the *running* sweep's proxy
+# by the shared PID file: the live session then failed with ECONNREFUSED.
+trap stop_proxy EXIT
 
 case "${1:-all}" in
   all|sweep|retrieval|bughunt)

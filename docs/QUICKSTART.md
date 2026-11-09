@@ -256,6 +256,7 @@ $ curl -s localhost:8817/v1/retrieve -H 'content-type: application/json' \
 | `POST /v1/detect` | classify a payload without compressing it |
 | `GET /v1/stats/summary` `by_type` `histogram` `requests` `retrievals` `store` | the same reports as `kompressor stats` — mounted only when `stats.enabled` (the default); with statistics off the whole prefix 404s |
 | `GET /v1/stats/live` | live statistics: JSON, or a dashboard that refreshes itself when opened in a browser (`?format=html`) |
+| `GET /v1/stats/cache` | prompt-cache analysis: reads, writes and lost prefixes per conversation, keep-warm, idle gaps — JSON or a page (`?format=html`) |
 | `GET /v1/refs` | the ref browser: the fragments recoverable compression stored, searchable, as JSON or a page — off unless `refs.browse = true` |
 | `GET /healthz` `/readyz` `/metrics` | liveness, readiness, Prometheus |
 
@@ -274,10 +275,38 @@ Then open `http://127.0.0.1:8818/` for the dashboard, or ask for JSON:
 curl -s 'http://127.0.0.1:8818/v1/stats/live?window=15m&recent=10'
 ```
 
-The listener serves only the dashboard, the JSON and the probes, and it runs
+`http://127.0.0.1:8818/cache` is the cache analysis (below), and
+`/v1/stats/cache` its JSON.
+
+The listener serves only the dashboard, the cache page, the JSON and the probes, and it runs
 whatever surfaces `serve` was started with — so a proxy-only service has a
 dashboard too. Leave `stats_listen` empty to serve `/v1/stats/live` only on the
 API listener. `KOMPRESSOR__SERVER__STATS_LISTEN` sets it from the environment.
+
+### Analysing the prompt cache
+
+`/cache` on the statistics listener, or `/v1/stats/cache` on the API listener,
+shows what the provider's prompt cache did with the traffic the proxy relayed:
+
+- how much input was read from cache, written to it (five-minute and one-hour
+  entries apart) and sent fresh, and what that cost against no cache at all,
+  in input-equivalent tokens so that no price list is needed;
+- every turn that failed to read back what the previous turn of its
+  conversation left cached, and why: **expiry** when the conversation had idled
+  past the cache lifetime (five minutes, or an hour once it wrote one-hour
+  entries), a **prefix change** when it had not — something rewrote the bytes;
+- the idle gaps before client turns, and how often each length was read back;
+- the keep-warm pings: warm, cold, failed, what they cost, and how many pauses
+  over five minutes they bridged;
+- each conversation, the costliest losses first; click one for its turns.
+
+```bash
+curl -s 'http://127.0.0.1:8818/v1/stats/cache?window=24h&conversations=20'
+curl -s 'http://127.0.0.1:8818/v1/stats/cache?window=24h&conversation=0123456789abcdef'
+```
+
+It reads only counts, like the live view, so it needs no switch beyond
+statistics being on, and the same key.
 
 ### Browsing the ref store
 

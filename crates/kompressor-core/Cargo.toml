@@ -12,6 +12,7 @@ default = ["code-aware"]
 code-aware = ["kompressor-engine/code-aware"]
 
 [dependencies]
+blake2 = { workspace = true }
 kompressor-engine = { path = "../kompressor-engine", default-features = false }
 kompressor-store = { path = "../kompressor-store" }
 kompressor-stats = { path = "../kompressor-stats" }

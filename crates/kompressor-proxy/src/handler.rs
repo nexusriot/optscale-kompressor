@@ -24,7 +24,7 @@ use tracing::Instrument;
 
 use kompressor_core::auth::{Credentials, Identity};
 use kompressor_core::config::{
-    CacheTtl, FrozenPrefix, ProxyConfig, RetrieveExecution, RetrieveTool,
+    CacheTtl, FrozenPrefix, PromptCacheRetention, ProxyConfig, RetrieveExecution, RetrieveTool,
 };
 use kompressor_core::{AppCore, RequestInfo};
 use kompressor_engine::estimate_tokens;
@@ -39,6 +39,7 @@ use crate::bodycodec;
 use crate::failopen::Stage;
 use crate::mode::ProxyMode;
 use crate::prefixcache;
+use crate::retention;
 use crate::retrieve::{Budget, Retriever};
 use crate::stream::{ClientChunk, StreamRelay};
 use crate::upstream::Outbound;
@@ -203,7 +204,7 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
         mode = mode.as_str(),
         "routing"
     );
-    let prepared = prepare(
+    let mut prepared = prepare(
         &state,
         &identity,
         mode,
@@ -215,6 +216,16 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
         upstream.name.as_str(),
     )
     .await;
+    // After every rewrite, so it rides on whatever goes out, compressed or
+    // not, and before the capture, so the capture shows it.
+    let retention = ask_for_retention(
+        &state,
+        family,
+        upstream.name.as_str(),
+        route.origin(),
+        auth_mode.is_subscription(),
+        &mut prepared,
+    );
 
     // The client is back in this conversation, so whatever was keeping its
     // cache warm has done its job. Cancelled before this request is sent, so a
@@ -277,6 +288,7 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
         if let Some(json) = prepared.json.clone() {
             outbound = outbound.with_json(json);
         }
+        outbound = outbound.with_retention(retention).with_started(started);
         if !prepared.stream {
             outbound = outbound.with_timeout(proxy.upstream_read_timeout);
         }
@@ -312,6 +324,7 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
                 // compression itself declined.
                 prepared.prefix,
             )
+            .with_timing(outbound.timing())
         });
     let budget = Budget::new(
         proxy.retrieve_max_rounds,
@@ -328,6 +341,7 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
         // Taken before `outbound` is moved into whichever path sends it.
         outbound.waited(),
     );
+    recorder.timing = Some(outbound.timing());
     recorder.keep_warm = keep_warm;
 
     if prepared.stream {
@@ -359,6 +373,54 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
         )
         .await
     }
+}
+
+/// Ask OpenAI to keep this prompt's cache entry for a day, when
+/// `proxy.prompt_cache_retention = "24h"` and the request is one that field is
+/// known to be understood on. See [`crate::retention`].
+///
+/// Returns what the sender needs to take the field back out should the
+/// upstream refuse it, or `None` when it was not added.
+fn ask_for_retention(
+    state: &ProxyState,
+    family: Option<ApiFamily>,
+    upstream: &str,
+    origin: &str,
+    subscription: bool,
+    prepared: &mut Prepared,
+) -> Option<retention::Guard> {
+    if subscription || !retention::family_supported(family) {
+        return None;
+    }
+    let config = state.core.config_for(family.map(ApiFamily::provider));
+    if config.proxy.prompt_cache_retention != PromptCacheRetention::Extended {
+        return None;
+    }
+    let model = prepared.model.clone()?;
+    if !retention::model_supported(&model)
+        || !retention::upstream_is_openai(upstream, origin)
+        || state.retention.refused(upstream, &model)
+    {
+        return None;
+    }
+    let mut parsed = None;
+    let value = match prepared.json.as_mut() {
+        Some(value) => value,
+        None => parsed.insert(serde_json::from_slice::<Value>(&prepared.body).ok()?),
+    };
+    if !retention::extend(value) {
+        return None;
+    }
+    // As for the Anthropic TTL: re-serializing changes JSON bytes, never the
+    // prompt the provider keys its cache on.
+    prepared.body = Bytes::from(serde_json::to_vec(value).ok()?);
+    tracing::debug!(model = %model, "asked for 24h prompt-cache retention");
+    Some(retention::Guard::new(
+        state.retention.clone(),
+        upstream,
+        &model,
+        config.proxy.max_body_bytes,
+    ))
 }
 
 /// The keep-warm ping this request would leave behind, if its conversation is
@@ -2002,6 +2064,7 @@ async fn stream_response(
         retriever,
         budget,
         buffer_limit: config.proxy.stream_buffer_bytes,
+        hold_ceiling: config.proxy.max_body_bytes,
         buffer_timeout: config.proxy.stream_buffer_timeout,
         intercept_limit: config.proxy.stream_intercept_bytes,
         intercept_timeout: config.proxy.stream_intercept_timeout,
@@ -2105,6 +2168,7 @@ pub(crate) struct Recorder {
     /// Provider wait, accumulated by the `Outbound` this request sends through.
     /// Shared rather than copied so the retrieve loop's extra rounds are in it.
     waited: Arc<AtomicU64>,
+    timing: Option<Arc<std::sync::Mutex<kompressor_stats::context::ProxyTiming>>>,
     /// The keep-warm ping to arm if the response stops on `tool_use`, or on
     /// `end_turn` with a background task running.
     pub(crate) keep_warm: Option<KeepWarmPlan>,
@@ -2128,6 +2192,8 @@ impl Recorder {
         waited: Arc<AtomicU64>,
     ) -> Recorder {
         let event = ProxyRequestEvent {
+            context: None,
+            timing: None,
             time_ms: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_millis() as i64)
@@ -2168,6 +2234,7 @@ impl Recorder {
             core: state.core.clone(),
             event,
             waited,
+            timing: None,
             prefixes: state.prefixes.clone(),
             prefix: prepared.prefix,
             keep_warm: None,
@@ -2217,6 +2284,10 @@ impl Recorder {
         started: Instant,
         error: Option<String>,
     ) {
+        self.event.timing = self
+            .timing
+            .as_ref()
+            .map(|t| t.lock().unwrap_or_else(|e| e.into_inner()).clone());
         self.event.status = status;
         self.event.retrieve_rounds = rounds;
         self.event.retrieve_tokens_injected = injected;
@@ -2636,11 +2707,15 @@ mod tests {
 
         let first = identify(&attempt("a", 0));
         assert_eq!(identify(&attempt("a", 4)), first);
-        // Its opening alone cannot be told apart, and nothing has parted yet.
-        assert_eq!(identify(&attempt("b", 0)), first);
-
-        let second = identify(&attempt("b", 1));
-        assert_ne!(second, first, "a departure is another conversation");
+        // Only the opening of a history eight messages longer: not that
+        // conversation's next turn, so another attempt from its first request.
+        let second = identify(&attempt("b", 0));
+        assert_ne!(second, first, "a fresh attempt is another conversation");
+        assert_eq!(
+            identify(&attempt("b", 1)),
+            second,
+            "and stays one once it parts"
+        );
         for turns in 2..6 {
             assert_eq!(identify(&attempt("b", turns)), second, "turn {turns}");
             assert_eq!(identify(&attempt("a", turns + 4)), first, "turn {turns}");
@@ -2667,8 +2742,50 @@ mod tests {
             identify(&["preamble", "task", "call", "retried", "reminder", "next"]),
             id
         );
-        // A replay of an earlier turn is not a departure either.
-        assert_eq!(identify(&["preamble", "task", "call"]), id);
+        // A replay that stops within the rewrite allowance is not a
+        // departure either.
+        assert_eq!(identify(&["preamble", "task", "call", "retried"]), id);
+    }
+
+    #[test]
+    fn a_fresh_attempt_leaves_the_running_one_its_identity() {
+        // Measured: a second attempt at a Harbor task started while the first
+        // was still working. Filed under the first, its opening request read
+        // as a 15k-token cache loss 52 s after the first's last turn.
+        let tracker = prefixcache::PrefixTracker::new(Duration::ZERO);
+        let identify = |texts: &[&str]| tracker.identify(&prefixcache::identity_chain(texts));
+        let running = ["preamble", "task", "a1", "r1", "a2", "r2", "a3", "r3"];
+        let first = identify(&running[..2]);
+        assert_eq!(identify(&running), first);
+
+        let fresh = identify(&["preamble", "task"]);
+        assert_ne!(fresh, first);
+        // Both carry on, interleaved, each as itself — the earlier one
+        // through a rewrite of its tail too.
+        assert_eq!(identify(&["preamble", "task", "b1", "s1"]), fresh);
+        assert_eq!(identify(&[&running[..], &["a4", "r4"]].concat()), first);
+        assert_eq!(identify(&["preamble", "task", "b1", "s1", "b2"]), fresh);
+        assert_eq!(identify(&[&running[..], &["a4b", "r4b"]].concat()), first);
+
+        // A third attempt is a third conversation.
+        let third = identify(&["preamble", "task"]);
+        assert!(third != first && third != fresh);
+        assert_eq!(identify(&["preamble", "task", "c1", "t1"]), third);
+        assert_eq!(
+            identify(&["preamble", "task", "b1", "s1", "b2", "s2"]),
+            fresh
+        );
+    }
+
+    #[test]
+    fn a_short_history_still_shares_its_opening_until_it_parts() {
+        // Within the rewrite allowance a replay is indistinguishable from a
+        // retry, so the two stay together until a departure.
+        let tracker = prefixcache::PrefixTracker::new(Duration::ZERO);
+        let identify = |texts: &[&str]| tracker.identify(&prefixcache::identity_chain(texts));
+        let first = identify(&["preamble", "task"]);
+        assert_eq!(identify(&["preamble", "task", "a1", "r1"]), first);
+        assert_eq!(identify(&["preamble", "task"]), first);
     }
 
     #[test]

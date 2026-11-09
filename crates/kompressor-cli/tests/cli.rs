@@ -443,6 +443,7 @@ fn stats_database(dir: &Path) -> PathBuf {
 
     // The debit side: without it every report reads as pure profit.
     sink.send(Event::Retrieval(RetrievalEvent {
+        context: None,
         time_ms: 1_700_000_001_000,
         tenant: "acme".to_string(),
         request_id: Some("req-1".to_string()),

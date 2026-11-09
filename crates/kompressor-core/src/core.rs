@@ -78,6 +78,7 @@ fn now_ms() -> i64 {
 
 impl AppCore {
     pub fn new(config: Config, refs: Arc<dyn RefStore>, stats: StatsSink) -> AppCore {
+        let stats = stats.with_context(crate::analysis_context::context(&config));
         let auth = Authenticator::new(config.auth.clone());
         let providers = config
             .proxy
@@ -626,6 +627,7 @@ impl AppCore {
             return;
         }
         self.stats.send(Event::Retrieval(RetrievalEvent {
+            context: None,
             time_ms: now_ms(),
             tenant: identity.tenant.as_str().to_string(),
             request_id: Some(request.request_id.to_string()).filter(|r| !r.is_empty()),
@@ -657,6 +659,7 @@ impl AppCore {
         }
         let returned = result.content.as_deref().unwrap_or("");
         self.stats.send(Event::Retrieval(RetrievalEvent {
+            context: None,
             time_ms,
             tenant: identity.tenant.as_str().to_string(),
             request_id: Some(request.request_id.to_string()).filter(|r| !r.is_empty()),
