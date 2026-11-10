@@ -776,7 +776,8 @@ async fn prepare(
         {
             CacheTtl::Default => false,
             CacheTtl::OneHour => true,
-            CacheTtl::Adaptive => fingerprint.is_some_and(|key| state.prefixes.long_ttl(key)),
+            CacheTtl::Adaptive => identified
+                .is_some_and(|(key, messages)| state.prefixes.long_ttl(key, messages)),
         };
     let mut prepared = prepare_inner(
         state,
