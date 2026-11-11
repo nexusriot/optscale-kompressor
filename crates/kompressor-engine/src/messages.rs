@@ -1076,8 +1076,10 @@ pub fn compress_messages(
         // Read from every handle this message stashed, repeats included: a
         // fragment an earlier message already holds is not in `pairs` again.
         let stashed_here = refs.stashed_since(inline_mark);
-        let tokens_of =
-            |id: &RefId| refs.fragment(*id).map_or(0, |fragment| estimate_tokens(fragment, &role));
+        let tokens_of = |id: &RefId| {
+            refs.fragment(*id)
+                .map_or(0, |fragment| estimate_tokens(fragment, &role))
+        };
         let read_again: Vec<RefId> = if applied.contains(&Kind::StaleRead) {
             Vec::new()
         } else {
@@ -1148,8 +1150,12 @@ pub fn compress_messages(
                     ids.filter(|id| req.keep_inline.contains(id) && !read_again.contains(id))
                         .collect()
                 };
-                let keep_all: Vec<RefId> =
-                    req.keep_inline.iter().chain(read_again.iter()).copied().collect();
+                let keep_all: Vec<RefId> = req
+                    .keep_inline
+                    .iter()
+                    .chain(read_again.iter())
+                    .copied()
+                    .collect();
                 if demanded.iter().all(|id| read_again.contains(id)) {
                     kept_reason = "read_again";
                 }
@@ -2622,7 +2628,12 @@ mod skip_reason_tests {
         functions
             .map(|function| {
                 let body: String = (0..26)
-                    .map(|step| format!("    step_{step} = compute(entries, {})\n", function * 26 + step))
+                    .map(|step| {
+                        format!(
+                            "    step_{step} = compute(entries, {})\n",
+                            function * 26 + step
+                        )
+                    })
                     .collect();
                 format!("def reconcile_{function:02}(entries):\n{body}\n")
             })
@@ -2633,7 +2644,10 @@ mod skip_reason_tests {
     fn shipped(messages: &mut [Message]) -> (Vec<String>, CompressStats) {
         let mut refs = RefCollector::new(1 << 20);
         let stats = compress_messages(messages, &opts(), &RequestOptions::default(), &mut refs);
-        (messages.iter().map(|m| m.content.joined_text()).collect(), stats)
+        (
+            messages.iter().map(|m| m.content.joined_text()).collect(),
+            stats,
+        )
     }
 
     /// A body the model reads a second time ships whole the second time.
@@ -2651,7 +2665,10 @@ mod skip_reason_tests {
         ];
         let (out, stats) = shipped(&mut messages);
 
-        assert!(!out[0].contains("step_0 = compute(entries, 78)"), "the first read stays elided");
+        assert!(
+            !out[0].contains("step_0 = compute(entries, 78)"),
+            "the first read stays elided"
+        );
         assert_eq!(out[2], reconcile(3..5), "the second read ships whole");
         assert_eq!(stats.skipped_by_reason.get("read_again"), Some(&1));
         assert!(
@@ -2672,7 +2689,10 @@ mod skip_reason_tests {
         ];
         let (out, _) = shipped(&mut messages);
 
-        assert!(out[2].contains(&reconcile(3..4)), "reconcile_03 was read before");
+        assert!(
+            out[2].contains(&reconcile(3..4)),
+            "reconcile_03 was read before"
+        );
         assert!(
             !out[2].contains("step_0 = compute(entries, 104)"),
             "reconcile_04 was not, and stays elided"
@@ -2691,12 +2711,19 @@ mod skip_reason_tests {
         ];
         let (first, _) = shipped(&mut opening.clone());
         let mut later = opening;
-        later.push(msg("user", &"a later turn with its own text\n".repeat(4_000)));
+        later.push(msg(
+            "user",
+            &"a later turn with its own text\n".repeat(4_000),
+        ));
         later.push(msg("tool", &reconcile(10..12)));
         let (second, _) = shipped(&mut later);
 
         assert_eq!(second[..3], first[..], "the prefix ships identically");
-        assert_eq!(second[4], reconcile(10..12), "and a third read is also a re-read");
+        assert_eq!(
+            second[4],
+            reconcile(10..12),
+            "and a third read is also a re-read"
+        );
     }
 
     /// A large fragment read twice stays elided: shipping it whole on every
@@ -2704,13 +2731,31 @@ mod skip_reason_tests {
     #[test]
     fn a_large_fragment_read_again_stays_elided() {
         let payload: String = (0..400)
-            .map(|i| format!("2026-01-02T03:04:{:02}Z INFO worker seq={i} value={i}\n", i % 60))
+            .map(|i| {
+                format!(
+                    "2026-01-02T03:04:{:02}Z INFO worker seq={i} value={i}\n",
+                    i % 60
+                )
+            })
             .collect();
-        let mut messages = vec![msg("tool", &payload), msg("user", "again"), msg("tool", &payload)];
+        let mut messages = vec![
+            msg("tool", &payload),
+            msg("user", "again"),
+            msg("tool", &payload),
+        ];
         let mut refs = RefCollector::new(1 << 20);
-        let stats = compress_messages(&mut messages, &opts(), &RequestOptions::default(), &mut refs);
+        let stats = compress_messages(
+            &mut messages,
+            &opts(),
+            &RequestOptions::default(),
+            &mut refs,
+        );
 
-        assert!(refs.pairs().iter().all(|(_, f)| estimate_tokens(f, "tool") > READ_AGAIN_MAX_TOKENS));
+        assert!(
+            refs.pairs()
+                .iter()
+                .all(|(_, f)| estimate_tokens(f, "tool") > READ_AGAIN_MAX_TOKENS)
+        );
         assert!(messages[2].content.joined_text().len() < payload.len());
         assert_eq!(stats.skipped_by_reason.get("read_again"), None);
     }

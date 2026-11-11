@@ -400,6 +400,12 @@ CREATE TABLE daily_analysis_conversations (
  conversation TEXT NOT NULL, PRIMARY KEY(day_ms,tenant,dimension,conversation));
 "#;
 
+// v14: whether a retrieval's range was read as asked, normalized, salvaged, or
+// unusable (the whole fragment went back). NULL when no range was asked for.
+const V14: &str = r#"
+ALTER TABLE retrieval_events ADD COLUMN range_status TEXT;
+"#;
+
 pub const MIGRATIONS: &[(u32, &str)] = &[
     (1, V1),
     (2, V2),
@@ -414,6 +420,7 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
     (11, V11),
     (12, V12),
     (13, V13),
+    (14, V14),
 ];
 
 /// The version a freshly migrated database reports in `PRAGMA user_version`.
