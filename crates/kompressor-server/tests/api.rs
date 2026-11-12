@@ -1695,6 +1695,7 @@ async fn analysis_joins_events_and_preserves_fixed_window_accounting() {
             returned_chars: returned * 4,
             returned_tokens: returned as u32,
             withheld,
+            range_status: None,
         }));
     }
     // Exclusive end: this row must not enter this report.

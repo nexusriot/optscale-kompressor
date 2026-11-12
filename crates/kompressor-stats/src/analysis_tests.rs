@@ -100,6 +100,7 @@ fn retrieval(
         returned_chars: if found { 2000 } else { 0 },
         returned_tokens: if found { 500 } else { 0 },
         withheld,
+        range_status: None,
     })
 }
 #[test]
@@ -328,7 +329,10 @@ fn a_real_v12_database_upgrades_without_inventing_provenance() {
       VALUES(1700006400001,'a','old','openai_chat','old-model','https://example.invalid',0,1000,100);").unwrap();
     drop(conn);
     let mut writer = StatsWriter::open(&StatsConfig::at(&path)).unwrap();
-    assert_eq!(crate::schema::apply(writer.connection()).unwrap(), 13);
+    assert_eq!(
+        crate::schema::apply(writer.connection()).unwrap(),
+        crate::schema::latest_version()
+    );
     let reader = StatsReader::open(&path).unwrap();
     let raw = reader
         .history("a", T, T + DAY, &HistoryFilter::default())

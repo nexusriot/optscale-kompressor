@@ -702,6 +702,7 @@ mod tests {
             returned_chars: u64::from(tokens) * 4,
             returned_tokens: tokens,
             withheld: false,
+            range_status: None,
         })
     }
 

@@ -189,6 +189,7 @@ mod tests {
             returned_chars: u64::from(returned_tokens) * 4,
             returned_tokens,
             withheld: false,
+            range_status: None,
         })
     }
 
@@ -1080,6 +1081,7 @@ mod tests {
                      ALTER TABLE proxy_requests DROP COLUMN analysis_archived;
                      ALTER TABLE optimization_events DROP COLUMN analysis_archived;
                      ALTER TABLE retrieval_events DROP COLUMN analysis_archived;
+                     ALTER TABLE retrieval_events DROP COLUMN range_status;
                      PRAGMA user_version = 5;",
                 )
                 .unwrap();
@@ -1132,6 +1134,7 @@ mod tests {
                      ALTER TABLE proxy_requests DROP COLUMN analysis_archived;
                      ALTER TABLE optimization_events DROP COLUMN analysis_archived;
                      ALTER TABLE retrieval_events DROP COLUMN analysis_archived;
+                     ALTER TABLE retrieval_events DROP COLUMN range_status;
                      PRAGMA user_version = 5;",
                 )
                 .unwrap();

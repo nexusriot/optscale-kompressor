@@ -347,8 +347,8 @@ fn insert_retrieval(conn: &Connection, e: &RetrievalEvent) -> Result<(), StatsEr
         "INSERT INTO retrieval_events (
             time_ms, tenant, request_id, surface, \"ref\", found, expired, ranged,
             fragment_bytes, fragment_chars, fragment_tokens, returned_chars, returned_tokens,
-            withheld, context_json)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+            withheld, context_json, range_status)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
     )?
     .execute(params![
         e.time_ms,
@@ -366,6 +366,7 @@ fn insert_retrieval(conn: &Connection, e: &RetrievalEvent) -> Result<(), StatsEr
         i64::from(e.returned_tokens),
         i64::from(e.withheld),
         e.context.as_ref().map(serde_json::to_string).transpose()?,
+        e.range_status,
     ])?;
     Ok(())
 }

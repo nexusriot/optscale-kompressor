@@ -9,6 +9,7 @@
 //! all: a provider that answered is always relayed, status and body, exactly as
 //! it answered.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -25,6 +26,7 @@ use tracing::Instrument;
 use kompressor_core::auth::{Credentials, Identity};
 use kompressor_core::config::{
     CacheTtl, FrozenPrefix, PromptCacheRetention, ProxyConfig, RetrieveExecution, RetrieveTool,
+    Upstream,
 };
 use kompressor_core::{AppCore, RequestInfo};
 use kompressor_engine::estimate_tokens;
@@ -37,6 +39,7 @@ use kompressor_wire::{ApiFamily, Walk, detect_family, walker_for};
 use crate::bodycapture;
 use crate::bodycodec;
 use crate::failopen::Stage;
+use crate::intercept::InterceptedOrigin;
 use crate::mode::ProxyMode;
 use crate::prefixcache;
 use crate::retention;
@@ -66,16 +69,33 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
     let config = state.core.config();
     let proxy = &config.proxy;
 
-    let Some(upstream) = route::match_upstream(proxy, parts.uri.path()) else {
-        return error_response(
-            StatusCode::NOT_FOUND,
-            "no upstream is configured for this path",
-            &request_id,
-        );
-    };
     // Classified before routing, not just before header policy: under a
     // subscription the same path belongs to a different host.
     let auth_mode = crate::authmode::classify(&parts.headers);
+    // A request the intercept decrypted already named its host, and is kept
+    // on it; one sent to this listener directly is routed by path alone. See
+    // `route::match_upstream_for_origin` for what path-only routing did to an
+    // intercepted request.
+    let matched = match parts.extensions.get::<InterceptedOrigin>() {
+        Some(origin) => route::match_upstream_for_origin(
+            proxy,
+            &origin.host,
+            origin.port,
+            parts.uri.path(),
+            auth_mode.is_subscription(),
+        ),
+        None => match route::match_upstream(proxy, parts.uri.path()) {
+            Some(upstream) => Cow::Borrowed(upstream),
+            None => {
+                return error_response(
+                    StatusCode::NOT_FOUND,
+                    "no upstream is configured for this path",
+                    &request_id,
+                );
+            }
+        },
+    };
+    let upstream: &Upstream = &matched;
     let route = route::route_for(
         upstream,
         parts.uri.path(),
@@ -731,10 +751,20 @@ fn prefix_identity(
     let fingerprint = state
         .prefixes
         .identify(&prefixcache::identity_chain_in_scope(&refs, &scope))?;
+    // The same history with the model left out, so that a conversation the
+    // client moves to another model is recognised as one this proxy carried;
+    // see `PrefixTracker::floor_for`.
+    let lineage =
+        prefixcache::lineage_key(&refs, identity.tenant.as_str(), provider, family.as_str());
     // Recorded whatever the setting says, so that turning `frozen_prefix` on
     // mid-session finds a watermark describing what the client established
     // rather than whatever this turn happens to mark.
-    state.prefixes.floor(fingerprint, walk.frozen_message_count);
+    state.prefixes.floor_for(
+        fingerprint,
+        walk.frozen_message_count,
+        lineage,
+        walk.model.as_deref().unwrap_or(""),
+    );
     let messages = value
         .get("messages")
         .and_then(Value::as_array)
@@ -776,7 +806,9 @@ async fn prepare(
         {
             CacheTtl::Default => false,
             CacheTtl::OneHour => true,
-            CacheTtl::Adaptive => fingerprint.is_some_and(|key| state.prefixes.long_ttl(key)),
+            CacheTtl::Adaptive => {
+                identified.is_some_and(|(key, messages)| state.prefixes.long_ttl(key, messages))
+            }
         };
     let mut prepared = prepare_inner(
         state,
@@ -1310,13 +1342,54 @@ pub(crate) async fn compress_with_deadline(
     let model = model.map(str::to_string);
     let provider = provider.to_string();
 
-    // Computation only. A `spawn_blocking` task cannot be cancelled, so when
-    // the deadline below wins this one still runs to completion — and until
-    // publication moved out of it, that abandoned task retained fragments
-    // nothing could fetch, filed savings for an output never forwarded, and
-    // promoted handles that rewrote later prompts. Everything it produces now
-    // lives in the `Computed` it returns, which the timeout arm simply drops.
+    // Everything below shares one deadline: waiting for a permit, waiting
+    // for a blocking thread, computing, and retaining in the store. The
+    // timeout used to cover the computation alone, after which `publish` ran
+    // its SQLite write on this async worker — a store behind its 5-second busy
+    // timeout then held the worker, the unrelated streams sharing it, and the
+    // very timers meant to bound it. (2026-11-11 review, F1.)
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    // Admission. Without it every request spawned its own blocking task, and
+    // a timed-out task is not cancelled: a burst of large histories queued
+    // and ran without limit, each holding a full copy of its messages after
+    // its caller had already fallen open. The permit is shared with the API
+    // and MCP surfaces, and saturation is a fail-open like any other: the
+    // request goes upstream as it arrived. (F2.)
+    let permit =
+        match tokio::time::timeout_at(deadline, state.core.engine_slots().clone().acquire_owned())
+            .await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(closed)) => {
+                state.failopen.record(Stage::Admission, &closed);
+                return None;
+            }
+            Err(_) => {
+                state.failopen.record(
+                    Stage::Admission,
+                    &"every engine permit was busy until the compression deadline",
+                );
+                return None;
+            }
+        };
+
+    // Compute and retain. A `spawn_blocking` task cannot be cancelled, so when
+    // the deadline below wins this one still runs to completion. What it can
+    // leave behind is bounded to fragments in the store that no forwarded
+    // request names — content-addressed, re-used or expired like any other.
+    // The saving, the optimization event and the promotion state are filed
+    // only after the race is decided, by `file` below, so an abandoned result
+    // still records nothing: it filed savings for an output never forwarded
+    // and promoted handles that rewrote later prompts before that split.
     let work = move || {
+        // Held until the work ends, not until the caller stops waiting.
+        let _permit = permit;
+        // A blocking pool with every thread busy can start this long after it
+        // was submitted. Nobody is waiting for it any more; do nothing.
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
         let mut messages = messages;
         let computed = core.compress_only(
             &mut messages,
@@ -1330,20 +1403,29 @@ pub(crate) async fn compress_with_deadline(
             outside_tokens,
             cache_pricing,
         );
-        (
-            core, identity, options, request_id, model, provider, messages, computed,
-        )
+        let retained = core.retain(&identity, computed, &request_id, &options);
+        Some((
+            core, identity, options, request_id, model, provider, messages, retained,
+        ))
     };
 
-    match tokio::time::timeout(timeout, tokio::task::spawn_blocking(work)).await {
-        Ok(Ok((core, identity, options, request_id, model, provider, mut messages, computed))) => {
-            // Published only now that the race is decided, so nothing a
-            // timeout discarded can reach the store, the stats or the
-            // promotion state.
-            let outcome = core.publish(
+    match tokio::time::timeout_at(deadline, tokio::task::spawn_blocking(work)).await {
+        Ok(Ok(Some((
+            core,
+            identity,
+            options,
+            request_id,
+            model,
+            provider,
+            mut messages,
+            retained,
+        )))) => {
+            // The commit point: nothing a timeout discarded reaches the stats
+            // or the promotion state. Filing does not block.
+            let outcome = core.file(
                 &identity,
                 &mut messages,
-                computed,
+                retained,
                 &RequestInfo {
                     request_id: &request_id,
                     api_family: Some(family.as_str()),
@@ -1363,6 +1445,16 @@ pub(crate) async fn compress_with_deadline(
                 .tokens_in
                 .saturating_sub(outcome.stats.tokens_out);
             Some((messages, saved))
+        }
+        // Queued past the deadline: the closure declined to start. A deadline
+        // that ran out is a timeout wherever it ran out, so it is counted with
+        // the others; `admission` is kept for a permit that never came free.
+        Ok(Ok(None)) => {
+            state.failopen.record(
+                Stage::Compress,
+                &"the compression deadline passed before the engine task started",
+            );
+            None
         }
         // a panicked engine is a fail-open, not a 500: the invariant is that
         // compression subtracts tokens, never availability
@@ -1946,6 +2038,7 @@ async fn buffered_response(
     mode: ProxyMode,
     started: Instant,
 ) -> Response {
+    let path = outbound.path();
     let relayed = match nonstream::run(
         outbound,
         family,
@@ -1957,6 +2050,7 @@ async fn buffered_response(
     {
         Ok(relayed) => relayed,
         Err(error) => {
+            tracing::warn!(request_id = %request_id, %path, %error, "the upstream could not be reached; answered 502");
             recorder.finish(None, 0, 0, None, started, Some(error.to_string()));
             return error_response(
                 StatusCode::BAD_GATEWAY,
@@ -1966,6 +2060,7 @@ async fn buffered_response(
         }
     };
 
+    log_upstream_status(relayed.status, &request_id, &path);
     let mut response_headers = headers::client_headers(&relayed.headers);
     headers::annotate(
         &mut response_headers,
@@ -2008,9 +2103,11 @@ async fn stream_response(
     mode: ProxyMode,
     started: Instant,
 ) -> Response {
+    let path = outbound.path();
     let upstream = match outbound.send().await {
         Ok(response) => response,
         Err(error) => {
+            tracing::warn!(request_id = %request_id, %path, %error, "the upstream could not be reached; answered 502");
             recorder.finish(None, 0, 0, None, started, Some(error.to_string()));
             return error_response(
                 StatusCode::BAD_GATEWAY,
@@ -2021,6 +2118,7 @@ async fn stream_response(
     };
 
     let status = upstream.status();
+    log_upstream_status(status, &request_id, &path);
     let mut response_headers = headers::client_headers(upstream.headers());
     // Rounds are reported as zero on a streamed response and cannot be
     // anything else: the headers go out before the first frame arrives, and a
@@ -2135,6 +2233,21 @@ fn is_event_stream(headers: &HeaderMap, asked_for_stream: bool) -> bool {
     {
         Some(value) => value.contains("event-stream"),
         None => asked_for_stream,
+    }
+}
+
+/// Say when the provider refused a request, at a level the default log keeps.
+///
+/// Refusals are relayed untouched, which is right, but they used to leave no
+/// line at all: a client reporting "authentication failed" pointed at a log
+/// showing nothing, and the log could not say whether the 401 came from the
+/// provider or the request never arrived. The request id joins this line to
+/// the stats row.
+fn log_upstream_status(status: StatusCode, request_id: &str, path: &str) {
+    if status.is_server_error() {
+        tracing::warn!(request_id = %request_id, %path, status = status.as_u16(), "the upstream answered with an error");
+    } else if status.is_client_error() {
+        tracing::info!(request_id = %request_id, %path, status = status.as_u16(), "the upstream refused the request");
     }
 }
 
