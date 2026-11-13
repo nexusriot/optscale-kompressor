@@ -1278,7 +1278,7 @@ dependencies = [
 
 [[package]]
 name = "kompressor-bench"
-version = "2.0.9"
+version = "2.0.10"
 dependencies = [
  "flate2",
  "kompressor-engine",
@@ -1290,7 +1290,7 @@ dependencies = [
 
 [[package]]
 name = "kompressor-cli"
-version = "2.0.9"
+version = "2.0.10"
 dependencies = [
  "assert_cmd",
  "axum",
@@ -1318,7 +1318,7 @@ dependencies = [
 
 [[package]]
 name = "kompressor-core"
-version = "2.0.9"
+version = "2.0.10"
 dependencies = [
  "blake2",
  "humantime-serde",
@@ -1337,7 +1337,7 @@ dependencies = [
 
 [[package]]
 name = "kompressor-engine"
-version = "2.0.9"
+version = "2.0.10"
 dependencies = [
  "base64 0.23.1",
  "blake2",
@@ -1363,7 +1363,7 @@ dependencies = [
 
 [[package]]
 name = "kompressor-mcp"
-version = "2.0.9"
+version = "2.0.10"
 dependencies = [
  "anyhow",
  "axum",
@@ -1387,7 +1387,7 @@ dependencies = [
 
 [[package]]
 name = "kompressor-proxy"
-version = "2.0.9"
+version = "2.0.10"
 dependencies = [
  "axum",
  "bytes",
@@ -1422,7 +1422,7 @@ dependencies = [
 
 [[package]]
 name = "kompressor-server"
-version = "2.0.9"
+version = "2.0.10"
 dependencies = [
  "axum",
  "bytes",
@@ -1446,7 +1446,7 @@ dependencies = [
 
 [[package]]
 name = "kompressor-stats"
-version = "2.0.9"
+version = "2.0.10"
 dependencies = [
  "humantime-serde",
  "kompressor-engine",
@@ -1460,7 +1460,7 @@ dependencies = [
 
 [[package]]
 name = "kompressor-store"
-version = "2.0.9"
+version = "2.0.10"
 dependencies = [
  "kompressor-engine",
  "parking_lot",
@@ -1472,7 +1472,7 @@ dependencies = [
 
 [[package]]
 name = "kompressor-wire"
-version = "2.0.9"
+version = "2.0.10"
 dependencies = [
  "kompressor-engine",
  "serde_json",
