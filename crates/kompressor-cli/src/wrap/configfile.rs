@@ -30,7 +30,9 @@
 
 use std::path::{Path, PathBuf};
 
-use super::settings::{Claim, Holder, Lock, Released, read_owners, sibling, sweep, write_owners};
+use super::settings::{
+    Claim, Holder, Lock, Released, clear, let_go, read_owners, sibling, sweep, write_owners,
+};
 use crate::error::CliError;
 
 /// The marker opening a block this command owns.
@@ -76,12 +78,14 @@ pub struct Table {
 
 /// How a codex install authenticates.
 ///
-/// This decides what may be written, not merely what is convenient: the two
-/// modes need *different* blocks, and the block for one breaks the other.
+/// This decides how codex is pointed at the proxy: a ChatGPT login by a flag,
+/// an API key by a block in its config file. See [`Target::codex_flags`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CodexAuth {
-    /// `codex login --with-api-key`. The key is in the environment.
+    /// A key in `OPENAI_API_KEY`, and no login.
     ApiKey,
+    /// `codex login --with-api-key`: the key is in `auth.json`.
+    StoredApiKey,
     /// A ChatGPT plan. There is no API key anywhere.
     Subscription,
 }
@@ -105,6 +109,7 @@ fn codex_auth(home: &Path) -> CodexAuth {
     };
     match value.get("auth_mode").and_then(serde_json::Value::as_str) {
         Some("chatgpt") => CodexAuth::Subscription,
+        Some("apikey") => CodexAuth::StoredApiKey,
         _ => CodexAuth::ApiKey,
     }
 }
@@ -116,57 +121,58 @@ impl Target {
         Target::codex_for(port, &home, codex_auth(&home))
     }
 
-    /// The codex target for a given home and auth mode.
+    /// The codex target in a given home: the block for an API-key login.
     ///
-    /// # Why the two modes get different blocks
+    /// A custom provider, because it is the only place
+    /// `supports_websockets = false` can be set. That keeps the session on
+    /// HTTP, where the proxy counts its tokens; a relayed WebSocket goes
+    /// uncounted, which an API key, billed per token, cannot afford. A ChatGPT
+    /// login is never given
+    /// this block: `model_provider` is honoured under a plan, and the
+    /// `env_key` it declares makes codex refuse the session with `Missing
+    /// environment variable: OPENAI_API_KEY`. Measured on codex 0.155.1.
     ///
-    /// Measured on codex 0.155.1, against both a live ChatGPT plan and an
-    /// API-key login:
-    ///
-    /// * **API key.** A custom provider is the good answer. It is the only
-    ///   place `supports_websockets = false` can be set, and without that codex
-    ///   spends five refused handshakes — about 13 seconds — on the first
-    ///   request of every session before falling back to HTTP.
-    ///
-    /// * **Subscription.** The same block is fatal. `model_provider` *is*
-    ///   honoured under a ChatGPT plan — which contradicts the obvious reading,
-    ///   and is why this was measured rather than assumed — so codex selects
-    ///   our provider, finds the `env_key` it declares, and refuses the session
-    ///   with `Missing environment variable: OPENAI_API_KEY` before sending
-    ///   anything. So a subscription install gets `openai_base_url` alone: it
-    ///   overrides the built-in provider's URL and leaves the ChatGPT
-    ///   credential on the path that already carries it.
-    ///
-    /// The subscription path therefore cannot suppress the WebSocket attempt —
-    /// there is no top-level key for it — and pays the handshake. That is a
-    /// real cost and it is recorded in docs/CODEX.md rather than hidden.
+    /// `env_key` reads only the environment and `requires_openai_auth` only
+    /// the stored login; given both, `env_key` wins. Measured on codex 0.164.0.
     pub fn codex_for(port: u16, home: &Path, auth: CodexAuth) -> Target {
-        let base = format!("http://127.0.0.1:{port}/v1");
-        let path = home.join("config.toml");
-        match auth {
-            CodexAuth::Subscription => Target {
-                path,
-                head: vec![("openai_base_url".into(), quoted(&base))],
-                tables: Vec::new(),
-            },
-            CodexAuth::ApiKey => Target {
-                path,
-                head: vec![
-                    ("model_provider".into(), quoted("kompressor")),
-                    ("openai_base_url".into(), quoted(&base)),
+        let base = proxy_base(port);
+        let key = match auth {
+            CodexAuth::StoredApiKey => ("requires_openai_auth".into(), "true".into()),
+            CodexAuth::ApiKey | CodexAuth::Subscription => {
+                ("env_key".into(), quoted("OPENAI_API_KEY"))
+            }
+        };
+        Target {
+            path: home.join("config.toml"),
+            head: vec![
+                ("model_provider".into(), quoted("kompressor")),
+                ("openai_base_url".into(), quoted(&base)),
+            ],
+            tables: vec![Table {
+                name: "model_providers.kompressor".into(),
+                entries: vec![
+                    ("name".into(), quoted("OpenAI via kompressor")),
+                    ("base_url".into(), quoted(&base)),
+                    ("wire_api".into(), quoted("responses")),
+                    key,
+                    ("supports_websockets".into(), "false".into()),
                 ],
-                tables: vec![Table {
-                    name: "model_providers.kompressor".into(),
-                    entries: vec![
-                        ("name".into(), quoted("OpenAI via kompressor")),
-                        ("base_url".into(), quoted(&base)),
-                        ("wire_api".into(), quoted("responses")),
-                        ("env_key".into(), quoted("OPENAI_API_KEY")),
-                        ("supports_websockets".into(), "false".into()),
-                    ],
-                }],
-            },
+            }],
         }
+    }
+
+    /// Flags that point codex at the proxy instead of a block in this file,
+    /// for a ChatGPT login; `None` under an API key, which keeps the file.
+    ///
+    /// Measured on codex 0.164.0 with a ChatGPT login: `openai_base_url` set
+    /// in the config file makes codex send an API key (`sk-…`) of its own in
+    /// place of the plan's token, and api.openai.com refuses that key for the
+    /// Responses API — `401 … Missing scopes: api.responses.write`. The same
+    /// key given as `-c` keeps the plan's token and `chatgpt-account-id`,
+    /// which the proxy routes to chatgpt.com. A flag also leaves the file
+    /// alone, so the Codex desktop app, which reads it too, is not redirected.
+    pub fn codex_flags(port: u16) -> Option<Vec<String>> {
+        codex_flags_for(port, codex_auth(&codex_home()))
     }
 
     fn owners_path(&self) -> PathBuf {
@@ -177,31 +183,31 @@ impl Target {
         sibling(&self.path, ".kompressor-wrap.lock")
     }
 
-    /// The text of the two blocks, head first.
-    fn render(&self) -> (String, String) {
+    /// The text of the two blocks, head first, with `eol` ending each line.
+    fn render(&self, eol: &str) -> (String, String) {
         let mut head = String::new();
         if !self.head.is_empty() {
             head.push_str(BEGIN);
-            head.push('\n');
+            head.push_str(eol);
             for (key, value) in &self.head {
-                head.push_str(&format!("{key} = {value}\n"));
+                head.push_str(&format!("{key} = {value}{eol}"));
             }
             head.push_str(END);
-            head.push('\n');
+            head.push_str(eol);
         }
 
         let mut foot = String::new();
         if !self.tables.is_empty() {
             foot.push_str(BEGIN);
-            foot.push('\n');
+            foot.push_str(eol);
             for table in &self.tables {
-                foot.push_str(&format!("[{}]\n", table.name));
+                foot.push_str(&format!("[{}]{eol}", table.name));
                 for (key, value) in &table.entries {
-                    foot.push_str(&format!("{key} = {value}\n"));
+                    foot.push_str(&format!("{key} = {value}{eol}"));
                 }
             }
             foot.push_str(END);
-            foot.push('\n');
+            foot.push_str(eol);
         }
         (head, foot)
     }
@@ -245,7 +251,13 @@ impl Target {
         if keys.is_empty() && tables.is_empty() {
             return body.to_string();
         }
-        let lines: Vec<&str> = body.lines().collect();
+        // Each physical line keeps its own ending, so a CRLF file stays CRLF;
+        // `statements` reads the text without them.
+        let physical: Vec<&str> = body.split_inclusive('\n').collect();
+        let lines: Vec<&str> = physical
+            .iter()
+            .map(|line| line.trim_end_matches('\n').trim_end_matches('\r'))
+            .collect();
         let mut out = String::with_capacity(body.len());
         let mut in_tables = false;
         let mut in_ours = false;
@@ -262,32 +274,59 @@ impl Target {
             } else {
                 keys.iter().any(|key| assigns(first, key))
             };
-            for line in &lines[start..end] {
+            for line in &physical[start..end] {
                 if disable {
                     out.push_str(DISABLED);
                 }
                 out.push_str(line);
-                out.push('\n');
             }
-        }
-        if !body.ends_with('\n') {
-            out.pop();
         }
         out
     }
 }
 
-/// Codex's configuration directory.
-fn codex_home() -> PathBuf {
-    std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".codex"))
+/// [`Target::codex_flags`] for a given auth mode.
+fn codex_flags_for(port: u16, auth: CodexAuth) -> Option<Vec<String>> {
+    (auth == CodexAuth::Subscription).then(|| {
+        vec![
+            "-c".into(),
+            format!("openai_base_url={}", quoted(&proxy_base(port))),
+        ]
+    })
 }
 
-fn home() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
+/// The proxy's OpenAI-style base URL, which codex appends `/responses` to.
+fn proxy_base(port: u16) -> String {
+    super::agents::Endpoint::V1.url(port)
+}
+
+/// Codex's configuration directory.
+fn codex_home() -> PathBuf {
+    codex_home_in(|name| std::env::var_os(name))
+}
+
+/// [`codex_home`] against a given environment, so a test can pass one without
+/// mutating the process's own.
+///
+/// The home directory is found the way Codex finds it: `HOME` on Unix, the
+/// user profile on Windows. PowerShell and cmd do not set `HOME` at all, and
+/// reading only that sent `wrap codex` to `.\.codex\config.toml` in whatever
+/// directory it was run from — a file Codex never reads, so the session
+/// compressed nothing while reporting that the config pointed at the proxy.
+/// Where Git Bash does set `HOME`, it names the profile anyway.
+fn codex_home_in(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> PathBuf {
+    let set = |name: &str| env(name).filter(|value| !value.is_empty());
+    if let Some(explicit) = set("CODEX_HOME") {
+        return PathBuf::from(explicit);
+    }
+    let home = if cfg!(windows) {
+        set("USERPROFILE").or_else(|| set("HOME"))
+    } else {
+        set("HOME")
+    };
+    home.map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
+        .join(".codex")
 }
 
 /// A TOML string literal.
@@ -402,17 +441,21 @@ fn reinstate(content: &str) -> String {
         return content.to_string();
     }
     let mut out = String::with_capacity(content.len());
-    for line in content.lines() {
-        match line.strip_prefix(DISABLED) {
-            Some(rest) => out.push_str(rest),
-            None => out.push_str(line),
-        }
-        out.push('\n');
-    }
-    if !content.ends_with('\n') {
-        out.pop();
+    for line in content.split_inclusive('\n') {
+        out.push_str(line.strip_prefix(DISABLED).unwrap_or(line));
     }
     out
+}
+
+/// The line ending `content` uses: CRLF if it has any, as a file saved on
+/// Windows does, else LF. Our blocks are written with it, so the file does
+/// not end up with two.
+fn line_ending(content: &str) -> &'static str {
+    if content.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    }
 }
 
 /// Remove every block this command owns, leaving the rest untouched.
@@ -429,7 +472,11 @@ fn strip_blocks(content: &str) -> String {
         };
         let end = start + end_rel + END.len();
         out.push_str(&rest[..start]);
-        rest = rest[end..].strip_prefix('\n').unwrap_or(&rest[end..]);
+        let after = &rest[end..];
+        rest = after
+            .strip_prefix("\r\n")
+            .or_else(|| after.strip_prefix('\n'))
+            .unwrap_or(after);
     }
     out.push_str(rest);
     out
@@ -445,14 +492,23 @@ pub enum Claimed {
 }
 
 /// Inject the block, recording this process as an owner.
-pub fn claim(target: &Target, port: u16) -> Result<Claimed, CliError> {
-    let _lock = Lock::acquire(target.lock_path());
+pub fn claim(target: &Target) -> Result<Claimed, CliError> {
+    let _lock = Lock::acquire(target.lock_path())?;
     let owners_path = target.owners_path();
     let mut owners = read_owners(&owners_path);
 
-    let current = std::fs::read_to_string(&target.path).unwrap_or_default();
+    let mut claim = owners.keys.remove(CLAIM_KEY).unwrap_or_default();
+    let had_holders = !claim.holders.is_empty();
+    sweep(&mut claim, &owners_path);
+    if had_holders && claim.holders.is_empty() {
+        restore(target, &claim)?;
+    }
+    let current = match std::fs::read_to_string(&target.path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(CliError::runtime("could not read configuration", error)),
+    };
     let existed = target.path.exists();
-
     // The edit is textual, so it is checked the one way that matters: a file
     // codex could load before must still load after. A shape the override
     // does not understand is refused with the file untouched, rather than
@@ -476,7 +532,7 @@ pub fn claim(target: &Target, port: u16) -> Result<Claimed, CliError> {
     // remember to put it back. Say what was done, and undo it on release.
     let collisions = target.collisions(&current);
     if !collisions.is_empty() {
-        eprintln!(
+        say!(
             "kompressor: {} already sets {} — commented out for this session, \
              restored on exit",
             target.path.display(),
@@ -484,15 +540,13 @@ pub fn claim(target: &Target, port: u16) -> Result<Claimed, CliError> {
         );
     }
 
-    let mut claim = owners.keys.remove(CLAIM_KEY).unwrap_or_default();
-    sweep(&mut claim, &owners_path);
     // Recorded once, by the first live claimant: a later session must restore
     // what was there before any of us, not the injected state it walked in on.
     if claim.holders.is_empty() {
-        claim.original = existed.then(|| current.clone());
+        claim.original = existed.then(|| reinstate(&strip_blocks(&current)));
     }
     claim.holders.retain(|h| h.pid != std::process::id());
-    claim.holders.push(Holder::me(Some(port)));
+    claim.holders.push(Holder::me(&target.path));
 
     let changed = next != current;
     if changed {
@@ -519,19 +573,56 @@ pub fn claim(target: &Target, port: u16) -> Result<Claimed, CliError> {
 /// `force` is `unwrap`: every claim is dropped and the file restored whoever
 /// else is running, because the user is asking for their config back.
 pub fn release(target: &Target, force: bool) -> Result<Released, CliError> {
-    let _lock = Lock::acquire(target.lock_path());
+    release_as(
+        target,
+        if force {
+            Release::Unwrap
+        } else {
+            Release::Session
+        },
+    )
+}
+
+/// Remove a block that no live session holds, and leave one that is held.
+///
+/// For a ChatGPT login, which is pointed at the proxy with a flag and so never
+/// claims the file: a block left there by a session that was killed still
+/// points codex, and the Codex app, at a port nothing listens on, and a file
+/// key is what makes a ChatGPT login send an API key in the first place.
+pub fn clear_stale(target: &Target) -> Result<Released, CliError> {
+    release_as(target, Release::Stale)
+}
+
+/// Whose claims a release drops.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Release {
+    /// This session's, as it ends.
+    Session,
+    /// Everyone's, and a block no claim records: `unwrap`.
+    Unwrap,
+    /// Only the dead's, and a block no claim records.
+    Stale,
+}
+
+fn release_as(target: &Target, how: Release) -> Result<Released, CliError> {
+    let _lock = Lock::acquire(target.lock_path())?;
     let owners_path = target.owners_path();
     let mut owners = read_owners(&owners_path);
+    if how != Release::Stale {
+        // This process's claim ends here whichever way the release goes,
+        // including when an `unwrap` has already dropped it.
+        let_go(&target.path);
+    }
     let Some(mut claim) = owners.keys.remove(CLAIM_KEY) else {
         // No claim recorded, but a block may still be there from a session
         // that was killed. Removing it is the repair `unwrap` exists for.
-        return strip_orphan(target, force);
+        return strip_orphan(target, how != Release::Session);
     };
     sweep(&mut claim, &owners_path);
-    if force {
-        claim.holders.clear();
-    } else {
-        claim.holders.retain(|h| h.pid != std::process::id());
+    match how {
+        Release::Session => claim.holders.retain(|h| h.pid != std::process::id()),
+        Release::Unwrap => clear(&mut claim),
+        Release::Stale => {}
     }
     if !claim.holders.is_empty() {
         owners.keys.insert(CLAIM_KEY.to_string(), claim);
@@ -545,22 +636,26 @@ pub fn release(target: &Target, force: bool) -> Result<Released, CliError> {
 }
 
 fn injected_content(target: &Target, current: &str) -> String {
-    let (head, foot) = target.render();
+    let eol = line_ending(current);
+    let (head, foot) = target.render(eol);
     let body = target.disable_collisions(&strip_blocks(current));
+    // Nothing outside the markers is changed: no blank line trimmed after the
+    // head, none added before the foot. `strip_blocks` removes exactly what is
+    // between the markers, so whatever is added out here stays behind whenever
+    // a file is cleaned without the original to hand: after a crash, under
+    // `unwrap`, or once the user has edited the file mid-session. The `BEGIN`
+    // comment already sets each block apart.
     let mut next = String::new();
     next.push_str(&head);
     if !body.trim().is_empty() {
-        next.push_str(body.trim_start_matches('\n'));
-        if !next.ends_with('\n') {
-            next.push('\n');
+        next.push_str(&body);
+        // The one exception: a file with no final newline gets one, or the
+        // foot's `BEGIN` would land on the user's last line.
+        if !foot.is_empty() && !next.ends_with('\n') {
+            next.push_str(eol);
         }
     }
-    if !foot.is_empty() {
-        if !next.is_empty() && !next.ends_with("\n\n") {
-            next.push('\n');
-        }
-        next.push_str(&foot);
-    }
+    next.push_str(&foot);
 
     next
 }
@@ -598,8 +693,8 @@ fn restore(target: &Target, claim: &Claim) -> Result<(), CliError> {
 }
 
 /// Strip a block left behind by a session that never got to clean up.
-fn strip_orphan(target: &Target, force: bool) -> Result<Released, CliError> {
-    if !force {
+fn strip_orphan(target: &Target, orphans: bool) -> Result<Released, CliError> {
+    if !orphans {
         return Ok(Released::NotOurs);
     }
     let Ok(current) = std::fs::read_to_string(&target.path) else {
@@ -632,9 +727,6 @@ mod tests {
         fn target(&self, port: u16) -> Target {
             Target::codex_for(port, &self.0, CodexAuth::ApiKey)
         }
-        fn subscription_target(&self, port: u16) -> Target {
-            Target::codex_for(port, &self.0, CodexAuth::Subscription)
-        }
         fn write_auth(&self, mode: &str) {
             std::fs::write(
                 self.0.join("auth.json"),
@@ -655,12 +747,124 @@ mod tests {
         }
     }
 
+    /// An environment holding exactly `vars`.
+    fn env_of(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<std::ffi::OsString> {
+        let vars: Vec<(String, String)> = vars
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |name| vars.iter().find(|(k, _)| k == name).map(|(_, v)| v.into())
+    }
+
+    #[test]
+    fn codex_home_is_honoured_over_everything() {
+        let env = env_of(&[
+            ("CODEX_HOME", "/opt/codex"),
+            ("HOME", "/home/u"),
+            ("USERPROFILE", "/profile"),
+        ]);
+        assert_eq!(codex_home_in(env), PathBuf::from("/opt/codex"));
+    }
+
+    /// PowerShell and cmd leave `HOME` unset. Reading only `HOME` put the block
+    /// in `.\.codex` under the working directory, which Codex never reads.
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_codex_home_is_in_the_profile_without_home() {
+        let env = env_of(&[("USERPROFILE", r"C:\Users\u")]);
+        assert_eq!(codex_home_in(env), PathBuf::from(r"C:\Users\u\.codex"));
+        let env = env_of(&[("USERPROFILE", r"C:\Users\u"), ("HOME", "")]);
+        assert_eq!(codex_home_in(env), PathBuf::from(r"C:\Users\u\.codex"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn on_unix_codex_home_is_under_home() {
+        let env = env_of(&[("HOME", "/home/u"), ("USERPROFILE", "/elsewhere")]);
+        assert_eq!(codex_home_in(env), PathBuf::from("/home/u/.codex"));
+    }
+
+    /// A ChatGPT login is pointed with `-c`, the config file only under a key.
+    #[test]
+    fn a_chatgpt_login_gets_a_flag_and_an_api_key_the_file() {
+        assert_eq!(
+            codex_flags_for(9131, CodexAuth::Subscription),
+            Some(vec![
+                "-c".to_string(),
+                "openai_base_url=\"http://127.0.0.1:9131/v1\"".to_string(),
+            ])
+        );
+        assert_eq!(codex_flags_for(9131, CodexAuth::ApiKey), None);
+    }
+
+    #[test]
+    fn quoted_and_multiline_assignments_are_overridden_and_restored() {
+        for (index, original) in [
+            "\"model_provider\" = \"mine\"\n",
+            "model_provider = \"\"\"\nmine\"\"\"\n",
+            "instructions = \"\"\"\nmodel_provider = example\n[example]\n\"\"\"\nmodel_provider = 'mine'\n",
+        ].iter().enumerate() {
+            let scratch = Scratch::new(&format!("toml-spans-{index}"));
+            scratch.write(original);
+            let target = scratch.target(9240);
+            let before: toml::Table = toml::from_str(original).unwrap();
+            claim(&target).unwrap();
+            let during: toml::Table = toml::from_str(&scratch.read()).unwrap();
+            assert_eq!(during["model_provider"].as_str(), Some("kompressor"));
+            assert_eq!(during.get("instructions"), before.get("instructions"));
+            release(&target, false).unwrap();
+            assert_eq!(scratch.read(), *original);
+        }
+    }
+
+    #[test]
+    fn a_new_session_restores_the_original_after_a_crashed_session() {
+        let scratch = Scratch::new("crashed-reclaim");
+        let original = "model_provider = 'mine'\n";
+        scratch.write(original);
+        let target = scratch.target(9241);
+        claim(&target).unwrap();
+        let_go(&target.path);
+        claim(&target).unwrap();
+        release(&target, false).unwrap();
+        assert_eq!(scratch.read(), original);
+    }
+
+    #[test]
+    fn a_new_session_does_not_restore_an_orphaned_proxy_block() {
+        let scratch = Scratch::new("orphan-reclaim");
+        let original = "model_provider = 'mine'\n";
+        scratch.write(original);
+        let target = scratch.target(9243);
+        claim(&target).unwrap();
+        let_go(&target.path);
+        std::fs::remove_file(target.owners_path()).unwrap();
+        claim(&target).unwrap();
+        release(&target, false).unwrap();
+        assert_eq!(scratch.read(), original);
+        assert!(!scratch.read().contains(BEGIN));
+    }
+
+    #[test]
+    fn an_invalid_injection_leaves_the_configuration_untouched() {
+        // An existing `[model_providers.kompressor]` table is commented out for
+        // the session instead (see the `existing-table` case above); a dotted
+        // key defining the same table is the shape that still cannot be.
+        let scratch = Scratch::new("existing-provider");
+        let original = "model_providers.kompressor.name = 'my provider'\n";
+        scratch.write(original);
+        let target = scratch.target(9242);
+        assert!(claim(&target).is_err());
+        assert_eq!(scratch.read(), original);
+        assert!(!target.owners_path().exists());
+    }
+
     #[test]
     fn cleanup_preserves_edits_to_existing_settings_and_comments() {
         let scratch = Scratch::new("session-edits");
         scratch.write("# original comment\nmodel = \"old\"\n");
         let target = scratch.target(9230);
-        claim(&target, 9230).unwrap();
+        claim(&target).unwrap();
         let edited = scratch.read().replace("\"old\"", "\"new\"") + "# added during session\n";
         scratch.write(&edited);
         release(&target, false).unwrap();
@@ -675,7 +879,7 @@ mod tests {
     fn forced_cleanup_preserves_user_settings_in_a_file_we_created() {
         let scratch = Scratch::new("new-session-edits");
         let target = scratch.target(9231);
-        claim(&target, 9231).unwrap();
+        claim(&target).unwrap();
         scratch.write(&(scratch.read() + "[projects.example]\ntrust_level = \"trusted\"\n"));
         release(&target, true).unwrap();
         assert!(target.path.exists());
@@ -688,7 +892,7 @@ mod tests {
         let scratch = Scratch::new("inject");
         scratch.write("model = \"gpt-5.5\"\n");
         let target = scratch.target(9123);
-        assert_eq!(claim(&target, 9123).unwrap(), Claimed::Injected);
+        assert_eq!(claim(&target).unwrap(), Claimed::Injected);
 
         let text = scratch.read();
         assert!(text.contains("openai_base_url = \"http://127.0.0.1:9123/v1\""));
@@ -707,7 +911,7 @@ mod tests {
         let scratch = Scratch::new("order");
         scratch.write("[mcp_servers.thing]\ncommand = \"x\"\n");
         let target = scratch.target(9124);
-        claim(&target, 9124).unwrap();
+        claim(&target).unwrap();
 
         let text = scratch.read();
         let key = text.find("model_provider = ").unwrap();
@@ -724,7 +928,7 @@ mod tests {
         let original = "# my notes\nmodel = \"gpt-5.5\"\n\n[mcp_servers.thing]\ncommand = \"x\"\n";
         scratch.write(original);
         let target = scratch.target(9125);
-        claim(&target, 9125).unwrap();
+        claim(&target).unwrap();
         assert_ne!(scratch.read(), original);
 
         assert_eq!(release(&target, false).unwrap(), Released::Restored);
@@ -735,11 +939,136 @@ mod tests {
         );
     }
 
+    /// Whether every line in `text` ends in CRLF.
+    fn all_crlf(text: &str) -> bool {
+        text.matches('\n').count() == text.matches("\r\n").count()
+    }
+
+    /// A file saved on Windows. Its lines used to come back as LF while the
+    /// session ran, and for good whenever codex wrote to it meanwhile.
+    #[test]
+    fn a_crlf_file_keeps_its_line_endings_through_a_session_codex_edits() {
+        let scratch = Scratch::new("crlf");
+        let original =
+            "# my notes\r\nopenai_base_url = \"https://example\"\r\nmodel = \"gpt-5.5\"\r\n";
+        scratch.write(original);
+        let target = scratch.target(9128);
+        claim(&target).unwrap();
+        let injected = scratch.read();
+        assert!(all_crlf(&injected), "{injected:?}");
+        assert!(injected.contains(DISABLED));
+
+        // Codex records a trusted project while the session runs.
+        scratch.write(&(injected + "\r\n[projects.example]\r\ntrust_level = \"trusted\"\r\n"));
+        release(&target, false).unwrap();
+        let cleaned = scratch.read();
+        assert!(all_crlf(&cleaned), "{cleaned:?}");
+        assert!(cleaned.starts_with(original), "{cleaned:?}");
+        assert!(cleaned.ends_with("[projects.example]\r\ntrust_level = \"trusted\"\r\n"));
+        assert!(!cleaned.contains(BEGIN) && !cleaned.contains(DISABLED));
+    }
+
+    /// Cleaning up without the original to hand (a crashed session, `unwrap`,
+    /// or a file the user edited mid-session) used to leave the blank line that
+    /// was put before the foot block, and drop blank lines that opened the file.
+    #[test]
+    fn cleanup_without_the_original_adds_and_drops_no_blank_lines() {
+        let original = "\r\n# my codex config\r\nmodel = \"gpt-5.5\"\r\n\r\n[profiles.x]\r\nmodel = \"o3\"\r\n";
+
+        // Killed mid-session, then `unwrap codex`.
+        let scratch = Scratch::new("no-blank-crash");
+        scratch.write(original);
+        let target = scratch.target(9134);
+        claim(&target).unwrap();
+        let _ = std::fs::remove_file(target.owners_path());
+        assert_eq!(release(&target, true).unwrap(), Released::Restored);
+        assert_eq!(scratch.read(), original);
+        let_go(&target.path);
+
+        // A line the user appended while the session ran.
+        let scratch = Scratch::new("no-blank-edit");
+        scratch.write(original);
+        let target = scratch.target(9135);
+        claim(&target).unwrap();
+        scratch.write(&(scratch.read() + "user_added = true\r\n"));
+        release(&target, false).unwrap();
+        assert_eq!(scratch.read(), format!("{original}user_added = true\r\n"));
+
+        // No final newline: the one line ending added, so the block starts on
+        // a line of its own, and nothing else.
+        let scratch = Scratch::new("no-final-newline");
+        scratch.write("model = \"gpt-5.5\"");
+        let target = scratch.target(9136);
+        claim(&target).unwrap();
+        assert!(scratch.read().contains(&format!("\"gpt-5.5\"\n{BEGIN}")));
+        let _ = std::fs::remove_file(target.owners_path());
+        release(&target, true).unwrap();
+        assert_eq!(scratch.read(), "model = \"gpt-5.5\"\n");
+        let_go(&target.path);
+    }
+
+    #[test]
+    fn unwrap_keeps_a_crlf_file_crlf() {
+        let scratch = Scratch::new("crlf-orphan");
+        let original = "openai_base_url = \"https://example\"\r\nmodel = \"gpt-5.5\"\r\n";
+        scratch.write(original);
+        let target = scratch.target(9129);
+        claim(&target).unwrap();
+        // A session killed without cleaning up leaves no claim behind.
+        let _ = std::fs::remove_file(target.owners_path());
+        assert_eq!(release(&target, true).unwrap(), Released::Restored);
+        let cleaned = scratch.read();
+        assert!(all_crlf(&cleaned), "{cleaned:?}");
+        assert_eq!(
+            cleaned, original,
+            "unwrap must leave the file byte for byte"
+        );
+    }
+
+    /// A session killed under the file route leaves its block. A later ChatGPT
+    /// session, pointed by flag, removes it; a block a live session holds stays.
+    #[test]
+    fn a_block_left_behind_is_cleared_and_a_held_one_kept() {
+        let scratch = Scratch::new("stale");
+        let original = "model = \"gpt-5.5\"\n";
+        scratch.write(original);
+        let target = scratch.target(9132);
+        claim(&target).unwrap();
+        // Held by this process, which is alive.
+        assert_eq!(clear_stale(&target).unwrap(), Released::StillInUse);
+        assert!(scratch.read().contains(BEGIN));
+
+        // Killed: its claim never recorded, or recorded and then lost.
+        let _ = std::fs::remove_file(target.owners_path());
+        assert_eq!(clear_stale(&target).unwrap(), Released::Restored);
+        assert_eq!(scratch.read(), original);
+        assert_eq!(clear_stale(&target).unwrap(), Released::NotOurs);
+        let_go(&target.path);
+    }
+
+    /// An `unwrap` from elsewhere drops this session's claim; the release that
+    /// follows still takes away its lock file, which nothing else would.
+    #[test]
+    fn a_release_after_unwrap_leaves_no_lock_file() {
+        let scratch = Scratch::new("unwrapped");
+        scratch.write("model = \"gpt-5.5\"\n");
+        let target = scratch.target(9133);
+        claim(&target).unwrap();
+        let held = sibling(
+            &target.path,
+            &format!(".kompressor-wrap.{}.held", std::process::id()),
+        );
+        assert!(held.exists());
+        let _ = std::fs::remove_file(target.owners_path());
+        assert_eq!(release(&target, false).unwrap(), Released::NotOurs);
+        assert!(!held.exists());
+    }
+
     #[test]
     fn a_file_we_created_is_removed_rather_than_left_empty() {
         let scratch = Scratch::new("created");
         let target = scratch.target(9126);
-        claim(&target, 9126).unwrap();
+        claim(&target).unwrap();
         assert!(target.path.exists());
 
         release(&target, false).unwrap();
@@ -754,9 +1083,9 @@ mod tests {
         let scratch = Scratch::new("twice");
         scratch.write("model = \"gpt-5.5\"\n");
         let target = scratch.target(9127);
-        claim(&target, 9127).unwrap();
+        claim(&target).unwrap();
         let once = scratch.read();
-        assert_eq!(claim(&target, 9127).unwrap(), Claimed::AlreadyCurrent);
+        assert_eq!(claim(&target).unwrap(), Claimed::AlreadyCurrent);
         assert_eq!(scratch.read(), once, "a second claim must not stack blocks");
     }
 
@@ -768,7 +1097,7 @@ mod tests {
         let scratch = Scratch::new("collide");
         scratch.write("model_provider = \"mine\"\n");
         let target = scratch.target(9128);
-        claim(&target, 9128).expect("a collision is not a reason to give up");
+        claim(&target).expect("a collision is not a reason to give up");
 
         let written = scratch.read();
         assert!(
@@ -792,7 +1121,7 @@ mod tests {
         scratch.write(original);
         let target = scratch.target(9129);
 
-        claim(&target, 9129).unwrap();
+        claim(&target).unwrap();
         assert!(scratch.read().contains(DISABLED));
         release(&target, false).unwrap();
         assert_eq!(
@@ -811,7 +1140,7 @@ mod tests {
         let scratch = Scratch::new("collide-orphan");
         scratch.write("model_provider = \"mine\"\n");
         let target = scratch.target(9130);
-        claim(&target, 9130).unwrap();
+        claim(&target).unwrap();
         std::fs::remove_file(target.owners_path()).unwrap();
 
         release(&target, true).unwrap();
@@ -835,9 +1164,9 @@ mod tests {
         let scratch = Scratch::new("collide-twice");
         scratch.write("model_provider = \"mine\"\n");
         let target = scratch.target(9131);
-        claim(&target, 9131).unwrap();
+        claim(&target).unwrap();
         let once = scratch.read();
-        claim(&target, 9131).unwrap();
+        claim(&target).unwrap();
         assert_eq!(scratch.read(), once, "the second claim changed the file");
         assert_eq!(once.matches(DISABLED).count(), 1);
     }
@@ -851,7 +1180,7 @@ mod tests {
         let original = "[model_providers.other]\nmodel_provider = \"theirs\"\n";
         scratch.write(original);
         let target = scratch.target(9132);
-        claim(&target, 9132).unwrap();
+        claim(&target).unwrap();
         assert!(
             !scratch.read().contains(DISABLED),
             "a key inside a table is not a collision: {}",
@@ -864,14 +1193,14 @@ mod tests {
         let scratch = Scratch::new("nested");
         scratch.write("[profiles.work]\nmodel_provider = \"mine\"\n");
         let target = scratch.target(9129);
-        assert_eq!(claim(&target, 9129).unwrap(), Claimed::Injected);
+        assert_eq!(claim(&target).unwrap(), Claimed::Injected);
     }
 
     #[test]
     fn unwrap_strips_a_block_left_by_a_session_that_was_killed() {
         let scratch = Scratch::new("orphan");
         let target = scratch.target(9130);
-        claim(&target, 9130).unwrap();
+        claim(&target).unwrap();
         // Lose the ownership record the way a `kill -9` would.
         let _ = std::fs::remove_file(target.owners_path());
 
@@ -889,39 +1218,16 @@ mod tests {
     }
 
     #[test]
-    fn a_subscription_install_gets_no_provider_block() {
-        // Measured on codex 0.155.1: `model_provider` IS honoured under a
-        // ChatGPT plan, so a provider block declaring `env_key` makes codex
-        // refuse the session with "Missing environment variable:
-        // OPENAI_API_KEY" before it sends anything. The override alone works.
-        let scratch = Scratch::new("subauth");
-        scratch.write("model = \"gpt-5.5\"\n");
-        let target = scratch.subscription_target(9140);
-        claim(&target, 9140).unwrap();
-
-        let text = scratch.read();
-        assert!(text.contains("openai_base_url = \"http://127.0.0.1:9140/v1\""));
-        assert!(
-            !text.contains("model_provider"),
-            "selecting our provider under a subscription kills the session:\n{text}"
-        );
-        assert!(
-            !text.contains("env_key"),
-            "a subscription install has no API key to name:\n{text}"
-        );
-    }
-
-    #[test]
     fn an_api_key_install_gets_the_provider_block_and_its_websocket_setting() {
         let scratch = Scratch::new("keyauth");
         scratch.write("model = \"gpt-5.5\"\n");
         let target = scratch.target(9141);
-        claim(&target, 9141).unwrap();
+        claim(&target).unwrap();
 
         let text = scratch.read();
         assert!(text.contains("model_provider = \"kompressor\""));
         assert!(text.contains("[model_providers.kompressor]"));
-        // The only place this can be set, and worth ~13s per session.
+        // The only place this can be set; it keeps the session countable.
         assert!(text.contains("supports_websockets = false"));
     }
 
@@ -931,7 +1237,31 @@ mod tests {
         scratch.write_auth("chatgpt");
         assert_eq!(codex_auth(&scratch.0), CodexAuth::Subscription);
         scratch.write_auth("apikey");
-        assert_eq!(codex_auth(&scratch.0), CodexAuth::ApiKey);
+        assert_eq!(codex_auth(&scratch.0), CodexAuth::StoredApiKey);
+    }
+
+    /// Each login gets the setting that finds its key.
+    #[test]
+    fn the_provider_finds_the_key_where_the_login_keeps_it() {
+        let stored = Target::codex_for(9142, Path::new("/x"), CodexAuth::StoredApiKey);
+        let env = Target::codex_for(9142, Path::new("/x"), CodexAuth::ApiKey);
+        let entry = |target: &Target, key: &str| {
+            target.tables[0]
+                .entries
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(
+            entry(&stored, "requires_openai_auth").as_deref(),
+            Some("true")
+        );
+        assert_eq!(entry(&stored, "env_key"), None);
+        assert_eq!(
+            entry(&env, "env_key").as_deref(),
+            Some("\"OPENAI_API_KEY\"")
+        );
+        assert_eq!(entry(&env, "requires_openai_auth"), None);
     }
 
     #[test]
@@ -991,7 +1321,7 @@ mod tests {
             let scratch = Scratch::new(&format!("valid-{tag}"));
             scratch.write(original);
             let target = scratch.target(9240);
-            claim(&target, 9240).unwrap_or_else(|e| panic!("{tag}: {e}"));
+            claim(&target).unwrap_or_else(|e| panic!("{tag}: {e}"));
             let claimed = scratch.read();
             let parsed = claimed
                 .parse::<toml::Table>()
@@ -1020,7 +1350,7 @@ mod tests {
         original.parse::<toml::Table>().unwrap();
         scratch.write(original);
         let target = scratch.target(9241);
-        let error = claim(&target, 9241).expect_err("would not parse");
+        let error = claim(&target).expect_err("would not parse");
         assert!(error.to_string().contains("config.toml"), "{error}");
         assert_eq!(scratch.read(), original);
         assert_eq!(release(&target, false).unwrap(), Released::NotOurs);

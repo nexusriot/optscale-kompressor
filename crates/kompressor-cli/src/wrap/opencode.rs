@@ -43,7 +43,9 @@ use std::time::Duration;
 
 use serde_json::{Map, Value};
 
-use super::settings::{Claim, Holder, Lock, Released, read_owners, sibling, sweep, write_owners};
+use super::settings::{
+    Claim, Holder, Lock, Released, let_go, read_owners, sibling, sweep, write_owners,
+};
 use crate::error::CliError;
 
 /// The providers this wrap routes, and the path each one's base URL takes on
@@ -567,7 +569,7 @@ fn still_ours(key: &str, value: Option<&Value>) -> bool {
 
 /// Point the file's providers at the proxy, recording what was there.
 pub fn claim(target: &Target, port: u16) -> Result<Routing, CliError> {
-    let _lock = Lock::acquire(target.lock_path());
+    let _lock = Lock::acquire(target.lock_path())?;
     let owners_path = target.owners_path();
     let mut owners = read_owners(&owners_path);
     let (text, mut map) = read_for_edit(&target.path)?;
@@ -582,7 +584,7 @@ pub fn claim(target: &Target, port: u16) -> Result<Routing, CliError> {
         file.original = text.clone();
     }
     file.holders.retain(|h| h.pid != std::process::id());
-    file.holders.push(Holder::me(Some(port)));
+    file.holders.push(Holder::me(&target.path));
 
     // A key we already hold is ours whatever it says; anything else that
     // routes a provider is the user's.
@@ -629,9 +631,12 @@ pub fn claim(target: &Target, port: u16) -> Result<Routing, CliError> {
 ///
 /// `force` is `unwrap`: every claim is dropped whoever holds it.
 pub fn release(target: &Target, force: bool) -> Result<Released, CliError> {
-    let _lock = Lock::acquire(target.lock_path());
+    let _lock = Lock::acquire(target.lock_path())?;
     let owners_path = target.owners_path();
     let mut owners = read_owners(&owners_path);
+    // This process's claim ends here whichever way the release goes, as in
+    // `configfile::release`: the lock next to the file is what proved it alive.
+    let_go(&target.path);
     let keys: Vec<String> = owned_keys()
         .into_iter()
         .filter(|key| owners.keys.contains_key(key))
