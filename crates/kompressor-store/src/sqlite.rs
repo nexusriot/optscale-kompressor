@@ -13,7 +13,10 @@
 //! patterns, different retention, and only this one holds payload bytes, so
 //! only this one has to be placed with care.
 
-use crate::browse::{BrowseOrder, BrowsePage, BrowseQuery, RefBrowse, RefDetail, RefSummary};
+use crate::browse::{
+    BrowseOrder, BrowsePage, BrowseQuery, MAX_CENSUS_ENTRIES, RefBrowse, RefCensus, RefCensusEntry,
+    RefDetail, RefSummary,
+};
 use crate::clock::Clock;
 use crate::types::{
     Lookup, PutMeta, RefRecord, RefStore, StoreError, StoreStats, Tenant, expires_at, is_expired,
@@ -160,6 +163,15 @@ WHERE tenant = ?2 AND last_accessed + ttl_seconds >= ?1 AND created_at + max_lif
 /// `{start}` are the preview and the characters before it.
 const SQL_BROWSE_COLUMNS: &str = "ref, {head}, {start}, bytes, kind, request_id, \
      created_at, last_accessed, ttl_seconds, max_lifetime";
+
+/// Bookkeeping only: the fragment column is never read, so a census of a
+/// gigabyte store moves a few megabytes.
+const SQL_CENSUS: &str = "
+SELECT ref, kind, bytes, created_at, last_accessed, ttl_seconds, max_lifetime
+FROM refs WHERE tenant = ?1
+ORDER BY created_at DESC, ref
+LIMIT ?2
+";
 
 const SQL_INSPECT: &str = "
 SELECT fragment, kind, request_id, created_at, last_accessed, ttl_seconds, max_lifetime
@@ -658,6 +670,38 @@ impl Filter {
 }
 
 impl RefBrowse for SqliteRefStore {
+    fn census(&self, tenant: &Tenant) -> Result<RefCensus, StoreError> {
+        let now = self.clock.now();
+        let conn = self.reader();
+        let mut stmt = conn.prepare_cached(SQL_CENSUS)?;
+        let mut entries = stmt
+            .query_map(
+                params![tenant.as_str(), (MAX_CENSUS_ENTRIES + 1) as i64],
+                |row| {
+                    let created = row.get::<_, i64>(3)?.max(0) as u64;
+                    let accessed = row.get::<_, i64>(4)?.max(0) as u64;
+                    let ttl = row.get::<_, i64>(5)?.max(0) as u64;
+                    let lifetime = row.get::<_, i64>(6)?.max(0) as u64;
+                    let expires_at = accessed
+                        .saturating_add(ttl)
+                        .min(created.saturating_add(lifetime));
+                    Ok(RefCensusEntry {
+                        id: row.get(0)?,
+                        kind: row.get(1)?,
+                        bytes: row.get::<_, i64>(2)?.max(0) as u64,
+                        created_at: created,
+                        last_accessed: accessed,
+                        expires_at,
+                        expired: expires_at < now,
+                    })
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        let truncated = entries.len() > MAX_CENSUS_ENTRIES;
+        entries.truncate(MAX_CENSUS_ENTRIES);
+        Ok(RefCensus { entries, truncated })
+    }
+
     fn browse(&self, tenant: &Tenant, query: &BrowseQuery) -> Result<BrowsePage, StoreError> {
         let now = clamp_i64(self.clock.now());
         let mut scope = Filter::new(tenant);

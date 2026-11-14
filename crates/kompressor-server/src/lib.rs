@@ -40,6 +40,7 @@ pub mod wire;
 pub mod analysis;
 mod api;
 pub mod cache;
+pub mod dashboards;
 pub mod export;
 pub mod live;
 mod ops;

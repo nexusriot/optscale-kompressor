@@ -580,6 +580,7 @@ are in [docs/charts/](docs/charts/).
 | HTTP API   | `POST /v1/compress`, `/v1/compress/raw`, `/v1/retrieve`, `/v1/detect`; `GET /v1/stats/*`, `/healthz`, `/readyz`, `/metrics`                                                 |
 | Live stats | `GET /v1/stats/live`: JSON, or a self-refreshing dashboard in a browser; on its own port with `server.stats_listen`                                                       |
 | Cache      | `GET /v1/stats/cache`: prompt-cache reads, writes and losses per conversation, each loss put down to expiry or a prefix change, and what keep-warm bridged                |
+| Dashboards | `GET /v1/stats/{trends,yield,store-health,keepwarm,upstream,engine}`: long-horizon trends, yield by content type, store health, keep-warm return, upstream incidents, engine time; plus a conversation timeline page |
 | Ref store  | `GET /v1/refs`: search, inspect and delete stored fragments, as JSON or a page; off unless `refs.browse = true`                                                           |
 | MCP server | `kompressor serve --mcp` (streamable HTTP): `optscale_kompressor_retrieve`, `optscale_kompressor_compress`, `optscale_kompressor_compress_raw`, `optscale_kompressor_stats` |
 | CLI        | `kompressor compress`, `retrieve`, `detect`, `stats`, `bench`, `check-config`                                                                                               |
@@ -631,6 +632,31 @@ accept the same `from`/`to` pair. Analysis uses retained raw events; daily
 archives cannot reconstruct turn history. Token reduction remains an estimate
 per request, not a monetary saving or a count of unique content.
 
+Seven more pages sit beside those on the statistics listener, linked from each
+other and from every page's **Dashboards** link:
+
+- `/trends`: weekly (or daily, or monthly) net tokens removed, prompt-cache
+  saving, input cost, conversations and errors for up to two years. It reads the
+  daily archive as well as raw rows, so it reaches past the raw-row retention,
+  and marks the period each build was first seen.
+- `/yield`: what each content type gave up, and what retrieval took back by
+  fragment kind (how many stored fragments were ever asked for, and how soon).
+  The engine records messages per type rather than tokens, so the per-type
+  saving is an estimate; runs made of a single type give the exact figure.
+- `/timeline`: one conversation drawn turn by turn — what the cache read, wrote
+  and charged fresh, each lost prefix, the pings, compressions and retrievals.
+- `/store`: what the ref store holds by kind, age and time to expiry, against
+  its byte cap, how many minted handles were ever asked for, and asks that came
+  too late (expired) or for nothing (missing).
+- `/keepwarm`: what the keep-warm pings cost against the rewrites they avoided,
+  by pause length and per conversation, with the pings sent after a
+  conversation's last turn and the TTL losses no ping covered.
+- `/upstream`: status classes, 429s, 5xx and unanswered requests by upstream
+  and model, latency percentiles, incidents (three or more such failures within
+  a minute of each other) and the latest failures.
+- `/engine`: where compression time goes, by content type, prompt size, outcome
+  and surface, the slowest runs, the engine slots in use and dropped stats events.
+
 ### Statistics JSON API for automation
 
 Every dashboard is backed by a JSON route, and a client that sends no `Accept`
@@ -646,6 +672,12 @@ statistics listener (`server.stats_listen`) as well.
 | `GET /v1/stats/analysis/retrievals?from=&to=` | retrieval amplification |
 | `GET /v1/stats/analysis/latency?from=&to=` | latency and reliability |
 | `GET /v1/stats/analysis/compare?from=&to=` | historical comparison; `compare_from`/`compare_to`, `model`, `mode`, `surface`, `experiment_id`, `run_id` |
+| `GET /v1/stats/trends?window=26w&bucket=week` | per-period history from raw rows and the daily archive; `window` up to `104w`, `bucket` `day`, `week` or `month`, or `from=&to=` up to 730 days |
+| `GET /v1/stats/yield?window=24h` | tokens removed per content type (estimated by message share) and retrieval asks per fragment kind |
+| `GET /v1/stats/store-health?window=24h` | the ref store's census by kind, age and expiry, its size over time, minted versus asked handles, expired and missing asks |
+| `GET /v1/stats/keepwarm?window=24h&conversations=50` | keep-warm ping cost against avoided rewrites, by pause length and per conversation |
+| `GET /v1/stats/upstream?window=24h` | status mix, latency and failures by upstream and model, incidents, latest failures |
+| `GET /v1/stats/engine?window=24h` | engine time by content type, prompt size, outcome and surface, slowest runs, process slots |
 | `GET /v1/stats/summary`, `histogram`, `by_type`, `retrievals`, `requests?request_id=`, `store` | the aggregate reports `kompressor stats` prints |
 
 `from`/`to` are epoch milliseconds (`to` exclusive, at most 90 days apart).
@@ -660,9 +692,9 @@ parameters are refused with `422`, and every error uses the same
 curl -s -H 'x-kompressor-key: sk-…' "http://127.0.0.1:8840/v1/stats/analysis/latency?from=$(( ($(date +%s) - 3600) * 1000 ))&to=$(( $(date +%s) * 1000 ))" | jq .total
 ```
 
-Every dashboard (live, cache and analysis) has a **Download JSONL** button, and
-each of their JSON routes — `/v1/stats/live`, `/v1/stats/cache`,
-`/v1/stats/analysis` and its `retrievals`, `latency` and `compare` views —
+Every dashboard has a **Download JSONL** button, and each of their JSON
+routes — `/v1/stats/live`, `/v1/stats/cache`, `/v1/stats/analysis` and its
+`retrievals`, `latency` and `compare` views, and the six dashboard routes above —
 also answers `?format=jsonl` with a JSON Lines attachment, under the same key
 and tenant rules as the JSON. The first line is `{"record":"summary",…}` with
 every field that is not a list; each list element follows on its own line,

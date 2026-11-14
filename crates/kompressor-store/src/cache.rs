@@ -17,7 +17,7 @@
 //! one deadline a read is not allowed to extend; covering the write gap needs
 //! no such guess, because the writer supplied the whole policy.
 
-use crate::browse::{BrowsePage, BrowseQuery, RefBrowse, RefDetail};
+use crate::browse::{BrowsePage, BrowseQuery, RefBrowse, RefCensus, RefDetail};
 use crate::clock::Clock;
 use crate::types::{
     Lookup, PutMeta, RefRecord, RefStore, StoreError, StoreStats, Tenant, is_expired,
@@ -409,6 +409,13 @@ impl<S: RefStore> RefStore for CachedRefStore<S> {
 /// a subset of it, written through. A removal clears both layers, or the
 /// deleted fragment would stay servable for the rest of the cache window.
 impl<S: RefStore> RefBrowse for CachedRefStore<S> {
+    fn census(&self, tenant: &Tenant) -> Result<RefCensus, StoreError> {
+        match self.inner.browser() {
+            Some(inner) => inner.census(tenant),
+            None => Ok(RefCensus::default()),
+        }
+    }
+
     fn browse(&self, tenant: &Tenant, query: &BrowseQuery) -> Result<BrowsePage, StoreError> {
         match self.inner.browser() {
             Some(inner) => inner.browse(tenant, query),

@@ -71,7 +71,7 @@ pub struct TimelinePoint {
 
 /// p50/p95/p99/max of `samples` by nearest rank (`ceil(n * q) - 1`), the same
 /// rank the SQL version took its `OFFSET` at.
-fn percentiles(mut samples: Vec<f64>) -> Latency {
+pub(crate) fn percentiles(mut samples: Vec<f64>) -> Latency {
     if samples.is_empty() {
         return Latency::default();
     }

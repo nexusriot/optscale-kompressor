@@ -50,7 +50,10 @@ pub mod memory;
 pub mod sqlite;
 pub mod types;
 
-pub use browse::{BrowseOrder, BrowsePage, BrowseQuery, RefBrowse, RefDetail, RefSummary};
+pub use browse::{
+    BrowseOrder, BrowsePage, BrowseQuery, MAX_CENSUS_ENTRIES, RefBrowse, RefCensus, RefCensusEntry,
+    RefDetail, RefSummary,
+};
 pub use cache::CachedRefStore;
 pub use clock::{Clock, ManualClock};
 pub use memory::MemoryRefStore;
@@ -162,6 +165,7 @@ mod tests {
         a_search_preview_is_a_window_around_the_first_match,
         inspecting_an_expired_row_neither_deletes_nor_touches_it,
         removing_deletes_only_the_named_tenants_rows,
+        a_census_lists_the_tenants_bookkeeping_newest_first_without_touching,
     );
 
     fn meta() -> PutMeta {
@@ -749,6 +753,54 @@ mod tests {
             "not deleted"
         );
         assert!(browser(&f).inspect(&b(), &id).unwrap().is_none(), "scoped");
+    }
+
+    fn a_census_lists_the_tenants_bookkeeping_newest_first_without_touching(make: Make) {
+        let f = make(1_000, None);
+        let old = put(f.store(), &a(), "aged out", &meta_with(100, 10_000));
+        f.clock.advance(150);
+        let new = put(
+            f.store(),
+            &a(),
+            "fresh",
+            &PutMeta::new(Kind::Json)
+                .with_ttl(600)
+                .with_max_lifetime(400),
+        );
+        put(f.store(), &b(), "someone else's", &meta());
+
+        let census = browser(&f).census(&a()).unwrap();
+        assert!(!census.truncated);
+        let ids: Vec<&str> = census.entries.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, vec![new.body(), old.body()]);
+        let (fresh, aged) = (&census.entries[0], &census.entries[1]);
+        assert_eq!((fresh.kind.as_str(), fresh.bytes), ("json", 5));
+        assert_eq!(fresh.created_at, 1_150);
+        assert_eq!(fresh.expires_at, 1_550, "the lifetime cap comes first");
+        assert!(!fresh.expired);
+        assert_eq!((aged.kind.as_str(), aged.expires_at), ("log", 1_100));
+        assert!(aged.expired);
+        assert!(
+            browser(&f).inspect(&a(), &old).unwrap().is_some(),
+            "a census deletes nothing"
+        );
+        assert_eq!(
+            browser(&f)
+                .inspect(&a(), &old)
+                .unwrap()
+                .unwrap()
+                .record
+                .last_accessed,
+            1_000,
+            "and touches nothing"
+        );
+        assert!(
+            browser(&f)
+                .census(&Tenant::new("nobody"))
+                .unwrap()
+                .entries
+                .is_empty()
+        );
     }
 
     fn removing_deletes_only_the_named_tenants_rows(make: Make) {

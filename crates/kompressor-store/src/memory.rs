@@ -6,7 +6,10 @@
 //! service sees none of these rows, and a restart between the compression that
 //! minted a handle and the retrieval that asks for it answers `Miss`.
 
-use crate::browse::{self, BrowseOrder, BrowsePage, BrowseQuery, RefBrowse, RefDetail, RefSummary};
+use crate::browse::{
+    self, BrowseOrder, BrowsePage, BrowseQuery, MAX_CENSUS_ENTRIES, RefBrowse, RefCensus,
+    RefCensusEntry, RefDetail, RefSummary,
+};
 use crate::clock::Clock;
 use crate::types::{
     Lookup, PutMeta, RefRecord, RefStore, StoreError, StoreStats, Tenant, is_expired,
@@ -237,6 +240,38 @@ impl RefStore for MemoryRefStore {
 }
 
 impl RefBrowse for MemoryRefStore {
+    fn census(&self, tenant: &Tenant) -> Result<RefCensus, StoreError> {
+        let now = self.clock.now();
+        let entries = self.entries.lock();
+        let mut all: Vec<RefCensusEntry> = entries
+            .iter()
+            .filter(|((owner, _), _)| owner == &tenant.0)
+            .map(|(_, entry)| {
+                let detail = RefDetail::new(entry.record.clone(), entry.max_lifetime_seconds, now);
+                RefCensusEntry {
+                    id: detail.record.id.body().to_owned(),
+                    bytes: detail.record.bytes(),
+                    kind: detail.record.kind,
+                    created_at: detail.record.created_at,
+                    last_accessed: detail.record.last_accessed,
+                    expires_at: detail.expires_at,
+                    expired: detail.expired,
+                }
+            })
+            .collect();
+        all.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        let truncated = all.len() > MAX_CENSUS_ENTRIES;
+        all.truncate(MAX_CENSUS_ENTRIES);
+        Ok(RefCensus {
+            entries: all,
+            truncated,
+        })
+    }
+
     fn browse(&self, tenant: &Tenant, query: &BrowseQuery) -> Result<BrowsePage, StoreError> {
         let now = self.clock.now();
         let needle = query.needle();
