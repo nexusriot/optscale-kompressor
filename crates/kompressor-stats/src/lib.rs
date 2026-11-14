@@ -50,6 +50,7 @@
 #![forbid(unsafe_code)]
 
 pub mod analysis;
+pub mod breakdown;
 pub mod cache;
 pub mod config;
 pub mod context;

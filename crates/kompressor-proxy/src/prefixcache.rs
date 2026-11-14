@@ -1479,6 +1479,37 @@ mod tests {
         }
     }
 
+    /// `kompressor stats cache` and `stats conversations` price rows with the
+    /// statistics crate's `breakdown::prices`, another copy of this table for
+    /// the same reason. Same check.
+    #[test]
+    fn the_stats_cli_prices_reads_and_writes_as_the_proxy_does() {
+        for family in [
+            ApiFamily::AnthropicMessages,
+            ApiFamily::OpenAiChat,
+            ApiFamily::OpenAiResponses,
+        ] {
+            for model in [
+                None,
+                Some("claude-opus-5-5"),
+                Some("anthropic/claude-sonnet-5-5"),
+                Some("claude-fable-5-1"),
+                Some("claude-mythos-5-1"),
+                Some("claude-haiku-5-5"),
+                Some("claude-opus-4-8"),
+                Some("gpt-5.5"),
+            ] {
+                let cli = kompressor_stats::breakdown::prices(family.as_str(), model);
+                let short = CachePrices::for_model(family, model, false);
+                let long = CachePrices::for_model(family, model, true);
+                let ppm = |rate: f64| (rate * 1_000_000.0).round() as u32;
+                assert_eq!(ppm(cli.read), short.read_ppm, "{family:?} {model:?}");
+                assert_eq!(ppm(cli.write_5m), short.write_ppm, "{family:?} {model:?}");
+                assert_eq!(ppm(cli.write_1h), long.write_ppm, "{family:?} {model:?}");
+            }
+        }
+    }
+
     /// Demand is what the last few requests asked for, not what the
     /// conversation ever did.
     #[test]

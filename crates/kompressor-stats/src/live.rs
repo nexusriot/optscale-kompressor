@@ -69,6 +69,27 @@ pub struct TimelinePoint {
     pub saved_gross: i64,
 }
 
+/// p50/p95/p99/max of `samples` by nearest rank (`ceil(n * q) - 1`), the same
+/// rank the SQL version took its `OFFSET` at.
+fn percentiles(mut samples: Vec<f64>) -> Latency {
+    if samples.is_empty() {
+        return Latency::default();
+    }
+    samples.sort_by(f64::total_cmp);
+    let n = samples.len();
+    let at = |quantile: f64| {
+        let rank = ((n as f64 * quantile).ceil() as usize).clamp(1, n) - 1;
+        Some(samples[rank])
+    };
+    Latency {
+        samples: n as u64,
+        p50: at(0.50),
+        p95: at(0.95),
+        p99: at(0.99),
+        max: at(1.0),
+    }
+}
+
 /// Percentiles of one latency column, in milliseconds.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Latency {
@@ -193,40 +214,81 @@ impl StatsReader {
         recent: usize,
     ) -> Result<LiveSnapshot, StatsError> {
         let bucket_ms = bucket_for(to_ms.saturating_sub(from_ms));
-        let summary = self.summary(tenant, from_ms, to_ms)?;
-        let (refs_emitted, engine_ms_total): (i64, f64) = self.conn.query_row(
-            "SELECT COALESCE(SUM(refs_emitted), 0), COALESCE(SUM(engine_ms), 0.0)
-             FROM optimization_events WHERE tenant = ?1 AND time_ms >= ?2 AND time_ms < ?3",
+        // One committed snapshot for every panel. Without it, a page polled
+        // while the writer commits could show totals from one batch and the
+        // timeline or recent list from the next, which do not add up.
+        let tx = self.conn.unchecked_transaction()?;
+
+        // The totals and the trailing rates come from one pass over the wider
+        // of the window and the longest rate window, with each figure a
+        // conditional sum, rather than one scan per figure.
+        let widest = RATE_WINDOWS.iter().map(|(_, w)| *w).max().unwrap_or(0);
+        let scan_from = from_ms.min(to_ms - widest);
+        let rate_from: Vec<i64> = RATE_WINDOWS.iter().map(|(_, w)| to_ms - w).collect();
+        let (totals_row, rate_rows) =
+            self.live_compressions(tenant, from_ms, to_ms, scan_from, &rate_from)?;
+        let (proxy_requests, rate_proxy) =
+            self.live_proxy_counts(tenant, from_ms, to_ms, scan_from, &rate_from)?;
+        let (_, _, retrieved_tokens) = self.retrieval_totals(
+            "tenant = ?1 AND time_ms >= ?2 AND time_ms < ?3",
             (tenant, from_ms, to_ms),
-            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        let proxy_requests = self.proxy_count(tenant, from_ms, to_ms)?;
+        let [
+            requests,
+            tokens_in,
+            tokens_out,
+            messages_total,
+            messages_compressed,
+            refs_emitted,
+        ] = totals_row.0;
+        let engine_ms_total = totals_row.1;
+        let requests = requests.max(0) as u64;
+        let saved_gross = tokens_in - tokens_out;
         let totals = LiveTotals {
-            compressions: summary.requests,
+            compressions: requests,
             proxy_requests,
-            messages_total: summary.messages_total,
-            messages_compressed: summary.messages_compressed,
-            tokens_in: summary.tokens_in,
-            tokens_out: summary.tokens_out,
-            saved_gross: summary.saved_gross,
-            retrieved_tokens: summary.retrieved_tokens,
-            saved_net: summary.saved_net,
-            ratio: ratio(summary.saved_gross, summary.tokens_in),
+            messages_total,
+            messages_compressed,
+            tokens_in,
+            tokens_out,
+            saved_gross,
+            retrieved_tokens,
+            saved_net: saved_gross - retrieved_tokens,
+            ratio: ratio(saved_gross, tokens_in),
             refs_emitted,
             engine_ms_total,
-            engine_ms_avg: if summary.requests > 0 {
-                engine_ms_total / summary.requests as f64
+            engine_ms_avg: if requests > 0 {
+                engine_ms_total / requests as f64
             } else {
                 0.0
             },
         };
 
-        let mut rates = Vec::new();
-        for (label, width) in RATE_WINDOWS {
-            rates.push(self.rate(tenant, label, to_ms - width, to_ms, *width)?);
-        }
+        let rates = RATE_WINDOWS
+            .iter()
+            .zip(rate_rows)
+            .zip(rate_proxy)
+            .map(
+                |(((label, width), (compressions, tokens_in, saved_gross)), proxy_requests)| {
+                    let minutes = *width as f64 / 60_000.0;
+                    let compressions = compressions.max(0) as u64;
+                    // A proxy-only deployment counts its traffic in proxy rows; an
+                    // API-only one has none. Whichever is larger is the request rate.
+                    let requests = proxy_requests.max(compressions);
+                    RateWindow {
+                        window: label.to_string(),
+                        compressions,
+                        proxy_requests,
+                        tokens_in,
+                        saved_gross,
+                        requests_per_min: requests as f64 / minutes,
+                        saved_per_min: saved_gross as f64 / minutes,
+                    }
+                },
+            )
+            .collect();
 
-        Ok(LiveSnapshot {
+        let snapshot = LiveSnapshot {
             tenant: tenant.to_string(),
             from_ms,
             to_ms,
@@ -241,47 +303,107 @@ impl StatsReader {
             skipped_by_reason: self.skipped(tenant, from_ms, to_ms)?,
             retrievals: self.retrievals(tenant, from_ms, to_ms)?,
             recent: self.recent(tenant, from_ms, to_ms, recent)?,
-        })
+        };
+        tx.commit()?;
+        Ok(snapshot)
     }
 
-    fn proxy_count(&self, tenant: &str, from_ms: i64, to_ms: i64) -> Result<u64, StatsError> {
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM proxy_requests
-             WHERE tenant = ?1 AND time_ms >= ?2 AND time_ms < ?3",
-            (tenant, from_ms, to_ms),
-            |row| row.get(0),
-        )?;
-        Ok(count.max(0) as u64)
-    }
-
-    fn rate(
+    /// Window totals of `optimization_events` (count, tokens in/out, messages
+    /// total/compressed, refs, engine ms) and, per trailing rate window
+    /// starting at `rate_from[i]`, (count, tokens in, saved) — one pass over
+    /// `[scan_from, to_ms)`.
+    #[allow(clippy::type_complexity)]
+    fn live_compressions(
         &self,
         tenant: &str,
-        label: &str,
         from_ms: i64,
         to_ms: i64,
-        width_ms: i64,
-    ) -> Result<RateWindow, StatsError> {
-        let (compressions, tokens_in, saved_gross): (i64, i64, i64) = self.conn.query_row(
-            "SELECT COUNT(*), COALESCE(SUM(tokens_in), 0), COALESCE(SUM(tokens_in - tokens_out), 0)
-             FROM optimization_events WHERE tenant = ?1 AND time_ms >= ?2 AND time_ms < ?3",
-            (tenant, from_ms, to_ms),
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )?;
-        let proxy_requests = self.proxy_count(tenant, from_ms, to_ms)?;
-        let minutes = width_ms as f64 / 60_000.0;
-        // A proxy-only deployment counts its traffic in proxy rows; an
-        // API-only one has none. Whichever is larger is the request rate.
-        let requests = proxy_requests.max(compressions.max(0) as u64);
-        Ok(RateWindow {
-            window: label.to_string(),
-            compressions: compressions.max(0) as u64,
-            proxy_requests,
-            tokens_in,
-            saved_gross,
-            requests_per_min: requests as f64 / minutes,
-            saved_per_min: saved_gross as f64 / minutes,
-        })
+        scan_from: i64,
+        rate_from: &[i64],
+    ) -> Result<(([i64; 6], f64), Vec<(i64, i64, i64)>), StatsError> {
+        let mut columns = String::from(
+            "COALESCE(SUM(time_ms >= ?2), 0),
+             COALESCE(SUM(CASE WHEN time_ms >= ?2 THEN tokens_in END), 0),
+             COALESCE(SUM(CASE WHEN time_ms >= ?2 THEN tokens_out END), 0),
+             COALESCE(SUM(CASE WHEN time_ms >= ?2 THEN messages_total END), 0),
+             COALESCE(SUM(CASE WHEN time_ms >= ?2 THEN messages_compressed END), 0),
+             COALESCE(SUM(CASE WHEN time_ms >= ?2 THEN refs_emitted END), 0),
+             COALESCE(SUM(CASE WHEN time_ms >= ?2 THEN engine_ms END), 0.0)",
+        );
+        let mut values: Vec<rusqlite::types::Value> = vec![
+            tenant.to_string().into(),
+            from_ms.into(),
+            to_ms.into(),
+            scan_from.into(),
+        ];
+        for start in rate_from {
+            values.push((*start).into());
+            let n = values.len();
+            columns.push_str(&format!(
+                ", COALESCE(SUM(time_ms >= ?{n}), 0),
+                   COALESCE(SUM(CASE WHEN time_ms >= ?{n} THEN tokens_in END), 0),
+                   COALESCE(SUM(CASE WHEN time_ms >= ?{n} THEN tokens_in - tokens_out END), 0)"
+            ));
+        }
+        let sql = format!(
+            "SELECT {columns} FROM optimization_events
+             WHERE tenant = ?1 AND time_ms >= ?4 AND time_ms < ?3"
+        );
+        Ok(self.conn.prepare_cached(&sql)?.query_row(
+            rusqlite::params_from_iter(values),
+            |row| {
+                let mut totals = [0i64; 6];
+                for (i, slot) in totals.iter_mut().enumerate() {
+                    *slot = row.get(i)?;
+                }
+                let engine: f64 = row.get(6)?;
+                let mut rates = Vec::with_capacity(rate_from.len());
+                for i in 0..rate_from.len() {
+                    let at = 7 + 3 * i;
+                    rates.push((row.get(at)?, row.get(at + 1)?, row.get(at + 2)?));
+                }
+                Ok(((totals, engine), rates))
+            },
+        )?)
+    }
+
+    /// Proxy rows in the window and in each trailing rate window, from one
+    /// pass that the `(tenant, time_ms)` index answers on its own.
+    fn live_proxy_counts(
+        &self,
+        tenant: &str,
+        from_ms: i64,
+        to_ms: i64,
+        scan_from: i64,
+        rate_from: &[i64],
+    ) -> Result<(u64, Vec<u64>), StatsError> {
+        let mut columns = String::from("COALESCE(SUM(time_ms >= ?2), 0)");
+        let mut values: Vec<rusqlite::types::Value> = vec![
+            tenant.to_string().into(),
+            from_ms.into(),
+            to_ms.into(),
+            scan_from.into(),
+        ];
+        for start in rate_from {
+            values.push((*start).into());
+            columns.push_str(&format!(", COALESCE(SUM(time_ms >= ?{}), 0)", values.len()));
+        }
+        let sql = format!(
+            "SELECT {columns} FROM proxy_requests
+             WHERE tenant = ?1 AND time_ms >= ?4 AND time_ms < ?3"
+        );
+        Ok(self.conn.prepare_cached(&sql)?.query_row(
+            rusqlite::params_from_iter(values),
+            |row| {
+                let count = |i: usize| row.get::<_, i64>(i).map(|v| v.max(0) as u64);
+                let total = count(0)?;
+                let mut rates = Vec::with_capacity(rate_from.len());
+                for i in 0..rate_from.len() {
+                    rates.push(count(1 + i)?);
+                }
+                Ok((total, rates))
+            },
+        )?)
     }
 
     fn timeline(
@@ -392,49 +514,39 @@ impl StatsReader {
             stats.cache_read_tokens,
             stats.prompt_tokens + stats.cache_read_tokens + stats.cache_write_tokens,
         );
-        stats.upstream_ms = self.latency("upstream_ms", tenant, from_ms, to_ms)?;
-        stats.total_ms = self.latency("total_ms", tenant, from_ms, to_ms)?;
+        (stats.upstream_ms, stats.total_ms) = self.latencies(tenant, from_ms, to_ms)?;
         Ok(stats)
     }
 
-    /// Percentiles by rank, one indexed lookup each, so a wide window costs
-    /// four seeks rather than every row in memory. `column` is one of two
-    /// fixed names, never caller input.
-    fn latency(
+    /// Percentiles of `upstream_ms` and `total_ms` by rank.
+    ///
+    /// Neither column is indexed, so each "ORDER BY col LIMIT 1 OFFSET k" the
+    /// earlier version ran was a sort of the whole window — four sorts and a
+    /// count per column, ten statements per snapshot. Reading both columns in
+    /// one pass and ranking them here costs one scan and two in-memory sorts.
+    fn latencies(
         &self,
-        column: &'static str,
         tenant: &str,
         from_ms: i64,
         to_ms: i64,
-    ) -> Result<Latency, StatsError> {
-        let filter = format!(
-            "FROM proxy_requests WHERE tenant = ?1 AND time_ms >= ?2 AND time_ms < ?3 \
-             AND {column} IS NOT NULL"
-        );
-        let samples: i64 = self.conn.query_row(
-            &format!("SELECT COUNT(*) {filter}"),
-            (tenant, from_ms, to_ms),
-            |row| row.get(0),
+    ) -> Result<(Latency, Latency), StatsError> {
+        let mut upstream = Vec::new();
+        let mut total = Vec::new();
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT upstream_ms, total_ms FROM proxy_requests
+             WHERE tenant = ?1 AND time_ms >= ?2 AND time_ms < ?3
+               AND (upstream_ms IS NOT NULL OR total_ms IS NOT NULL)",
         )?;
-        if samples <= 0 {
-            return Ok(Latency::default());
+        let mut rows = stmt.query((tenant, from_ms, to_ms))?;
+        while let Some(row) = rows.next()? {
+            if let Some(v) = row.get::<_, Option<f64>>(0)? {
+                upstream.push(v);
+            }
+            if let Some(v) = row.get::<_, Option<f64>>(1)? {
+                total.push(v);
+            }
         }
-        let at = |quantile: f64| -> Result<Option<f64>, StatsError> {
-            let rank = ((samples as f64 * quantile).ceil() as i64 - 1).clamp(0, samples - 1);
-            let value = self.conn.query_row(
-                &format!("SELECT {column} {filter} ORDER BY {column} LIMIT 1 OFFSET ?4"),
-                (tenant, from_ms, to_ms, rank),
-                |row| row.get::<_, f64>(0),
-            )?;
-            Ok(Some(value))
-        };
-        Ok(Latency {
-            samples: samples as u64,
-            p50: at(0.50)?,
-            p95: at(0.95)?,
-            p99: at(0.99)?,
-            max: at(1.0)?,
-        })
+        Ok((percentiles(upstream), percentiles(total)))
     }
 
     fn by_model(
@@ -851,6 +963,19 @@ mod tests {
         assert_eq!(live.totals.tokens_in, 100);
         assert_eq!(live.upstream.status_5xx, 0);
         assert_eq!(live.recent.len(), 1);
+    }
+
+    #[test]
+    fn percentiles_take_the_nearest_rank_the_sql_offsets_did() {
+        let p = percentiles((1..=100).rev().map(f64::from).collect());
+        assert_eq!(p.samples, 100);
+        assert_eq!(
+            (p.p50, p.p95, p.p99, p.max),
+            (Some(50.0), Some(95.0), Some(99.0), Some(100.0))
+        );
+        let one = percentiles(vec![7.0]);
+        assert_eq!((one.p50, one.max), (Some(7.0), Some(7.0)));
+        assert_eq!(percentiles(Vec::new()).samples, 0);
     }
 
     #[test]

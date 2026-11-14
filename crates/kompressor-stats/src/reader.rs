@@ -501,7 +501,7 @@ impl StatsReader {
     /// `withheld = 0` where the column exists, and the constant true where it
     /// does not — so a query reads "the asks that reached the store" on either
     /// shape. See [`StatsReader::has_withheld`].
-    fn served(&self) -> &'static str {
+    pub(crate) fn served(&self) -> &'static str {
         if self.has_withheld {
             "withheld = 0"
         } else {
@@ -1178,7 +1178,7 @@ impl StatsReader {
     /// of the 14 asks the store saw was answered — an invented 44% failure
     /// rate, on the one line most readers will look at. Measured on a real
     /// database after the column shipped and before this followed.
-    fn retrieval_totals(
+    pub(crate) fn retrieval_totals(
         &self,
         predicate: &str,
         params: impl rusqlite::Params,

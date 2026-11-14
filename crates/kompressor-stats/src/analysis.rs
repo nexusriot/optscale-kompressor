@@ -75,29 +75,62 @@ pub struct AnalysisReport {
 
 // Include all three event streams, including requests with no compression and
 // retrievals without a join key. The latter remain in the unattributed bucket.
+//
+// One pass: the three streams are projected onto a common shape and grouped
+// once by request id. The previous form emulated a full outer join — three
+// grouped CTEs, a UNION of their keys, then three LEFT JOINs on `IS`, which
+// SQLite served by materialising each CTE and building an automatic index on
+// it. `GROUP BY` treats NULL request ids as one group exactly as `IS` matched
+// them, and every per-stream MIN/MAX/SUM is taken over that stream's rows
+// alone because the other streams contribute NULL or 0 to it.
 const REQUESTS: &str = "
-WITH o AS (
- SELECT request_id, MIN(time_ms) time_ms, MAX(model) model, COUNT(*) compressions,
- SUM(CASE WHEN coalesce(outcome,'') <> 'discarded' THEN tokens_in-tokens_out ELSE 0 END) gross
- FROM optimization_events WHERE tenant=?1 AND time_ms>=?2 AND time_ms<?3 GROUP BY request_id
-), r AS (
- SELECT request_id, MIN(time_ms) time_ms, SUM(CASE WHEN found=1 AND withheld=0 THEN returned_tokens ELSE 0 END) debit
- FROM retrieval_events WHERE tenant=?1 AND time_ms>=?2 AND time_ms<?3 GROUP BY request_id
-), p AS (
- SELECT request_id, MIN(time_ms) time_ms, MAX(model) model, MAX(conversation) conversation,
- SUM(CASE WHEN keep_warm=0 THEN 1 ELSE 0 END) clients, SUM(keep_warm) pings,
- SUM(CASE WHEN keep_warm=0 THEN retrieve_rounds ELSE 0 END) rounds,
- SUM(CASE WHEN keep_warm=0 AND (error IS NOT NULL OR status IS NULL OR status>=400) THEN 1 ELSE 0 END) errors,
- SUM(CASE WHEN keep_warm=0 AND total_ms IS NOT NULL THEN 1 ELSE 0 END) latency_samples,
- SUM(CASE WHEN keep_warm=0 THEN coalesce(total_ms,0) ELSE 0 END) latency,
- MAX(status) status, MAX(error) error
- FROM proxy_requests WHERE tenant=?1 AND time_ms>=?2 AND time_ms<?3 GROUP BY request_id
-), k AS (SELECT request_id FROM o UNION SELECT request_id FROM r UNION SELECT request_id FROM p)
-SELECT coalesce(p.time_ms,o.time_ms,r.time_ms), k.request_id, coalesce(p.model,o.model), p.conversation,
- coalesce(p.clients,0), coalesce(p.pings,0), coalesce(o.compressions,0), coalesce(o.gross,0), coalesce(r.debit,0),
- coalesce(p.rounds,0), coalesce(p.errors,0), coalesce(p.latency_samples,0), coalesce(p.latency,0), p.status, p.error
-FROM k LEFT JOIN o ON o.request_id IS k.request_id LEFT JOIN r ON r.request_id IS k.request_id
-LEFT JOIN p ON p.request_id IS k.request_id ORDER BY 1 DESC, k.request_id DESC";
+WITH u AS (
+ SELECT request_id, time_ms o_time, NULL r_time, NULL p_time, model o_model, NULL p_model,
+  NULL conversation, 1 compressions,
+  CASE WHEN coalesce(outcome,'') <> 'discarded' THEN tokens_in-tokens_out ELSE 0 END gross,
+  0 debit, 0 clients, 0 pings, 0 rounds, 0 errors, 0 latency_samples, 0 latency,
+  NULL status, NULL error
+ FROM optimization_events WHERE tenant=?1 AND time_ms>=?2 AND time_ms<?3
+ UNION ALL
+ SELECT request_id, NULL, time_ms, NULL, NULL, NULL, NULL, 0, 0,
+  CASE WHEN found=1 AND withheld=0 THEN returned_tokens ELSE 0 END,
+  0, 0, 0, 0, 0, 0, NULL, NULL
+ FROM retrieval_events WHERE tenant=?1 AND time_ms>=?2 AND time_ms<?3
+ UNION ALL
+ SELECT request_id, NULL, NULL, time_ms, NULL, model, conversation, 0, 0, 0,
+  CASE WHEN keep_warm=0 THEN 1 ELSE 0 END, keep_warm,
+  CASE WHEN keep_warm=0 THEN retrieve_rounds ELSE 0 END,
+  CASE WHEN keep_warm=0 AND (error IS NOT NULL OR status IS NULL OR status>=400) THEN 1 ELSE 0 END,
+  CASE WHEN keep_warm=0 AND total_ms IS NOT NULL THEN 1 ELSE 0 END,
+  CASE WHEN keep_warm=0 THEN coalesce(total_ms,0) ELSE 0 END,
+  status, error
+ FROM proxy_requests WHERE tenant=?1 AND time_ms>=?2 AND time_ms<?3
+)
+SELECT coalesce(MIN(p_time), MIN(o_time), MIN(r_time)), request_id,
+ coalesce(MAX(p_model), MAX(o_model)), MAX(conversation),
+ SUM(clients), SUM(pings), SUM(compressions), SUM(gross), SUM(debit),
+ SUM(rounds), SUM(errors), SUM(latency_samples), SUM(latency), MAX(status), MAX(error)
+FROM u GROUP BY request_id ORDER BY 1 DESC, request_id DESC";
+
+/// The outcome and model/mode/surface breakdowns, from one read of the window.
+///
+/// `AS MATERIALIZED` makes SQLite read `optimization_events` once into a
+/// temporary table that the four groupings then share, where four separate
+/// statements each scanned the window. `kind` keeps the outcome rows apart
+/// and preserves the order the breakdowns were listed in before.
+const BREAKDOWNS: &str = "
+WITH o AS MATERIALIZED (
+ SELECT request_id, messages_total, tokens_in, outcome, model, mode, surface
+ FROM optimization_events WHERE tenant=?1 AND time_ms>=?2 AND time_ms<?3
+)
+SELECT kind, name, SUM(messages_total), SUM(tokens_in), COUNT(DISTINCT request_id), MIN(request_id)
+FROM (
+ SELECT 0 kind, coalesce(outcome,'unrecorded') name, request_id, messages_total, tokens_in FROM o
+ UNION ALL SELECT 1, 'model: ' || coalesce(model,'unrecorded'), request_id, messages_total, tokens_in FROM o
+ UNION ALL SELECT 2, 'mode: ' || coalesce(mode,'unrecorded'), request_id, messages_total, tokens_in FROM o
+ UNION ALL SELECT 3, 'surface: ' || coalesce(surface,'unrecorded'), request_id, messages_total, tokens_in FROM o
+)
+GROUP BY kind, name ORDER BY kind, 4 DESC, name";
 
 impl StatsReader {
     pub fn analysis(
@@ -113,7 +146,15 @@ impl StatsReader {
         let mut groups = BTreeMap::<Option<String>, Efficiency>::new();
         let mut turns = Vec::new();
         let mut turns_total = 0;
-        let mut stmt = self.conn.prepare(REQUESTS)?;
+        // The cache report's turns by request id: looked up once per detail
+        // turn, which a linear search made quadratic in the turn count.
+        let cache_turns: std::collections::HashMap<&str, _> = cache
+            .turns
+            .iter()
+            .flatten()
+            .map(|t| (t.request_id.as_str(), t))
+            .collect();
+        let mut stmt = self.conn.prepare_cached(REQUESTS)?;
         let mut rows = stmt.query((tenant, from, to))?;
         while let Some(row) = rows.next()? {
             let time: i64 = row.get(0)?;
@@ -156,11 +197,7 @@ impl StatsReader {
                 turns_total += 1;
                 if turns.len() < MAX_TURNS {
                     let request_id = request.unwrap_or_default();
-                    let cache_turn = cache
-                        .turns
-                        .as_ref()
-                        .and_then(|ts| ts.iter().find(|t| t.request_id == request_id))
-                        .cloned();
+                    let cache_turn = cache_turns.get(request_id.as_str()).map(|t| (*t).clone());
                     turns.push(AnalysisTurn {
                         time_ms: time,
                         request_id,
@@ -205,19 +242,8 @@ impl StatsReader {
         }
         let mut conversations: Vec<_> = groups.into_values().collect();
         conversations.sort_by_key(|c| c.saved_net);
-        let outcomes = self.analysis_opportunities(
-            tenant,
-            from,
-            to,
-            "coalesce(o.outcome,'unrecorded')",
-            false,
-        )?;
-        let skips = self.analysis_opportunities(tenant, from, to, "j.key", true)?;
-        let mut breakdowns = Vec::new();
-        for field in ["model", "mode", "surface"] {
-            let expr = format!("'{field}: ' || coalesce(o.{field},'unrecorded')");
-            breakdowns.extend(self.analysis_opportunities(tenant, from, to, &expr, false)?);
-        }
+        let (outcomes, breakdowns) = self.analysis_breakdowns(tenant, from, to)?;
+        let skips = self.analysis_skips(tenant, from, to)?;
         let raw_available_from_ms = self.conn.query_row("SELECT MIN(t) FROM (SELECT MIN(time_ms) t FROM optimization_events WHERE tenant=?1 UNION ALL SELECT MIN(time_ms) FROM retrieval_events WHERE tenant=?1 UNION ALL SELECT MIN(time_ms) FROM proxy_requests WHERE tenant=?1)", [tenant], |r| r.get(0))?;
         let report = AnalysisReport {
             tenant: tenant.into(),
@@ -240,29 +266,52 @@ impl StatsReader {
         Ok(report)
     }
 
-    fn analysis_opportunities(
+    fn analysis_breakdowns(
         &self,
         tenant: &str,
         from: i64,
         to: i64,
-        name: &str,
-        skips: bool,
+    ) -> Result<(Vec<Opportunity>, Vec<Opportunity>), StatsError> {
+        let mut outcomes = Vec::new();
+        let mut breakdowns = Vec::new();
+        let mut stmt = self.conn.prepare_cached(BREAKDOWNS)?;
+        let mut rows = stmt.query((tenant, from, to))?;
+        while let Some(r) = rows.next()? {
+            let item = Opportunity {
+                name: r.get(1)?,
+                messages: r.get(2)?,
+                tokens: r.get(3)?,
+                requests: r.get::<_, i64>(4)? as u64,
+                example_request: r.get(5)?,
+            };
+            if r.get::<_, i64>(0)? == 0 {
+                outcomes.push(item);
+            } else {
+                breakdowns.push(item);
+            }
+        }
+        Ok((outcomes, breakdowns))
+    }
+
+    fn analysis_skips(
+        &self,
+        tenant: &str,
+        from: i64,
+        to: i64,
     ) -> Result<Vec<Opportunity>, StatsError> {
-        let (join, messages, tokens) = if skips {
-            (
-                ", json_each(o.skipped_by_reason) j",
-                "SUM(j.value)",
-                "SUM(coalesce((SELECT value FROM json_each(o.skipped_tokens_by_reason) WHERE key=j.key),0))",
-            )
-        } else {
-            ("", "SUM(o.messages_total)", "SUM(o.tokens_in)")
-        };
-        let sql = format!(
-            "SELECT {name}, {messages}, {tokens}, COUNT(DISTINCT o.request_id), MIN(o.request_id) FROM optimization_events o{join} WHERE o.tenant=?1 AND o.time_ms>=?2 AND o.time_ms<?3 GROUP BY {name} ORDER BY 3 DESC,1"
-        );
+        // `json_extract` on the key the outer `json_each` is already at, as
+        // `v_skip_reasons` does, instead of a correlated `json_each` that
+        // re-parsed the token map once per (row, reason).
         Ok(self
             .conn
-            .prepare(&sql)?
+            .prepare_cached(
+                "SELECT j.key, SUM(j.value),
+                        SUM(coalesce(json_extract(o.skipped_tokens_by_reason, '$.\"' || j.key || '\"'), 0)),
+                        COUNT(DISTINCT o.request_id), MIN(o.request_id)
+                 FROM optimization_events o, json_each(o.skipped_by_reason) j
+                 WHERE o.tenant=?1 AND o.time_ms>=?2 AND o.time_ms<?3
+                 GROUP BY j.key ORDER BY 3 DESC, 1",
+            )?
             .query_map((tenant, from, to), |r| {
                 Ok(Opportunity {
                     name: r.get(0)?,
