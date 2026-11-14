@@ -949,3 +949,104 @@ async fn the_ref_store_the_router_is_built_on_is_the_one_the_config_asks_for() {
         "the fragment must land in the store the deployment configured"
     );
 }
+
+/// Every count in a tool schema uses JSON Schema's own vocabulary.
+///
+/// `schemars` renders a `usize` with `"format": "uint"`, which is not a format
+/// the specification defines. Validators ignore it, so nothing breaks — but
+/// Claude Code prints a warning for each one, on every session that lists these
+/// tools, in the place a user reads to find out what went wrong. This keeps the
+/// next `usize` added to a wire type from quietly putting it back.
+#[test]
+fn no_tool_schema_declares_a_format_json_schema_does_not_define() {
+    use schemars::schema_for;
+
+    for (name, schema) in [
+        (
+            "RetrieveInput",
+            schema_for!(kompressor_mcp::wire::RetrieveInput),
+        ),
+        (
+            "RetrieveOutput",
+            schema_for!(kompressor_mcp::wire::RetrieveOutput),
+        ),
+        (
+            "CompressInput",
+            schema_for!(kompressor_mcp::wire::CompressInput),
+        ),
+    ] {
+        let rendered = serde_json::to_string(&schema).expect("schema serialises");
+        assert!(
+            !rendered.contains("\"uint"),
+            "{name} still declares a uint format: use #[schemars(schema_with = \"non_negative_integer\")]"
+        );
+    }
+}
+
+/// A ranged or truncated retrieval says so in a text block, not only in the
+/// envelope.
+///
+/// Claude Desktop's chat surfaces text blocks and drops `structuredContent`, so
+/// a model there sees the fragment and nothing else — `truncated` included,
+/// which is the one field the tool description tells it to act on. Reported from
+/// a real session as "`found`: absent — the response was raw log text with no
+/// envelope fields".
+#[tokio::test]
+async fn a_ranged_retrieval_reports_the_whole_size_in_text() {
+    let core = keyed_core();
+    let router = kompressor_mcp::mcp_router(core.clone());
+
+    // Something long enough to be retained and worth ranging.
+    let body: String = (1..=200)
+        .map(|i| format!("line {i} of the fragment\n"))
+        .collect();
+    let (status, compressed) = rpc(
+        &router,
+        Some(KEY_A),
+        HOST,
+        call(
+            1,
+            "optscale_kompressor_compress_raw",
+            json!({ "content": body }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{compressed}");
+
+    let text = serde_json::to_string(&compressed).unwrap();
+    let Some(handle) = text
+        .split("ref:k_")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
+                .next()
+        })
+        .map(|r| format!("k_{r}"))
+    else {
+        // Nothing was elided, so there is nothing to range over.
+        return;
+    };
+
+    let (status, retrieved) = rpc(
+        &router,
+        Some(KEY_A),
+        HOST,
+        call(
+            2,
+            "optscale_kompressor_retrieve",
+            json!({ "ref": handle, "range": { "lines": { "start": 1, "end": 3 } } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{retrieved}");
+
+    let blocks = serde_json::to_string(&retrieved).unwrap();
+    assert!(
+        blocks.contains("[kompressor: a range of ref:"),
+        "a ranged retrieval must say so in text, for clients that show no envelope: {blocks}"
+    );
+    assert!(
+        blocks.contains("lines /"),
+        "the note must carry the whole fragment's size: {blocks}"
+    );
+}

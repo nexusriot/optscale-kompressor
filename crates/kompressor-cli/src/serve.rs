@@ -171,6 +171,17 @@ fn upstream_client(config: &Config) -> Result<reqwest::Client, CliError> {
 ///
 /// `RUST_LOG` wins over the configured level, as the configuration says it does.
 fn init_logging(log: &kompressor_core::config::LogConfig) {
+    init_logging_to(log, std::io::stdout, true);
+}
+
+/// [`init_logging`], writing somewhere other than stdout.
+///
+/// `ansi` is off for a destination that ends up in a file rather than a
+/// terminal, where colour codes are noise in every line.
+fn init_logging_to<W>(log: &kompressor_core::config::LogConfig, writer: W, ansi: bool)
+where
+    W: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
+{
     use tracing_subscriber::filter::EnvFilter;
     use tracing_subscriber::fmt;
 
@@ -184,9 +195,13 @@ fn init_logging(log: &kompressor_core::config::LogConfig) {
         "json" => fmt::Subscriber::builder()
             .json()
             .with_env_filter(filter)
+            .with_writer(writer)
+            .with_ansi(ansi)
             .try_init(),
         _ => fmt::Subscriber::builder()
             .with_env_filter(filter)
+            .with_writer(writer)
+            .with_ansi(ansi)
             .try_init(),
     };
 }
@@ -200,16 +215,29 @@ fn init_logging(log: &kompressor_core::config::LogConfig) {
 /// [`run`]: there is no address to bind and no listener to compose, and the
 /// process must keep stdout clear for the protocol.
 ///
-/// That last point is why logging is deliberately not initialised here. Every
-/// other command is free to write progress to the terminal; here a single
-/// stray line on stdout is a protocol violation that the runtime reports as a
-/// broken server. Tracing's default is stdout, so the safe thing is to leave it
-/// off entirely rather than to configure it and hope.
+/// That last point is why logging goes to **stderr** here. Every other command
+/// logs to stdout; here a single stray line on stdout is a protocol violation
+/// that the runtime reports as a broken server. Stderr is the channel MCP
+/// leaves a stdio server for exactly this, and runtimes keep it — Claude
+/// Desktop in its per-server log file.
+///
+/// It used to be off entirely, which was safe and left proxy mode mute: a
+/// fronted server that did not start, did not answer `initialize`, or was
+/// skipped for its configuration vanished from the tool list with nothing
+/// anywhere to say why.
 ///
 /// The store this opens is the one named by `config`, which is how a fragment
 /// the proxy elided becomes one this server can hand back: the wrap points both
 /// at the same configuration, so a handle minted on the proxy resolves here.
 pub async fn run_stdio(config: Config) -> CliResult {
+    // rmcp logs every handshake and notification at `info`, peer info and all,
+    // which in a per-server log buries the lines that say a fronted server was
+    // skipped. Held to `warn` here; `RUST_LOG` still overrides the whole filter.
+    let log = kompressor_core::config::LogConfig {
+        level: format!("{},rmcp=warn", config.log.level),
+        ..config.log.clone()
+    };
+    init_logging_to(&log, std::io::stderr, false);
     let (core, running) = build_core(config)?;
     let (stop, rx) = tokio::sync::watch::channel(false);
     let upkeep = maintenance(core.clone(), rx);

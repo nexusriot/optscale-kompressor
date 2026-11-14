@@ -464,7 +464,10 @@ This covers the Code tab. The **Chat tab** reaches `claude.ai` with a web
 session and its own conversation API — nothing a reverse proxy can serve, and
 nothing worth serving: its history is held server-side, so a turn carries one
 message and an id. Setup, measurements and the limits:
-[docs/CLAUDE-DESKTOP.md](docs/CLAUDE-DESKTOP.md).
+[docs/CLAUDE-DESKTOP.md](docs/CLAUDE-DESKTOP.md). What Chat does carry in bulk
+is MCP tool results, and `kompressor mcp serve` can front the servers that
+produce them and compress what they return:
+[docs/MCP-PROXY.md](docs/MCP-PROXY.md).
 
 ### Any client, through the proxy
 
@@ -583,6 +586,7 @@ are in [docs/charts/](docs/charts/).
 | Dashboards | `GET /v1/stats/{trends,yield,store-health,keepwarm,upstream,engine}`: long-horizon trends, yield by content type, store health, keep-warm return, upstream incidents, engine time; plus a conversation timeline page |
 | Ref store  | `GET /v1/refs`: search, inspect and delete stored fragments, as JSON or a page; off unless `refs.browse = true`                                                           |
 | MCP server | `kompressor serve --mcp` (streamable HTTP): `optscale_kompressor_retrieve`, `optscale_kompressor_compress`, `optscale_kompressor_compress_raw`, `optscale_kompressor_stats` |
+| MCP proxy  | `kompressor mcp serve` (stdio): the same tools, plus those of every `[[mcp.servers]]` it fronts, with their results compressed                                            |
 | CLI        | `kompressor compress`, `retrieve`, `detect`, `stats`, `bench`, `check-config`                                                                                               |
 | Library    | the `kompressor-engine` crate: compress a string or a conversation, no I/O                                                                                                  |
 
