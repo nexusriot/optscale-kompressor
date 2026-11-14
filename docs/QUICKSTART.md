@@ -258,6 +258,7 @@ $ curl -s localhost:8817/v1/retrieve -H 'content-type: application/json' \
 | `GET /v1/stats/summary` `by_type` `histogram` `requests` `retrievals` `store` | the same reports as `kompressor stats` — mounted only when `stats.enabled` (the default); with statistics off the whole prefix 404s |
 | `GET /v1/stats/live` | live statistics: JSON, or a dashboard that refreshes itself when opened in a browser (`?format=html`) |
 | `GET /v1/stats/cache` | prompt-cache analysis: reads, writes and lost prefixes per conversation, keep-warm, idle gaps — JSON or a page (`?format=html`) |
+| `GET /v1/stats/trends` `yield` `store-health` `keepwarm` `upstream` `engine` | the dashboards: long-horizon trends, yield by content type, ref-store health, keep-warm return, upstream incidents, engine time — JSON or a page (`?format=html`); on the statistics listener at `/trends`, `/yield`, `/store`, `/keepwarm`, `/upstream`, `/engine`, with a conversation timeline at `/timeline` |
 | `GET /v1/refs` | the ref browser: the fragments recoverable compression stored, searchable, as JSON or a page — off unless `refs.browse = true` |
 | `GET /healthz` `/readyz` `/metrics` | liveness, readiness, Prometheus |
 

@@ -50,9 +50,11 @@
 #![forbid(unsafe_code)]
 
 pub mod analysis;
+pub mod breakdown;
 pub mod cache;
 pub mod config;
 pub mod context;
+pub mod dashboards;
 pub mod error;
 pub mod events;
 pub mod history;

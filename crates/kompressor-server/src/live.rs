@@ -232,11 +232,13 @@ pub(crate) fn live_routes() -> Router<Arc<ServerState>> {
         )
         .route("/stats/analysis/latency", get(crate::analysis::latency))
         .route("/stats/analysis/compare", get(crate::analysis::comparison))
+        .merge(crate::dashboards::dashboard_routes())
 }
 
 /// Everything the dedicated statistics listener serves: the page at `/`, the
-/// ref browser at `/refs`, the cache analysis at `/cache`, the versioned live,
-/// cache and ref routes, and the probes.
+/// ref browser at `/refs`, the cache analysis at `/cache`, the dashboards at
+/// `/trends`, `/yield`, `/timeline`, `/store`, `/keepwarm`, `/upstream` and
+/// `/engine`, the versioned reporting and ref routes, and the probes.
 pub fn stats_listener_router(state: Arc<ServerState>) -> Router {
     let routes = live_routes()
         .merge(crate::refs::refs_routes())
@@ -245,7 +247,8 @@ pub fn stats_listener_router(state: Arc<ServerState>) -> Router {
         .route("/", get(page_at_root))
         .route("/refs", get(crate::refs::page_on_stats_listener))
         .route("/cache", get(crate::cache::page_on_stats_listener))
-        .route("/analysis", get(crate::analysis::page_on_stats_listener))
+        .route("/analysis", get(crate::analysis::page_on_stats_listener));
+    let router = crate::dashboards::listener_pages(router)
         .with_state(state.clone())
         .nest("/v1", routes.clone())
         .nest("/v2", routes)
@@ -332,7 +335,7 @@ async fn respond(
     })
 }
 
-fn server_info(state: &ServerState) -> ServerInfo {
+pub(crate) fn server_info(state: &ServerState) -> ServerInfo {
     let config = state.core.config();
     let (started, started_at_ms) = *STARTED.get_or_init(|| (Instant::now(), now_ms()));
     ServerInfo {

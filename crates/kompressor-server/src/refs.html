@@ -168,6 +168,7 @@ pre { background: var(--bg); border-color: var(--line); }
     <span class="meta"><span id="status-dot" class="dot"></span><span id="status">connecting…</span></span>
     <div class="controls">
       <a id="live-link" href="#">Live stats</a>
+    <a id="dashboards-link" href="#">Dashboards</a>
       <a id="analysis-link" href="#">Analysis</a>
     <a id="cache-link" href="#">Cache</a>
       <button id="pause" aria-pressed="false" title="Re-list automatically">Pause</button>
@@ -651,6 +652,18 @@ $("limit").value = String(state.limit);
 $("expired").checked = state.expired;
 load();
 if (state.selected) openDetail(state.selected);
+</script>
+<script>
+// The dashboards sit at /trends on the statistics listener and at
+// /v1/stats/trends (or /v2/...) on the API.
+(() => {
+  const link = document.getElementById("dashboards-link");
+  const version = /^\/v[12]\//.exec(location.pathname);
+  const url = new URL(version ? version[0] + "stats/trends" : "/trends", location.origin);
+  const tenant = new URLSearchParams(location.search).get("tenant");
+  if (tenant) url.searchParams.set("tenant", tenant);
+  link.href = url.pathname + url.search;
+})();
 </script>
 </body>
 </html>

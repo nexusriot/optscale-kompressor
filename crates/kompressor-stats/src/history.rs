@@ -136,6 +136,35 @@ fn dimension(
     Ok(d)
 }
 
+/// [`dimension`], remembered per distinct input. A run context is a few
+/// kilobytes of JSON shared by every request of a run, so parsing and
+/// re-serialising it per row was most of the cost of a long window; a window
+/// holds a handful of distinct contexts, not one per row.
+#[derive(Default)]
+struct Dimensions(std::collections::HashMap<DimensionInput, Dimension>);
+
+/// What [`dimension`] is computed from: model, mode, surface, run context.
+type DimensionInput = (Option<String>, Option<String>, String, Option<String>);
+
+impl Dimensions {
+    fn get(
+        &mut self,
+        model: Option<String>,
+        mode: Option<String>,
+        surface: String,
+        ctx: Option<String>,
+    ) -> Result<Dimension, StatsError> {
+        let key = (model, mode, surface, ctx);
+        if let Some(found) = self.0.get(&key) {
+            return Ok(found.clone());
+        }
+        let (model, mode, surface, ctx) = key.clone();
+        let made = dimension(model, mode, surface, ctx)?;
+        self.0.insert(key, made.clone());
+        Ok(made)
+    }
+}
+
 // Aggregating the three streams independently avoids multiplying usage by the
 // number of optimization/retrieval rows sharing a request ID.
 fn raw(
@@ -146,12 +175,13 @@ fn raw(
     unarchived_only: bool,
 ) -> Result<Groups, StatsError> {
     let mut groups = Groups::new();
+    let mut dimensions = Dimensions::default();
     let mut stmt=conn.prepare("SELECT coalesce(o.model,c.model),o.mode,o.surface,c.context,o.tokens_in-o.tokens_out,o.outcome
       FROM optimization_events o LEFT JOIN request_context c ON c.tenant=o.tenant AND c.request_id=o.request_id
       WHERE o.tenant=?1 AND o.time_ms>=?2 AND o.time_ms<?3 AND (?4=0 OR o.analysis_archived=0)")?;
     let mut rows = stmt.query(params![tenant, from, to, unarchived_only])?;
     while let Some(r) = rows.next()? {
-        let d = dimension(r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)?;
+        let d = dimensions.get(r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)?;
         let m = &mut groups.entry(d).or_default().0;
         m.compressions += 1;
         if r.get::<_, Option<String>>(5)?.as_deref() != Some("discarded") {
@@ -163,7 +193,7 @@ fn raw(
       WHERE p.tenant=?1 AND p.time_ms>=?2 AND p.time_ms<?3 AND (?4=0 OR p.analysis_archived=0)")?;
     let mut rows = stmt.query(params![tenant, from, to, unarchived_only])?;
     while let Some(r) = rows.next()? {
-        let d = dimension(r.get(0)?, r.get(1)?, "proxy".into(), r.get(2)?)?;
+        let d = dimensions.get(r.get(0)?, r.get(1)?, "proxy".into(), r.get(2)?)?;
         let rate = rates(&r.get::<_, String>(3)?, Some(&d.model));
         let (m, convs) = groups.entry(d).or_default();
         let ping = r.get::<_, bool>(4)?;
@@ -211,7 +241,7 @@ fn raw(
       WHERE r.tenant=?1 AND r.time_ms>=?2 AND r.time_ms<?3 AND r.found=1 AND r.withheld=0 AND (?4=0 OR r.analysis_archived=0)")?;
     let mut rows = stmt.query(params![tenant, from, to, unarchived_only])?;
     while let Some(r) = rows.next()? {
-        let d = dimension(r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)?;
+        let d = dimensions.get(r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)?;
         groups.entry(d).or_default().0.retrieved_tokens += r.get::<_, i64>(4)?;
     }
     Ok(groups)

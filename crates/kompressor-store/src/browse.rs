@@ -209,8 +209,40 @@ impl RefDetail {
     }
 }
 
+/// One entry's bookkeeping, without its fragment: what a census of the store
+/// is made of.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefCensusEntry {
+    /// The handle body, without the `k_` marker prefix.
+    pub id: String,
+    pub kind: String,
+    pub bytes: u64,
+    pub created_at: u64,
+    pub last_accessed: u64,
+    /// When the entry stops being retrievable unless it is read first.
+    pub expires_at: u64,
+    pub expired: bool,
+}
+
+/// The most entries a census returns. A store holding more is described by
+/// its newest entries, and says so.
+pub const MAX_CENSUS_ENTRIES: usize = 200_000;
+
+/// Every entry of one tenant, newest first, at most [`MAX_CENSUS_ENTRIES`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RefCensus {
+    pub entries: Vec<RefCensusEntry>,
+    /// Whether the tenant held more entries than were returned.
+    pub truncated: bool,
+}
+
 /// Listing, inspecting and deleting entries. See the module docs.
 pub trait RefBrowse: Send + Sync {
+    /// Every entry of `tenant`, expired or not, with no fragment text: what
+    /// the store-health and compression-yield dashboards are drawn from.
+    /// Like [`RefBrowse::inspect`] it touches nothing.
+    fn census(&self, tenant: &Tenant) -> Result<RefCensus, StoreError>;
+
     /// One page of `tenant`'s entries.
     fn browse(&self, tenant: &Tenant, query: &BrowseQuery) -> Result<BrowsePage, StoreError>;
 
