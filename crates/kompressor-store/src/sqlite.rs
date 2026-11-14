@@ -13,14 +13,20 @@
 //! patterns, different retention, and only this one holds payload bytes, so
 //! only this one has to be placed with care.
 
+use crate::browse::{
+    BrowseOrder, BrowsePage, BrowseQuery, MAX_CENSUS_ENTRIES, RefBrowse, RefCensus, RefCensusEntry,
+    RefDetail, RefSummary,
+};
 use crate::clock::Clock;
 use crate::types::{
     Lookup, PutMeta, RefRecord, RefStore, StoreError, StoreStats, Tenant, expires_at, is_expired,
 };
 use kompressor_engine::refs::RefId;
-use parking_lot::Mutex;
-use rusqlite::{Connection, OptionalExtension, params};
+use parking_lot::{Mutex, MutexGuard};
+use rusqlite::types::Value;
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The default size cap on live fragments.
 pub const DEFAULT_MAX_BYTES: u64 = 1024 * 1024 * 1024;
@@ -75,6 +81,7 @@ ON CONFLICT(tenant, ref) DO UPDATE SET
   max_lifetime  = excluded.max_lifetime,
   kind          = excluded.kind,
   request_id    = coalesce(excluded.request_id, refs.request_id)
+RETURNING created_at
 ";
 
 const SQL_GET: &str = "
@@ -82,7 +89,15 @@ SELECT fragment, kind, request_id, created_at, last_accessed, ttl_seconds, max_l
 FROM refs WHERE tenant = ?1 AND ref = ?2
 ";
 
-const SQL_DELETE_ONE: &str = "DELETE FROM refs WHERE tenant = ?1 AND ref = ?2";
+const SQL_DELETE_ONE: &str = "DELETE FROM refs WHERE tenant = ?1 AND ref = ?2 RETURNING bytes";
+
+/// The stored size of one row, read before an upsert so the byte counter can
+/// charge the difference rather than the whole fragment again.
+const SQL_BYTES_OF: &str = "SELECT bytes FROM refs WHERE tenant = ?1 AND ref = ?2";
+
+/// Every row's bytes, live or not: what [`SqliteRefStore`] seeds its byte
+/// counter from, and reconciles it against on each purge.
+const SQL_TOTAL_BYTES: &str = "SELECT coalesce(sum(bytes), 0) FROM refs";
 
 /// The liveness predicate is repeated in SQL rather than filtered in Rust so a
 /// touch cannot resurrect an entry the absolute cap already killed.
@@ -103,17 +118,24 @@ DELETE FROM refs WHERE (tenant, ref) IN (
 )
 ";
 
-const SQL_LIVE_BYTES: &str = "
-SELECT coalesce(sum(bytes), 0) FROM refs
-WHERE last_accessed + ttl_seconds >= ?1 AND created_at + max_lifetime >= ?1
+/// Total and live bytes in one pass: the cap is enforced against the live
+/// figure, and the total re-seeds the byte counter the scan was run to check.
+const SQL_CAP_BYTES: &str = "
+SELECT coalesce(sum(bytes), 0),
+       coalesce(sum(CASE WHEN last_accessed + ttl_seconds >= ?1
+                          AND created_at + max_lifetime >= ?1 THEN bytes ELSE 0 END), 0)
+FROM refs
 ";
+
+/// The cheapest statement that still proves the table is readable.
+const SQL_PING: &str = "SELECT count(*) FROM (SELECT 1 FROM refs LIMIT 1)";
 
 /// Eviction order is last access first, with the key as a tie-break: one
 /// compression stores its whole batch in the same second, and without the
 /// tie-break which member of that batch dies would vary run to run.
 ///
 /// **Live rows only, and that is load-bearing.** The byte cap is enforced
-/// against `SQL_LIVE_BYTES`, which excludes expired rows; an expired row among
+/// against the live half of `SQL_CAP_BYTES`, which excludes expired rows; an expired row among
 /// the candidates had its bytes subtracted from a total that never included
 /// them, so the loop stopped early and left the store over its cap. Measured:
 /// cap 100, one expired 100-byte row and two live 60-byte rows, eviction
@@ -134,6 +156,26 @@ WHERE last_accessed + ttl_seconds >= ?1 AND created_at + max_lifetime >= ?1
 const SQL_STATS_FOR_TENANT: &str = "
 SELECT count(*), coalesce(sum(bytes), 0), min(created_at) FROM refs
 WHERE tenant = ?2 AND last_accessed + ttl_seconds >= ?1 AND created_at + max_lifetime >= ?1
+";
+
+/// The row the browser reads: [`SQL_GET`] plus the handle, with the fragment
+/// cut to a preview so a page never pulls whole fragments. `{head}` and
+/// `{start}` are the preview and the characters before it.
+const SQL_BROWSE_COLUMNS: &str = "ref, {head}, {start}, bytes, kind, request_id, \
+     created_at, last_accessed, ttl_seconds, max_lifetime";
+
+/// Bookkeeping only: the fragment column is never read, so a census of a
+/// gigabyte store moves a few megabytes.
+const SQL_CENSUS: &str = "
+SELECT ref, kind, bytes, created_at, last_accessed, ttl_seconds, max_lifetime
+FROM refs WHERE tenant = ?1
+ORDER BY created_at DESC, ref
+LIMIT ?2
+";
+
+const SQL_INSPECT: &str = "
+SELECT fragment, kind, request_id, created_at, last_accessed, ttl_seconds, max_lifetime
+FROM refs WHERE tenant = ?1 AND ref = ?2
 ";
 
 /// Knobs that are not the file path.
@@ -166,6 +208,26 @@ pub struct SqliteRefStore {
     conn: Mutex<Connection>,
     clock: Clock,
     max_bytes: Option<u64>,
+    /// An upper bound on the bytes of every row, expired ones included,
+    /// maintained by this process's own writes and only changed while `conn`
+    /// is locked.
+    ///
+    /// It exists so a put does not have to sum the whole table to learn that
+    /// the store is nowhere near its cap: live bytes can never exceed stored
+    /// bytes, so a bound under the cap settles the question with no scan. The
+    /// exact scan still runs once the bound crosses the cap, and re-seeds it.
+    /// Another process writing the same file is not seen here; the purge pass
+    /// re-reads the true total, which bounds how long that can mislead.
+    stored_bytes: AtomicU64,
+    /// A second, read-only connection for the ref browser, when the store is
+    /// a file.
+    ///
+    /// A browse search lowercases every fragment it scans and sorts on columns
+    /// no index covers; on the main connection that held the lock every put
+    /// and retrieval waits on for as long as an operator's search took. WAL
+    /// lets this connection read a committed snapshot beside the writer. An
+    /// in-memory store cannot be opened twice and browses on `conn`.
+    browse_conn: Option<Mutex<Connection>>,
 }
 
 impl SqliteRefStore {
@@ -179,8 +241,27 @@ impl SqliteRefStore {
         path: impl AsRef<Path>,
         options: SqliteOptions,
     ) -> Result<SqliteRefStore, StoreError> {
+        let path = path.as_ref();
         let conn = Connection::open(path)?;
-        SqliteRefStore::from_connection(conn, options)
+        let mut store = SqliteRefStore::from_connection(conn, options)?;
+        // Opened after the main connection has created and migrated the file.
+        // A failure here costs only the isolation, never the store.
+        store.browse_conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_URI
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .and_then(|reader| {
+            reader.execute_batch("PRAGMA busy_timeout=5000; PRAGMA temp_store=MEMORY;")?;
+            Ok(reader)
+        })
+        .map_err(|error| {
+            tracing::debug!(%error, "ref browser shares the store connection");
+        })
+        .ok()
+        .map(Mutex::new);
+        Ok(store)
     }
 
     /// A private in-memory database.
@@ -253,11 +334,29 @@ impl SqliteRefStore {
     ) -> Result<SqliteRefStore, StoreError> {
         configure(&conn)?;
         migrate(&conn)?;
+        let stored: i64 = conn.query_row(SQL_TOTAL_BYTES, [], |row| row.get(0))?;
         Ok(SqliteRefStore {
             conn: Mutex::new(conn),
             clock: options.clock,
             max_bytes: options.max_bytes,
+            stored_bytes: AtomicU64::new(stored.max(0) as u64),
+            browse_conn: None,
         })
+    }
+
+    /// The connection browse reads go through: the read-only one when there is
+    /// one, otherwise the store's own.
+    fn reader(&self) -> MutexGuard<'_, Connection> {
+        self.browse_conn.as_ref().unwrap_or(&self.conn).lock()
+    }
+
+    /// Take `bytes` off the stored-bytes bound, never below zero.
+    fn release(&self, bytes: i64) {
+        // Every caller holds the connection lock, which is what serialises
+        // writes to the bound, so a load and a store cannot interleave.
+        let held = self.stored_bytes.load(Ordering::Relaxed);
+        self.stored_bytes
+            .store(held.saturating_sub(bytes.max(0) as u64), Ordering::Relaxed);
     }
 
     /// Evict by last access until live bytes sit under 90% of the cap.
@@ -265,8 +364,17 @@ impl SqliteRefStore {
         let Some(cap) = self.max_bytes else {
             return Ok(());
         };
+        // Live bytes are a subset of stored bytes, so a bound under the cap
+        // answers without reading the table.
+        if self.stored_bytes.load(Ordering::Relaxed) <= cap {
+            return Ok(());
+        }
         let now = clamp_i64(now);
-        let live: i64 = conn.query_row(SQL_LIVE_BYTES, params![now], |row| row.get(0))?;
+        let (total, live): (i64, i64) = conn.query_row(SQL_CAP_BYTES, params![now], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+        self.stored_bytes
+            .store(total.max(0) as u64, Ordering::Relaxed);
         let mut remaining = live.max(0) as u64;
         if remaining <= cap {
             return Ok(());
@@ -298,8 +406,11 @@ impl SqliteRefStore {
                     if remaining <= target {
                         break;
                     }
-                    delete.execute(params![tenant, id])?;
+                    delete
+                        .query_row(params![tenant, id], |row| row.get::<_, i64>(0))
+                        .optional()?;
                     remaining = remaining.saturating_sub(bytes.max(0) as u64);
+                    self.release(bytes);
                 }
             }
             tx.commit()?;
@@ -320,11 +431,22 @@ impl RefStore for SqliteRefStore {
         refs: &[(RefId, String)],
         meta: &PutMeta,
     ) -> Result<(), StoreError> {
+        self.put_many_created(tenant, refs, meta).map(|_| ())
+    }
+
+    fn put_many_created(
+        &self,
+        tenant: &Tenant,
+        refs: &[(RefId, String)],
+        meta: &PutMeta,
+    ) -> Result<Option<Vec<u64>>, StoreError> {
         if refs.is_empty() {
-            return Ok(());
+            return Ok(Some(Vec::new()));
         }
         let now = self.clock.now();
         let mut conn = self.conn.lock();
+        let mut created = Vec::with_capacity(refs.len());
+        let mut added: i64 = 0;
         {
             // One transaction for the batch: a request's elisions become
             // retrievable together, and fsync cost is paid once rather than per
@@ -332,25 +454,46 @@ impl RefStore for SqliteRefStore {
             let tx = conn.transaction()?;
             {
                 let mut stmt = tx.prepare_cached(SQL_UPSERT)?;
+                let mut sized = tx.prepare_cached(SQL_BYTES_OF)?;
                 for (id, fragment) in refs {
-                    stmt.execute(params![
-                        tenant.as_str(),
-                        id.body(),
-                        fragment.as_bytes(),
-                        fragment.len() as i64,
-                        meta.kind.as_str(),
-                        meta.request_id.as_deref(),
-                        clamp_i64(now),
-                        clamp_i64(now),
-                        clamp_i64(meta.ttl_seconds),
-                        clamp_i64(meta.max_lifetime_seconds),
-                    ])?;
+                    // A point read on the primary key: a re-store, which is
+                    // most of them on a long conversation, charges only the
+                    // difference (normally none) instead of the whole fragment.
+                    let previous: i64 = sized
+                        .query_row(params![tenant.as_str(), id.body()], |row| row.get(0))
+                        .optional()?
+                        .unwrap_or(0);
+                    added += fragment.len() as i64 - previous.max(0);
+                    // `RETURNING` reports the row as it stands after the
+                    // upsert, so a re-store answers with its first creation.
+                    let at: i64 = stmt.query_row(
+                        params![
+                            tenant.as_str(),
+                            id.body(),
+                            fragment.as_bytes(),
+                            fragment.len() as i64,
+                            meta.kind.as_str(),
+                            meta.request_id.as_deref(),
+                            clamp_i64(now),
+                            clamp_i64(now),
+                            clamp_i64(meta.ttl_seconds),
+                            clamp_i64(meta.max_lifetime_seconds),
+                        ],
+                        |row| row.get(0),
+                    )?;
+                    created.push(at.max(0) as u64);
                 }
             }
             tx.commit()?;
         }
+        // Charged only after the commit: a batch that rolled back stored nothing.
+        if added >= 0 {
+            self.stored_bytes.fetch_add(added as u64, Ordering::Relaxed);
+        } else {
+            self.release(-added);
+        }
         self.enforce_byte_cap(&mut conn, now)?;
-        Ok(())
+        Ok(Some(created))
     }
 
     fn get(&self, tenant: &Tenant, id: &RefId, touch: bool) -> Result<Lookup, StoreError> {
@@ -400,7 +543,14 @@ impl RefStore for SqliteRefStore {
         if is_expired(&record, max_lifetime, now) {
             let expired_at = expires_at(&record, max_lifetime);
             let mut stmt = conn.prepare_cached(SQL_DELETE_ONE)?;
-            stmt.execute(params![tenant.as_str(), id.body()])?;
+            if let Some(bytes) = stmt
+                .query_row(params![tenant.as_str(), id.body()], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .optional()?
+            {
+                self.release(bytes);
+            }
             return Ok(Lookup::Expired { expired_at });
         }
         if touch {
@@ -444,8 +594,21 @@ impl RefStore for SqliteRefStore {
                 break;
             }
         }
+        // The periodic sweep is where the bound is made exact again: it is off
+        // the request path, and it also picks up rows another process wrote or
+        // deleted.
+        let stored: i64 = conn.query_row(SQL_TOTAL_BYTES, [], |row| row.get(0))?;
+        self.stored_bytes
+            .store(stored.max(0) as u64, Ordering::Relaxed);
         self.enforce_byte_cap(&mut conn, now)?;
         Ok(removed)
+    }
+
+    fn ping(&self) -> Result<(), StoreError> {
+        let conn = self.conn.lock();
+        conn.prepare_cached(SQL_PING)?
+            .query_row([], |row| row.get::<_, i64>(0))?;
+        Ok(())
     }
 
     fn stats(&self) -> Result<StoreStats, StoreError> {
@@ -466,6 +629,348 @@ impl RefStore for SqliteRefStore {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?;
         Ok(into_stats(row))
+    }
+
+    fn browser(&self) -> Option<&dyn RefBrowse> {
+        Some(self)
+    }
+}
+
+/// A `WHERE` clause and the values it binds, built one filter at a time.
+struct Filter {
+    clause: String,
+    values: Vec<Value>,
+}
+
+impl Filter {
+    fn new(tenant: &Tenant) -> Filter {
+        Filter {
+            clause: "tenant = ?1".to_owned(),
+            values: vec![Value::Text(tenant.0.clone())],
+        }
+    }
+
+    /// Append `condition`, which numbers its placeholders from the index it
+    /// is handed, and the values they bind in that order.
+    fn and(&mut self, condition: impl FnOnce(usize) -> String, values: Vec<Value>) {
+        let next = self.values.len() + 1;
+        self.clause.push_str(" AND ");
+        self.clause.push_str(&condition(next));
+        self.values.extend(values);
+    }
+
+    fn live(&mut self, now: i64) {
+        self.and(
+            |n| {
+                format!("last_accessed + ttl_seconds >= ?{n} AND created_at + max_lifetime >= ?{n}")
+            },
+            vec![Value::Integer(now)],
+        );
+    }
+}
+
+impl RefBrowse for SqliteRefStore {
+    fn census(&self, tenant: &Tenant) -> Result<RefCensus, StoreError> {
+        let now = self.clock.now();
+        let conn = self.reader();
+        let mut stmt = conn.prepare_cached(SQL_CENSUS)?;
+        let mut entries = stmt
+            .query_map(
+                params![tenant.as_str(), (MAX_CENSUS_ENTRIES + 1) as i64],
+                |row| {
+                    let created = row.get::<_, i64>(3)?.max(0) as u64;
+                    let accessed = row.get::<_, i64>(4)?.max(0) as u64;
+                    let ttl = row.get::<_, i64>(5)?.max(0) as u64;
+                    let lifetime = row.get::<_, i64>(6)?.max(0) as u64;
+                    let expires_at = accessed
+                        .saturating_add(ttl)
+                        .min(created.saturating_add(lifetime));
+                    Ok(RefCensusEntry {
+                        id: row.get(0)?,
+                        kind: row.get(1)?,
+                        bytes: row.get::<_, i64>(2)?.max(0) as u64,
+                        created_at: created,
+                        last_accessed: accessed,
+                        expires_at,
+                        expired: expires_at < now,
+                    })
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        let truncated = entries.len() > MAX_CENSUS_ENTRIES;
+        entries.truncate(MAX_CENSUS_ENTRIES);
+        Ok(RefCensus { entries, truncated })
+    }
+
+    fn browse(&self, tenant: &Tenant, query: &BrowseQuery) -> Result<BrowsePage, StoreError> {
+        let now = clamp_i64(self.clock.now());
+        let mut scope = Filter::new(tenant);
+        if !query.include_expired {
+            scope.live(now);
+        }
+
+        let mut filter = Filter {
+            clause: scope.clause.clone(),
+            values: scope.values.clone(),
+        };
+        if let Some(kind) = &query.kind {
+            filter.and(|n| format!("kind = ?{n}"), vec![Value::Text(kind.clone())]);
+        }
+        if let Some(request_id) = &query.request_id {
+            filter.and(
+                |n| format!("request_id = ?{n}"),
+                vec![Value::Text(request_id.clone())],
+            );
+        }
+        if let Some(id) = query.exact_handle() {
+            filter.and(
+                |n| format!("ref = ?{n}"),
+                vec![Value::Text(id.body().to_owned())],
+            );
+        } else if let Some(needle) = query.needle() {
+            // `lower()` folds ASCII only, which is what the memory backend's
+            // matcher does too. A handle that cannot match passes `NULL`, and
+            // `instr` of `NULL` is never positive.
+            let handle = query.handle_needle().map_or(Value::Null, Value::Text);
+            filter.and(
+                |n| {
+                    format!(
+                        "(instr(lower(CAST(fragment AS TEXT)), ?{n}) > 0 \
+                          OR instr(lower(ref), ?{h}) > 0 \
+                          OR instr(lower(coalesce(request_id, '')), ?{n}) > 0)",
+                        h = n + 1
+                    )
+                },
+                vec![Value::Text(needle), handle],
+            );
+        }
+
+        // Every order ends on the handle, as eviction does, so a page boundary
+        // inside a batch written in one second is stable across requests.
+        let order = match query.order {
+            BrowseOrder::Newest => "created_at DESC, ref ASC",
+            BrowseOrder::Oldest => "created_at ASC, ref ASC",
+            BrowseOrder::RecentlyUsed => "last_accessed DESC, ref ASC",
+            BrowseOrder::Largest => "bytes DESC, ref ASC",
+            BrowseOrder::ExpiringSoon => {
+                "min(last_accessed + ttl_seconds, created_at + max_lifetime) ASC, ref ASC"
+            }
+        };
+
+        let chars = query.preview_limit();
+        let narrowed = filter.clause != scope.clause;
+        let conn = self.reader();
+
+        let kinds = {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT kind, count(*) FROM refs WHERE {} GROUP BY kind ORDER BY kind",
+                scope.clause
+            ))?;
+            let rows = stmt.query_map(params_from_iter(scope.values.iter()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?.max(0) as u64,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        // Unfiltered, the facets already partition exactly the rows a count
+        // would read again; only a narrowed listing needs its own count.
+        let total: i64 = if narrowed {
+            conn.query_row(
+                &format!("SELECT count(*) FROM refs WHERE {}", filter.clause),
+                params_from_iter(filter.values.iter()),
+                |row| row.get(0),
+            )?
+        } else {
+            kinds.iter().map(|(_, n)| *n as i64).sum()
+        };
+
+        let mut values = filter.values;
+        let mut bind = |value: Value| {
+            values.push(value);
+            values.len()
+        };
+        let needle = query.text_needle();
+        let (head, start) = match &needle {
+            // A window around the first match. Over TEXT, `instr` and `substr`
+            // count characters, and `lower()` folds ASCII only, which keeps
+            // the folded copy's positions the original's. No match in the
+            // text — the hit was the handle or the request — starts at 1.
+            Some(needle) => {
+                let n = bind(Value::Text(needle.clone()));
+                let lead = bind(Value::Integer(crate::browse::lead_in(chars) as i64));
+                // One character more than shown, so a cut is detectable.
+                let take = bind(Value::Integer(chars as i64 + 1));
+                let at = format!("instr(lower(CAST(fragment AS TEXT)), ?{n})");
+                (
+                    format!(
+                        "CAST(substr(CAST(fragment AS TEXT), max(1, {at} - ?{lead}), ?{take}) AS BLOB)"
+                    ),
+                    format!("max(0, {at} - 1 - ?{lead})"),
+                )
+            }
+            // Four bytes a character is the most UTF-8 can spend, so this
+            // byte prefix always holds `chars` characters when there are any.
+            None => {
+                let take = bind(Value::Integer(chars.saturating_mul(4) as i64));
+                (format!("substr(fragment, 1, ?{take})"), "0".to_owned())
+            }
+        };
+        let limit = bind(Value::Integer(query.page_limit() as i64));
+        let offset = bind(Value::Integer(query.offset.min(i64::MAX as usize) as i64));
+        let sql = format!(
+            "SELECT {} FROM refs WHERE {} ORDER BY {order} LIMIT ?{limit} OFFSET ?{offset}",
+            SQL_BROWSE_COLUMNS
+                .replace("{head}", &head)
+                .replace("{start}", &start),
+            filter.clause,
+        );
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(values.iter()), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, i64>(9)?,
+            ))
+        })?;
+        let mut entries = Vec::new();
+        for row in rows {
+            let (handle, head, start, bytes, kind, request_id, created, accessed, ttl, lifetime) =
+                row?;
+            // A row whose handle does not parse was not written by this engine;
+            // listing it would offer a handle nothing can open.
+            let Some(id) = RefId::parse(&handle) else {
+                continue;
+            };
+            let bytes = bytes.max(0) as u64;
+            let head = utf8_prefix(&head);
+            let (preview, cut) = crate::browse::preview(&head, chars);
+            let detail = RefDetail::new(
+                RefRecord {
+                    id,
+                    fragment: String::new(),
+                    kind,
+                    request_id,
+                    created_at: created.max(0) as u64,
+                    last_accessed: accessed.max(0) as u64,
+                    ttl_seconds: ttl.max(0) as u64,
+                },
+                lifetime.max(0) as u64,
+                now.max(0) as u64,
+            );
+            entries.push(RefSummary {
+                id,
+                kind: detail.record.kind,
+                request_id: detail.record.request_id,
+                bytes,
+                created_at: detail.record.created_at,
+                last_accessed: detail.record.last_accessed,
+                ttl_seconds: detail.record.ttl_seconds,
+                max_lifetime_seconds: detail.max_lifetime_seconds,
+                expires_at: detail.expires_at,
+                expired: detail.expired,
+                // A match window read one character past what it shows; a
+                // prefix read a byte count, which the fragment may outrun.
+                truncated: cut || (needle.is_none() && (head.len() as u64) < bytes),
+                preview_start: start.max(0) as u64,
+                preview,
+            });
+        }
+
+        Ok(BrowsePage {
+            total: total.max(0) as u64,
+            entries,
+            kinds,
+        })
+    }
+
+    fn inspect(&self, tenant: &Tenant, id: &RefId) -> Result<Option<RefDetail>, StoreError> {
+        let now = self.clock.now();
+        let conn = self.reader();
+        let mut stmt = conn.prepare_cached(SQL_INSPECT)?;
+        let row = stmt
+            .query_row(params![tenant.as_str(), id.body()], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            })
+            .optional()?;
+        let Some((fragment, kind, request_id, created, accessed, ttl, lifetime)) = row else {
+            return Ok(None);
+        };
+        // Lossy rather than `CorruptRow`: the operator looking at a damaged
+        // row is the one person who should still be able to see it.
+        let fragment = match String::from_utf8(fragment) {
+            Ok(text) => text,
+            Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
+        };
+        Ok(Some(RefDetail::new(
+            RefRecord {
+                id: *id,
+                fragment,
+                kind,
+                request_id,
+                created_at: created.max(0) as u64,
+                last_accessed: accessed.max(0) as u64,
+                ttl_seconds: ttl.max(0) as u64,
+            },
+            lifetime.max(0) as u64,
+            now,
+        )))
+    }
+
+    fn remove(&self, tenant: &Tenant, ids: &[RefId]) -> Result<usize, StoreError> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let mut removed = 0;
+        let mut freed: i64 = 0;
+        {
+            let mut stmt = tx.prepare_cached(SQL_DELETE_ONE)?;
+            for id in ids {
+                if let Some(bytes) = stmt
+                    .query_row(params![tenant.as_str(), id.body()], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .optional()?
+                {
+                    removed += 1;
+                    freed += bytes.max(0);
+                }
+            }
+        }
+        tx.commit()?;
+        self.release(freed);
+        Ok(removed)
+    }
+}
+
+/// The longest valid UTF-8 prefix of `bytes`. A byte-counted `substr` can end
+/// inside a character; the partial character is dropped, never repaired.
+fn utf8_prefix(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => text.to_owned(),
+        Err(error) if error.valid_up_to() > 0 || error.error_len().is_none() => {
+            String::from_utf8_lossy(&bytes[..error.valid_up_to()]).into_owned()
+        }
+        Err(_) => String::from_utf8_lossy(bytes).into_owned(),
     }
 }
 
@@ -580,6 +1085,127 @@ mod tests {
             live_bytes <= 100,
             "cap is 100 and eviction left {live_bytes} live bytes"
         );
+    }
+
+    fn stored(store: &SqliteRefStore) -> u64 {
+        store.stored_bytes.load(Ordering::Relaxed)
+    }
+
+    /// The bound charges a re-store the difference, not the whole fragment
+    /// again: on a long conversation every turn re-stores the same handles,
+    /// and a bound that grew with each turn would make the scan it exists to
+    /// skip run on every put.
+    #[test]
+    fn re_storing_a_fragment_does_not_grow_the_byte_bound() {
+        let dir = TempDir::new().unwrap();
+        let store = SqliteRefStore::open(dir.path().join("refs.db")).unwrap();
+        let tenant = Tenant::new("t");
+        let body = "x".repeat(100);
+        for _ in 0..10 {
+            store
+                .put_many(&tenant, &[(ref_for(&body), body.clone())], &meta())
+                .unwrap();
+        }
+        assert_eq!(stored(&store), 100);
+
+        store.remove(&tenant, &[ref_for(&body)]).unwrap();
+        assert_eq!(stored(&store), 0);
+    }
+
+    /// A reopened store seeds its bound from the file, so rows written by an
+    /// earlier run still count against the cap without a scan per put.
+    #[test]
+    fn a_reopened_store_still_enforces_the_cap_on_rows_it_did_not_write() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("refs.db");
+        let tenant = Tenant::new("t");
+        {
+            let store = SqliteRefStore::open_with(
+                &path,
+                SqliteOptions {
+                    clock: Clock::system(),
+                    max_bytes: None,
+                },
+            )
+            .unwrap();
+            for fill in ["a", "b", "c"] {
+                let body = fill.repeat(100);
+                store
+                    .put_many(&tenant, &[(ref_for(&body), body.clone())], &meta())
+                    .unwrap();
+            }
+        }
+        let store = SqliteRefStore::open_with(
+            &path,
+            SqliteOptions {
+                clock: Clock::system(),
+                max_bytes: Some(200),
+            },
+        )
+        .unwrap();
+        assert_eq!(stored(&store), 300);
+        let body = "d".repeat(10);
+        store
+            .put_many(&tenant, &[(ref_for(&body), body.clone())], &meta())
+            .unwrap();
+        let live = store.stats().unwrap().live_bytes;
+        assert!(live <= 180, "cap 200 evicts to 90%, left {live}");
+        assert_eq!(stored(&store), live, "the scan re-seeds the bound");
+    }
+
+    /// The purge pass makes the bound exact again, whatever drifted.
+    #[test]
+    fn a_purge_re_reads_the_true_total() {
+        let dir = TempDir::new().unwrap();
+        let clock = ManualClock::at(100);
+        let store = SqliteRefStore::open_with(
+            dir.path().join("refs.db"),
+            SqliteOptions {
+                clock: clock.clock(),
+                max_bytes: None,
+            },
+        )
+        .unwrap();
+        let tenant = Tenant::new("t");
+        let body = "x".repeat(50);
+        store
+            .put_many(
+                &tenant,
+                &[(ref_for(&body), body.clone())],
+                &meta().with_ttl(1),
+            )
+            .unwrap();
+        store.stored_bytes.store(10_000, Ordering::Relaxed);
+        clock.set(200);
+        assert_eq!(store.purge_expired(200).unwrap(), 1);
+        assert_eq!(stored(&store), 0);
+    }
+
+    /// A file-backed store browses on its own read-only connection and sees
+    /// what the writer committed.
+    #[test]
+    fn a_file_store_browses_committed_rows_on_a_second_connection() {
+        let dir = TempDir::new().unwrap();
+        let store = SqliteRefStore::open(dir.path().join("refs.db")).unwrap();
+        assert!(store.browse_conn.is_some());
+        let tenant = Tenant::new("t");
+        let body = "needle in a haystack".to_string();
+        store
+            .put_many(&tenant, &[(ref_for(&body), body.clone())], &meta())
+            .unwrap();
+        let page = store.browse(&tenant, &BrowseQuery::default()).unwrap();
+        assert_eq!(page.total, 1);
+        let found = store
+            .browse(
+                &tenant,
+                &BrowseQuery {
+                    search: Some("NEEDLE".into()),
+                    ..BrowseQuery::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(found.total, 1);
+        assert!(store.ping().is_ok());
     }
 
     #[test]
@@ -701,7 +1327,7 @@ mod tests {
         let id = ref_for("whatever");
         {
             let conn = store.conn.lock();
-            conn.execute(
+            conn.query_row(
                 SQL_UPSERT,
                 params![
                     tenant.as_str(),
@@ -715,6 +1341,7 @@ mod tests {
                     i64::MAX / 4,
                     i64::MAX / 4,
                 ],
+                |_| Ok(()),
             )
             .unwrap();
         }

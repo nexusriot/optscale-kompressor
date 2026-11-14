@@ -49,9 +49,17 @@
 
 #![forbid(unsafe_code)]
 
+pub mod analysis;
+pub mod breakdown;
+pub mod cache;
 pub mod config;
+pub mod context;
+pub mod dashboards;
 pub mod error;
 pub mod events;
+pub mod history;
+pub mod insights;
+pub mod live;
 pub mod reader;
 pub mod retention;
 pub mod schema;
@@ -168,6 +176,7 @@ mod tests {
         returned_tokens: u32,
     ) -> Event {
         Event::Retrieval(RetrievalEvent {
+            context: None,
             time_ms,
             tenant: tenant.to_string(),
             request_id: request_id.map(str::to_string),
@@ -209,6 +218,8 @@ mod tests {
 
     fn proxy(time_ms: i64, tenant: &str, request_id: &str) -> Event {
         Event::ProxyRequest(ProxyRequestEvent {
+            context: None,
+            timing: None,
             time_ms,
             tenant: tenant.to_string(),
             request_id: request_id.to_string(),
@@ -1064,6 +1075,15 @@ mod tests {
                      ALTER TABLE proxy_requests DROP COLUMN strip_usage;
                      ALTER TABLE proxy_requests DROP COLUMN cache_write_1h_tokens;
                      ALTER TABLE proxy_requests DROP COLUMN keep_warm;
+                     ALTER TABLE retrieval_events DROP COLUMN context_json;
+                     DROP TABLE request_context;
+                     DROP TABLE daily_analysis;
+                     DROP TABLE daily_analysis_conversations;
+                     ALTER TABLE proxy_requests DROP COLUMN timing_json;
+                     ALTER TABLE proxy_requests DROP COLUMN analysis_archived;
+                     ALTER TABLE optimization_events DROP COLUMN analysis_archived;
+                     ALTER TABLE retrieval_events DROP COLUMN analysis_archived;
+                     ALTER TABLE retrieval_events DROP COLUMN range_status;
                      PRAGMA user_version = 5;",
                 )
                 .unwrap();
@@ -1108,7 +1128,16 @@ mod tests {
                 ALTER TABLE proxy_requests DROP COLUMN strip_usage;
                 ALTER TABLE proxy_requests DROP COLUMN cache_write_1h_tokens;
                 ALTER TABLE proxy_requests DROP COLUMN keep_warm;
-                PRAGMA user_version = 5;",
+                ALTER TABLE retrieval_events DROP COLUMN context_json;
+                     DROP TABLE request_context;
+                     DROP TABLE daily_analysis;
+                     DROP TABLE daily_analysis_conversations;
+                     ALTER TABLE proxy_requests DROP COLUMN timing_json;
+                     ALTER TABLE proxy_requests DROP COLUMN analysis_archived;
+                     ALTER TABLE optimization_events DROP COLUMN analysis_archived;
+                     ALTER TABLE retrieval_events DROP COLUMN analysis_archived;
+                     ALTER TABLE retrieval_events DROP COLUMN range_status;
+                     PRAGMA user_version = 5;",
                 )
                 .unwrap();
         }
@@ -1825,3 +1854,6 @@ mod tests {
         assert_eq!(outcome.saved_net(), outcome.saved_gross);
     }
 }
+
+#[cfg(test)]
+mod analysis_tests;

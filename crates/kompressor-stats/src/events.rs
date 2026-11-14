@@ -68,6 +68,8 @@ impl fmt::Display for Surface {
 /// One compression of one request: the credit side of the token economy.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OptimizationEvent {
+    #[serde(default)]
+    pub context: Option<crate::context::RunContext>,
     /// Request start in milliseconds since the Unix epoch (see the module doc).
     pub time_ms: i64,
     /// Tenant the request was billed to.
@@ -147,6 +149,7 @@ impl OptimizationEvent {
         mode: Mode,
     ) -> OptimizationEvent {
         OptimizationEvent {
+            context: None,
             time_ms,
             tenant: tenant.into(),
             request_id: request_id.into(),
@@ -195,6 +198,8 @@ impl OptimizationEvent {
 /// One attempt to fetch a fragment back: the debit side of the token economy.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RetrievalEvent {
+    #[serde(default)]
+    pub context: Option<crate::context::RunContext>,
     /// Request start in milliseconds since the Unix epoch.
     pub time_ms: i64,
     /// Tenant the retrieval was billed to.
@@ -251,12 +256,6 @@ pub struct RetrievalEvent {
     /// The split the 2026-11-11 review asked for: a whole-fragment read the
     /// model meant and one whose narrowing failed looked identical before,
     /// and only the second is a cost the tool's guidance can fix.
-    ///
-    /// Not persisted on this line yet: the column is stats schema v14, after
-    /// the v13 that `experimental/v2` already assigned, and it arrives with
-    /// that branch. Claiming v13 here would give one version number two
-    /// schemas, and a database stamped by one line would fail to open on the
-    /// other. Until then the status reaches the model and in-process sinks.
     #[serde(default)]
     pub range_status: Option<String>,
 }
@@ -292,6 +291,10 @@ pub struct ProtectedRefEvent {
 /// saving the provider had already discounted as a cache read.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProxyRequestEvent {
+    #[serde(default)]
+    pub context: Option<crate::context::RunContext>,
+    #[serde(default)]
+    pub timing: Option<crate::context::ProxyTiming>,
     /// Request start in milliseconds since the Unix epoch.
     pub time_ms: i64,
     /// Tenant the request was billed to.

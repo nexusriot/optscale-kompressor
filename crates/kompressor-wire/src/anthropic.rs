@@ -118,6 +118,10 @@ impl Walker for AnthropicMessagesWalker {
                         unseen_tokens: unseen_tokens(blocks),
                         one_text_block: matches!(blocks.as_slice(), [only]
                             if only.get("type").and_then(Value::as_str) == Some("text")),
+                        tool_error: blocks.iter().any(|block| {
+                            block.get("type").and_then(Value::as_str) == Some("tool_result")
+                                && block.get("is_error").and_then(Value::as_bool) == Some(true)
+                        }),
                     };
                     builder.push_blocks(role, meta, slots);
                 }
@@ -487,6 +491,32 @@ mod tests {
             MessageContent::Blocks(slots) => assert_eq!(slots[2].text, "stdout: ok"),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn a_tool_result_flagged_is_error_reaches_the_engine_as_a_failure() {
+        let body = json!({
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 1024,
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_01", "name": "Edit",
+                     "input": {"file_path": "src/a.rs"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_01", "is_error": true,
+                     "content": "String to replace not found in file."}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_01",
+                     "content": "The file has been updated."}
+                ]}
+            ]
+        });
+        let walk = AnthropicMessagesWalker.walk(&body).expect("known shape");
+        assert!(walk.messages[1].meta.tool_error);
+        assert_eq!(walk.messages[1].meta.file_path.as_deref(), Some("src/a.rs"));
+        assert!(!walk.messages[2].meta.tool_error);
     }
 
     #[test]

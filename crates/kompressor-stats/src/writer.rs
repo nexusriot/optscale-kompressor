@@ -52,6 +52,7 @@ struct SinkInner {
 pub struct StatsSink {
     // `None` is the null sink: no thread, no file, no counter worth reading.
     inner: Option<Arc<SinkInner>>,
+    context: Option<Arc<crate::context::RunContext>>,
 }
 
 impl StatsSink {
@@ -59,10 +60,24 @@ impl StatsSink {
     ///
     /// Never blocks and never returns an error, by design; see the module doc.
     /// Use [`StatsSink::dropped`] to find out whether anything was lost.
-    pub fn send(&self, event: Event) {
+    pub fn send(&self, mut event: Event) {
         let Some(inner) = &self.inner else {
             return;
         };
+        if let Some(context) = &self.context {
+            match &mut event {
+                Event::Optimization(e) => {
+                    e.context.get_or_insert_with(|| (**context).clone());
+                }
+                Event::Retrieval(e) => {
+                    e.context.get_or_insert_with(|| (**context).clone());
+                }
+                Event::ProxyRequest(e) => {
+                    e.context.get_or_insert_with(|| (**context).clone());
+                }
+                _ => {}
+            }
+        }
         match inner.tx.try_send(Msg::Event(Box::new(event))) {
             Ok(()) => {}
             // Full: the writer is behind. Disconnected: the writer is gone.
@@ -71,6 +86,11 @@ impl StatsSink {
                 inner.dropped.fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+
+    pub fn with_context(mut self, context: crate::context::RunContext) -> Self {
+        self.context = Some(Arc::new(context));
+        self
     }
 
     /// Events lost to a full or dead queue since start: `stats_dropped_total`.
@@ -117,7 +137,10 @@ impl StatsSink {
 /// and callers should not need a feature flag or a generic parameter to say
 /// "no analytics".
 pub fn null_sink() -> StatsSink {
-    StatsSink { inner: None }
+    StatsSink {
+        inner: None,
+        context: None,
+    }
 }
 
 /// A sink that keeps every event where a test can read it.
@@ -130,6 +153,7 @@ pub fn capturing_sink(capacity: usize) -> (StatsSink, CapturedEvents) {
     let (tx, rx) = mpsc::sync_channel(capacity);
     (
         StatsSink {
+            context: None,
             inner: Some(Arc::new(SinkInner {
                 tx,
                 dropped: AtomicU64::new(0),
@@ -166,6 +190,7 @@ pub(crate) fn detached_sink(capacity: usize) -> (StatsSink, Receiver<Msg>) {
     let (tx, rx) = mpsc::sync_channel(capacity);
     (
         StatsSink {
+            context: None,
             inner: Some(Arc::new(SinkInner {
                 tx,
                 dropped: AtomicU64::new(0),
@@ -214,10 +239,32 @@ impl StatsWriter {
         let tx = self.conn.transaction()?;
         for event in events {
             match event {
-                Event::Optimization(e) => insert_optimization(&tx, e)?,
+                Event::Optimization(e) => {
+                    insert_context(
+                        &tx,
+                        &e.tenant,
+                        &e.request_id,
+                        e.time_ms,
+                        e.model.as_deref(),
+                        Some(e.mode.as_str()),
+                        e.context.as_ref(),
+                    )?;
+                    insert_optimization(&tx, e)?;
+                }
                 Event::Retrieval(e) => insert_retrieval(&tx, e)?,
                 Event::ProtectedRefs(e) => insert_protected(&tx, e)?,
-                Event::ProxyRequest(e) => insert_proxy(&tx, e)?,
+                Event::ProxyRequest(e) => {
+                    insert_context(
+                        &tx,
+                        &e.tenant,
+                        &e.request_id,
+                        e.time_ms,
+                        e.model.as_deref(),
+                        None,
+                        e.context.as_ref(),
+                    )?;
+                    insert_proxy(&tx, e)?;
+                }
                 Event::Discarded { tenant, request_id } => {
                     // The row keeps the engine's own numbers — that is what the
                     // engine did — and gains an outcome saying the result never
@@ -300,8 +347,8 @@ fn insert_retrieval(conn: &Connection, e: &RetrievalEvent) -> Result<(), StatsEr
         "INSERT INTO retrieval_events (
             time_ms, tenant, request_id, surface, \"ref\", found, expired, ranged,
             fragment_bytes, fragment_chars, fragment_tokens, returned_chars, returned_tokens,
-            withheld)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+            withheld, context_json, range_status)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
     )?
     .execute(params![
         e.time_ms,
@@ -318,6 +365,8 @@ fn insert_retrieval(conn: &Connection, e: &RetrievalEvent) -> Result<(), StatsEr
         e.returned_chars as i64,
         i64::from(e.returned_tokens),
         i64::from(e.withheld),
+        e.context.as_ref().map(serde_json::to_string).transpose()?,
+        e.range_status,
     ])?;
     Ok(())
 }
@@ -343,6 +392,21 @@ fn insert_protected(conn: &Connection, e: &ProtectedRefEvent) -> Result<(), Stat
     Ok(())
 }
 
+fn insert_context(
+    conn: &Connection,
+    tenant: &str,
+    request_id: &str,
+    time: i64,
+    model: Option<&str>,
+    mode: Option<&str>,
+    context: Option<&crate::context::RunContext>,
+) -> Result<(), StatsError> {
+    let json = context.map(serde_json::to_string).transpose()?;
+    conn.execute("INSERT INTO request_context(tenant,request_id,time_ms,model,mode,context) VALUES (?1,?2,?3,?4,?5,?6)
+    ON CONFLICT(tenant,request_id) DO UPDATE SET model=coalesce(excluded.model,request_context.model),mode=coalesce(excluded.mode,request_context.mode),context=coalesce(request_context.context,excluded.context)",params![tenant,request_id,time,model,mode,json])?;
+    Ok(())
+}
+
 fn insert_proxy(conn: &Connection, e: &ProxyRequestEvent) -> Result<(), StatsError> {
     conn.prepare_cached(
         "INSERT INTO proxy_requests (
@@ -350,8 +414,8 @@ fn insert_proxy(conn: &Connection, e: &ProxyRequestEvent) -> Result<(), StatsErr
             prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens,
             shadow_prompt_tokens, retrieve_rounds, retrieve_tokens_injected,
             upstream_ms, total_ms, error, conversation, strip_usage, cache_write_1h_tokens,
-            keep_warm)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
+            keep_warm, timing_json)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
     )?
     .execute(params![
         e.time_ms,
@@ -376,6 +440,7 @@ fn insert_proxy(conn: &Connection, e: &ProxyRequestEvent) -> Result<(), StatsErr
         i64::from(e.strip_usage),
         e.cache_write_1h_tokens.map(i64::from),
         i64::from(e.keep_warm),
+        e.timing.as_ref().map(serde_json::to_string).transpose()?,
     ])?;
     // `compression_event_id` stays NULL. The rowid it would point at may not
     // exist yet — the proxy can finish a request before the compression event
@@ -449,6 +514,7 @@ pub fn spawn(config: &StatsConfig) -> Result<(StatsSink, StatsHandle), StatsErro
         .map_err(StatsError::Thread)?;
 
     let sink = StatsSink {
+        context: None,
         inner: Some(Arc::new(SinkInner {
             tx: tx.clone(),
             dropped: AtomicU64::new(0),

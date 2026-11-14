@@ -374,7 +374,7 @@ impl Engine {
 }
 ```
 
-`Message` is the engine's neutral shape: `{ role: String, content: MessageContent::{Text(String) | Blocks(Vec<TextSlot>) | Opaque}, meta: MessageMeta { cache_control: bool, protected: bool, tool_name, file_path, extra: serde_json::Map } }`. `TextSlot` is the key enabling the proxy: a list of independently compressible text spans inside a block-structured message (each Anthropic `tool_result` text block or OpenAI content part is a slot), so `compress_messages` works for block content too — a gateway that can only see whole string bodies compresses none of it.
+`Message` is the engine's neutral shape: `{ role: String, content: MessageContent::{Text(String) | Blocks(Vec<TextSlot>) | Opaque}, meta: MessageMeta { cache_control: bool, protected: bool, tool_name, file_path, tool_error, extra: serde_json::Map } }`. `TextSlot` is the key enabling the proxy: a list of independently compressible text spans inside a block-structured message (each Anthropic `tool_result` text block or OpenAI content part is a slot), so `compress_messages` works for block content too — a gateway that can only see whole string bodies compresses none of it.
 
 ### 4.7 Stats returned by the engine
 
@@ -511,7 +511,7 @@ Grammar loading is a one-time `LazyLock` per language; no warm-up spike beyond f
 
 ### 5.12 Read lifecycle (`engine::read_lifecycle`)
 
-`classify_reads(&[Message], frozen: usize) -> BTreeMap<usize, ReadState>` (§5.15 step 4): a message whose tool is `read|read_file` and whose path a *later* `edit|write|write_file|apply_patch` targets is `STALE`; paths are normalized before comparison, and reads inside the frozen prefix or marked protected stay `FRESH`. A `SUPERSEDED` state — eliding a read that a *later read of the same file* replaces — is deliberately not implemented: it rewrites content further back in the history and busts prompt caches for a saving the idle-window store already mostly recovers. The proxy populates `tool_name`/`file_path` from tool-call arguments when it can see them (§12.5), which is what makes this reachable at all: a gateway that forwards message bodies without tool metadata can never trigger it.
+`classify_reads(&[Message], frozen: usize) -> BTreeMap<usize, ReadState>` (§5.15 step 4): a message whose tool is `read|read_file` and whose path a *later* `edit|write|write_file|apply_patch` targets is `STALE`; paths are normalized before comparison (separators, empty and `.` components only: `.env` is not `env`, `../src/a.rs` is not `src/a.rs`, `/etc/x` is not `etc/x`), a write that reported failure — Anthropic's `is_error`, `tool_error`/`is_error` on the message API, or a result whose first line opens with `error`, `<tool_use_error>`, `failed`, `failure`, `fatal` or `apply_patch verification failed` — changed nothing and invalidates nothing, and reads inside the frozen prefix or marked protected stay `FRESH`. A `SUPERSEDED` state — eliding a read that a *later read of the same file* replaces — is deliberately not implemented: it rewrites content further back in the history and busts prompt caches for a saving the idle-window store already mostly recovers. The proxy populates `tool_name`/`file_path` from tool-call arguments when it can see them (§12.5), which is what makes this reachable at all: a gateway that forwards message bodies without tool metadata can never trigger it.
 
 ### 5.13 Token estimator and the guard (`engine::tokens`)
 
@@ -1155,13 +1155,17 @@ CREATE INDEX IF NOT EXISTS refs_expiry ON refs (last_accessed);   -- lazy purge 
 - **Get**: `SELECT fragment, kind, request_id, created_at, last_accessed, ttl_seconds, max_lifetime FROM refs WHERE tenant=? AND ref=?`, liveness computed in Rust so `Expired` can be distinguished from `Miss`. On a live hit with `touch`, an `UPDATE … SET last_accessed=?` runs with the liveness predicate repeated **in SQL** — a touch must not be able to resurrect a row the absolute cap already killed.
 - **Purge**: expiry is decided on read (`Lookup::Expired`), and `purge_expired` deletes in bounded batches of 5,000 via `DELETE FROM refs WHERE (tenant, ref) IN (SELECT … LIMIT ?)` — a `WITHOUT ROWID` table has no `rowid` for the usual bounded-delete idiom. **Nothing schedules it**: `refs.purge_interval` (60 s) is currently a knob with no consumer, so dead rows linger until the size cap reclaims them. That is safe but untidy — reads never return an expired fragment, and expired rows do not count toward the cap.
 - **Size cap**: `refs.max_bytes` (default 1 GiB) is enforced inline on every `put_many`. Live bytes over the cap ⇒ evict by `last_accessed ASC, tenant ASC, ref ASC` down to 90% of the cap. The 90% is so a store parked exactly at the limit does not evict on every write for the rest of its life; the key tie-break is so that which member of a same-second batch dies does not vary run to run.
-- **Recent-write cache** (`store::cache::CachedRefStore`): an in-process write-through cache of the last `refs.recent_cache_entries` (default 4,096) `(tenant, ref) → fragment`, bounded as well by `refs.recent_cache_bytes` of fragment text (default 64 MiB; whichever bound binds first evicts, and a fragment larger than the whole budget is written through uncached — the entry cap alone allowed 4,096 × 1 MiB), with a 60 s window against an hour-scale TTL. It exists to cover the gap around a *write* — the proxy hands the model a marker and the model may ask for it in the same turn — not to be a second store with its own retention. Reads deliberately do **not** populate it: a record coming back from the inner store does not carry its absolute lifetime, so a cached copy could only guess at the one deadline a read is not allowed to extend.
+- **Recent-write cache** (`store::cache::CachedRefStore`): an in-process write-through cache of the last `refs.recent_cache_entries` (default 4,096) `(tenant, ref) → fragment`, bounded as well by `refs.recent_cache_bytes` of fragment text (default 64 MiB; whichever bound binds first evicts, and a fragment larger than the whole budget is written through uncached — the entry cap alone allowed 4,096 × 1 MiB), with a 60 s window against an hour-scale TTL. It exists to cover the gap around a *write* — the proxy hands the model a marker and the model may ask for it in the same turn — not to be a second store with its own retention. Reads deliberately do **not** populate it: a record coming back from the inner store does not carry its absolute lifetime, so a cached copy could only guess at the one deadline a read is not allowed to extend. Writes do not guess either: `RefStore::put_many_created` has the inner store report the `created_at` each row kept through the upsert, so a fragment re-stored after it was evicted from the cache keeps its original absolute deadline instead of being cached as created now.
 - Schema versioning via `PRAGMA user_version` and an ordered `MIGRATIONS: &[(u32, &str)]` array, keyed on an **integer**. The usual shortcut — sorting migration filenames as strings — puts `V10_` before `V2_`, so the tenth migration runs first the moment a tenth one exists; keying on an integer and iterating the array cannot express that bug.
 
 ### 8.3 Other backends
 
 - `MemoryRefStore`: `DashMap<(Tenant, RefId), RefRecord>` with the same TTL semantics; test default and `--ephemeral` mode.
 - `CachedRefStore`: the write-through wrapper described in §8.2, composed in front of either of the above.
+
+### 8.3.1 Browsing
+
+`RefStore` stays point-lookup only: nothing on the request path walks the table. Listing is a separate trait, `RefBrowse` (`browse`, `inspect`, `remove`), reached through `RefStore::browser()` — `None` by default, implemented by both backends, and by `CachedRefStore` exactly when its inner store is, so that a removal clears the cached copy as well as the row. A browse is tenant-scoped like everything else; it orders by `newest`, `oldest`, `recent` (last access), `largest` or `expiring`, always tie-broken on the handle so a page boundary inside a same-second batch is stable; it searches the fragment, the handle and the request id case-insensitively (ASCII folding, which is what SQLite's `lower()` does, so both backends agree); and SQLite reads only a `substr` of each fragment for the preview — its start, or under a search a window that begins a quarter of the preview before the first match in the text (`preview_start` says how many characters were skipped). None of it touches an entry or lazily deletes an expired one: looking is not using, and a browser that kept fragments alive would change the retention it reports on. `inspect` reads an expired row that is still on disk, lossily if it is not UTF-8, since the operator looking at a damaged row is the one person who should still see it.
 - **No Redis backend is built.** `RefsBackend` has exactly two variants, `sqlite` and `memory`. `KOMPRESSOR_REDIS_URL` is still recognised by the environment reader so an operator migrating from a Redis-backed deployment gets a warning ("this build stores fragments in sqlite") rather than silence, but it selects nothing.
 
 ### 8.4 TTL refresh for protected markers
@@ -1219,7 +1223,7 @@ aggregate history beyond that.
   That last key exists because `content_types` counts only successes. A git workload where every diff is declined by the §7.6 gates reported `diff: 0`, which is indistinguishable from "no diffs were present" — and on one measured run 1,374 of 1,483 messages were skipped with the most interesting fact about the run inside them. The decline path detects a second time rather than widening `compress_content`'s return, which is `Option<Kind>` and `None` for every decline: one extra pass on the declines alone is cheaper than touching every caller, and a declined message is one the compressors have already finished with. `v_skip_reasons` unrolls the map one row per reason.
 - `retrieval_events(id, time_ms, tenant, request_id, surface, ref, found, expired, ranged, fragment_bytes, fragment_chars, fragment_tokens, returned_chars, returned_tokens, rolled_up, withheld)`. `withheld` arrived in v10: an ask the per-request token budget refused before the store was read, which is neither a hit nor a miss and is excluded from every rate computed over this table (§12.5b).
 - `protected_ref_events(id, time_ms, tenant, request_id, refs JSON, refs_total, reasons JSON, messages, touched)`.
-- `proxy_requests(id, time_ms, tenant, request_id, api_family, model, upstream, status, stream, compression_event_id, prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens, shadow_prompt_tokens, retrieve_rounds, retrieve_tokens_injected, upstream_ms, total_ms, error, conversation, rolled_up, strip_usage, cache_write_1h_tokens, keep_warm)`. `compression_event_id` and `shadow_prompt_tokens` are never populated — see E.2 for why the join goes through `request_id` instead. `conversation` arrived in v5, `rolled_up` in v7, `strip_usage` in v9, `cache_write_1h_tokens` in v11 and `keep_warm` in v12; this prose listing had drifted three columns behind the ladder. `check_schema` does compare table columns — but against the DDL blocks in E.1, not against prose, so a sentence like this one can rot while the gate stays green.
+- `proxy_requests(id, time_ms, tenant, request_id, api_family, model, upstream, status, stream, compression_event_id, prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens, shadow_prompt_tokens, retrieve_rounds, retrieve_tokens_injected, upstream_ms, total_ms, error, conversation, rolled_up, strip_usage, cache_write_1h_tokens, keep_warm, timing_json, analysis_archived)`. `compression_event_id` and `shadow_prompt_tokens` are never populated — see E.2 for why the join goes through `request_id` instead. `conversation` arrived in v5, `rolled_up` in v7, `strip_usage` in v9, `cache_write_1h_tokens` in v11, `keep_warm` in v12, and `timing_json` and `analysis_archived` in v13; this prose listing had drifted three columns behind the ladder. `check_schema` does compare table columns — but against the DDL blocks in E.1, not against prose, so a sentence like this one can rot while the gate stays green.
 
   **A relayed websocket files one row for the whole connection.** The HTTP path's unit — a request — does not exist on that transport: every frame shares one `request_id`, so the connection is what has an identity. The row carries `status = 101` (the handshake succeeded, and it keeps relayed sessions separable from forwarded 200s), `stream = 1`, the duration, and the error when the relay ends badly. **Token counters are NULL, not zero**, because the relay never reads a `response.completed` frame and so does not know what the provider billed; zero would read as "this cost nothing" and quietly deflate every cost report, the same distinction `opaque` draws in the skip taxonomy. `retrieve_rounds` is genuinely 0, because the retrieve tool cannot be offered on a transport whose tool tree executes inside the client; fragments do come back on that path, but as an append to the client's next frame rather than as a round (§12.5b), so there is no round to count. Without this row a relayed session was invisible to `kompressor stats summary`, the HTML report and the Harbor bench, all of which read `proxy_requests` — it contributed compression events and nothing else, and a relay failure had nowhere to land but a log line nobody tails.
 
@@ -1325,9 +1329,61 @@ prefix answers 404 rather than an empty report — an empty report would read as
 | `GET /v1/stats/retrievals?…` | hit/miss/expired counts, ranged share, top refs by retrieval count |
 | `GET /v1/stats/requests?request_id=` | one request's economy row plus its events |
 | `GET /v1/stats/store` | live refs/bytes, oldest, purge counters |
+| `GET /v1/stats/live?window&recent&tenant&format&refresh` | a live snapshot ending now: totals, 1m/5m/15m rates, a timeline, upstream status/cache/latency percentiles, by provider/model/type, skip reasons, retrievals, the latest requests, and process info (version, uptime, dropped events). JSON, JSON Lines for `?format=jsonl`, or a self-refreshing HTML dashboard for `?format=html` or a browser's `Accept` |
+| `GET /v1/stats/cache?window&conversations&conversation&tenant&format&refresh` | prompt-cache analysis over `proxy_requests`: input split into fresh, read, 5-minute and 1-hour writes, with its cost in input-equivalent tokens against an uncached baseline; every lost prefix classified as `ttl_expiry` or `prefix_change`; keep-warm pings (warm, cold, failed, cost, pauses bridged); client turns by idle gap; per model; per conversation, costliest losses first, and with `conversation=<16 hex>` that conversation's rows one by one. JSON, JSON Lines for `?format=jsonl`, or a page for `?format=html` or a browser's `Accept` |
+| `GET /v1/stats/trends?window&from&to&bucket&tenant&format` | per-period history (`day`, `week` from Monday, `month`; UTC) from raw rows and `daily_analysis` alike, the same accounting as the compare view, up to 730 days and 400 points, with the period each build first appeared |
+| `GET /v1/stats/yield?window&from&to&tenant&format` | tokens removed per content type, each run's saving split across its `content_types` by message count (the engine records no per-type tokens; single-type runs give the exact figure), joined to a census of the ref store for asks, hits, tokens returned and time to first ask per fragment kind; asks for purged handles are `unknown` |
+| `GET /v1/stats/store-health?window&from&to&tenant&format` | the tenant's ref-store census (bookkeeping only, never fragment text; newest 200,000) by kind, age and time to expiry, `store_samples` over the window, handles minted against handles asked for, and asks found, expired, missing or withheld, beside `refs.max_bytes` and the configured lifetimes |
+| `GET /v1/stats/keepwarm?window&from&to&conversations&tenant&format` | the cache walk again, pricing each ping's usage against the rewrite it avoided: a pause longer than the cache lifetime that pings bridged credits the next turn's read at write-minus-read rates; pinged pauses within the lifetime are `unneeded`, pings after a conversation's last turn `trailing`, and unpinged TTL losses `missed`; by idle gap and per conversation |
+| `GET /v1/stats/upstream?window&from&to&tenant&format` | `proxy_requests` by status class (2xx, 3xx, other 4xx, 429, 5xx, none), retries from `timing_json`, latency percentiles per upstream and model, incidents (three or more 429/5xx/unanswered/broken-stream rows within 60 s of each other) and the latest 50 failures |
+| `GET /v1/stats/engine?window&from&to&tenant&format` | `optimization_events.engine_ms` percentiles by dominant content type, prompt size, outcome and surface, a timeline, the 20 slowest runs, and the process's engine slots and dropped-event count |
+| `GET /v1/refs?q&kind&request_id&expired&order&offset&limit&preview&tenant&format` | the ref browser (§8.3.1): one page of the tenant's fragments with a preview each, the match total, a count per kind and what the tenant holds live. JSON, or a page for `?format=html` or a browser's `Accept`. Off — 404 — unless `refs.browse = true` |
+| `GET /v1/refs/{handle}?history&tenant` | one fragment in full, read without touching it, with its retention and every recorded ask for it (`retrieval_events`) |
+| `DELETE /v1/refs/{handle}?tenant` | remove a fragment from the store and the recent-write cache; a later retrieval is a miss |
 | `GET /metrics` | Prometheus (§15) |
 
 Responses are JSON; `?format=csv` on the tabular ones. The same queries back `kompressor stats …` on the CLI (direct SQLite, no server needed).
+
+`/v1/stats/live` reads the same database as the rest, so it is as current as
+the writer's commit interval (100 ms) and needs no second set of counters to
+keep in step. `window` is `<n>s|m|h|d` up to 90d (default `1h`; raw rows older
+than retention are gone), `recent` 0–200 (default 25), `refresh` the page's
+poll interval in seconds (default 2). `server.stats_listen` serves it on a
+listener of its own as well — the dashboard at `/`, the JSON at
+`/v1/stats/live`, plus the probes, and nothing that compresses — and that
+listener runs whatever surfaces were selected, so `serve --proxy` has one too.
+The HTML shell is served without credentials because it holds no data; with
+`auth.mode = "api_keys"` its polls send a key the viewer types in, kept in the
+tab's `sessionStorage`.
+
+`/v1/stats/cache` walks each conversation's `proxy_requests` rows in time
+order, keep-warm pings included, and compares every row with what the row
+before left cached: for Anthropic its reads plus writes, for OpenAI (which
+caches unasked) its whole prompt — capped at what the new prompt still
+carries, since a client that compacted its context (Codex does) sent a shorter
+prompt and dropped the rest itself. On the archived Codex runs that cap is 26.6M
+of the 30.7M tokens an uncapped comparison called lost. A shortfall of 1,024
+tokens or more on Anthropic, 2,048 on OpenAI (gpt-5.5 caches at 2,048-token
+intervals), is a lost prefix — `partial` if something was read, `miss` if nothing — put down
+to `ttl_expiry` when the conversation had been idle (since its last request or
+ping) past the cache lifetime, five minutes or an hour once it has written
+one-hour entries, and to `prefix_change` otherwise. A client request with fewer
+messages than the one before it is a `branch` (a subagent summary or side
+query re-sending an earlier history) and is compared with nothing. Costs are in
+input-equivalent tokens — fresh input 1, a read at the model's read rate, a
+write at 1.25 or 2 — from `kompressor_stats::cache::rates`, a copy of the
+proxy's `CachePrices` kept in step by a test. The page is served at `/cache` on
+the statistics listener; `window` defaults to `6h`, `conversations` to 50 (at
+most 500), and one report reads at most the newest 200,000 rows.
+
+The ref browser follows the same shape: `/v1/refs` is JSON or a page, the page
+fetches the JSON with the key from the same `sessionStorage` entry, and the
+statistics listener serves it at `/refs` beside the dashboard, which links to
+it when browsing is on. It is off by default because it changes who can read a
+fragment: without it, reading one back needs its unguessable handle; with it,
+any credential for a tenant can list that tenant's fragments. Deleting is
+allowed to the same caller — the tenant's own data, and a model that asks for a
+deleted handle gets the miss it already handles.
 
 ## 10. `kompressor-server`: HTTP compression API
 
@@ -1512,6 +1568,8 @@ The credential stays the client's throughout. OptScale Kompressor never mints, s
 
 **The Anthropic mount carries no such override, and that is not an omission.** A Max or Pro plan and an API key both reach `api.anthropic.com`; only the header policy differs. The asymmetry belongs to the providers, not to this design.
 
+**A namespaced model name is renamed on the way to `api.anthropic.com`, and only there.** Gateways such as OpenRouter name Claude models `anthropic/<id>`, and a client configured for one keeps the namespace: Harbor's claude-code agent hands it to Claude Code, which sends it on every subagent request even when the main agent's `ANTHROPIC_MODEL` is bare. Anthropic's own API answers that name with a 404, so every subagent died on its first call. Measured on the three 1.5.14 Harbor runs of 2026-11-02: all of them failed this way ("There's an issue with the selected model"), in `protein-assembly` and `dna-assembly` on the last run. `handler::model_for_upstream` strips the namespace from a Messages request bound for `api.anthropic.com`, after the arriving bytes are kept, so the renamed body is re-encoded rather than forwarded as it came. Any other upstream, and so a gateway behind this proxy that wants the namespace, gets the name as sent.
+
 **What a subscription caller gets on the wire.** It is relayed as close to byte-identical as the proxy can manage, because the provider recognises its own client. OptScale Kompressor adds nothing of its own — not even `X-Kompressor-Request-Id`, which still reaches every stats row and log line but never the wire (§12.7).
 
 **What it is worth, and what it is not.** A plan bills no tokens, so compression saves no money on this path. What it buys is context headroom: on a live ChatGPT-plan codex sweep the final turn carried **37,501 tokens instead of 235,036**, 6.3x more conversation before the window fills. There is also one wrinkle — `openai_base_url` overrides the built-in provider's URL but cannot disable its WebSocket preference, and no top-level key can, so a plan session always opens a websocket. An API-key session, which goes through the provider block, does not. What happens next is §12.5b's flag: on, which is the default, the upgrade is relayed and the session keeps the socket it opened; off, it reaches the forward path as a plain GET, the provider refuses it on a path that takes POSTs, and the session pays a five-attempt handshake (405 each) before falling back to HTTPS. That 405 is the upstream's, not ours. Whether subscription traffic should be rewritten before it is sent is the operator's decision, not this document's.
@@ -1639,6 +1697,18 @@ A background task's wait, which ends on `end_turn` rather than `tool_use`, again
 ![keep-warm for background tasks](charts/keepwarm-background.drawio.png)
 
 **On OpenAI the lever is retention, not pings** (`proxy.prompt_cache_retention`, default `default`). OpenAI caches every prompt of 1,024 tokens or more unasked and, on gpt-5.5 and the models before it, charges nothing to write; how long it keeps an entry is the request's `prompt_cache_retention`, `in_memory` (typically five to ten minutes idle) or `24h` (around 30 minutes, up to a day). Codex names neither, so it gets whatever the organization defaults to. Over 12,114 archived Codex requests on gpt-5.5 (2026-09-18 to 10-31), turns that came back after more than five minutes idle failed to read back 46–76% of the prefix the turn before had cached — the in-memory lifetime — but only 135 turns came back that late, because Codex blocks on its tools rather than waiting on background jobs, and the 476K tokens they lost came to about 0.35% of the Codex bill, against 12.6% for Claude Code on Opus 5.5 without keep-warm. Pinging would recover at most that, at $30 per million output tokens a ping, so OpenAI is not pinged; `"24h"` costs nothing on these models, so it is offered. It is added only where it is documented to be read: Chat Completions and Responses requests through the `openai` upstream or any upstream on `api.openai.com`, not the ChatGPT-subscription route on the same mount, not a request that names a retention itself, and only for the models OpenAI lists for `24h` (`retention::SUPPORTED`, matched whole so `gpt-5` does not take in `gpt-5.6`). GPT-5.6 and later take `prompt_cache_options.ttl` instead and price their writes, 1.25x for 30 minutes and 2.5x for 12 hours, which makes them an `adaptive` question like Anthropic's and is not built. A 400 whose body names the field is answered inside `Outbound::send` by sending the same request again without it, and the upstream and model are remembered (`retention::Rejections`) so the field is not added there again; any other answer, a 400 that does not name it included, reaches the client as the provider sent it. The websocket relay is left alone: a `response.create` frame has not been shown to accept the field.
+
+The current rules in three charts, drawn from the code as of 1.5.15 (the two above predate the background cap of 11, `Monitor`, `ScheduleWakeup` and `TaskStop`). Who does what across a tool call: the ping runs on its own tokio task, spawned once the response has been relayed, which the client's next request aborts before it is forwarded:
+
+![keep-warm across a tool call](charts/keepwarm/tool-call-sequence.drawio.png)
+
+When a response arms it:
+
+![when keep-warm is armed](charts/keepwarm/arming.drawio.png)
+
+When pings are sent, and what ends them:
+
+![ping schedule and what ends it](charts/keepwarm/schedule.drawio.png)
 
 **Stale-read is the exception**: a later write to the same path replaces the read before it, so appending a turn *does* rewrite an earlier one. The two features cannot both be had, and `frozen_prefix = "first_seen"` therefore withholds `enable_stale_read`. The economics decide which goes: at Opus rates, re-writing a 20,000-token suffix to remove a 2,000-token stale read needs ~125 further turns to break even, against sessions that run 20 to 70. `stale_reads_are_the_one_transform_that_rewrites_what_came_before` asserts both directions, so whoever makes the transform causal finds the test rather than the bill.
 
@@ -2096,7 +2166,7 @@ A frame parser tolerant of `\n\n` / `\r\n\r\n` boundaries, `data:` multi-line jo
 
 Layered, lowest to highest precedence: built-in defaults → config file (`--config kompressor.toml`, or `$KOMPRESSOR_CONFIG`, or `./kompressor.toml`, or `$XDG_CONFIG_HOME/kompressor/config.toml`, else `~/.config/kompressor/config.toml` — `~` being `%USERPROFILE%` on Windows, where `HOME` is usually unset) → environment (`KOMPRESSOR__SECTION__KEY`, double underscore; plus a flat `KOMPRESSOR_<FIELD>` alias for every engine knob) → CLI flags. `kompressor check-config` prints the effective merged config with secrets redacted and validates every range.
 
-Two consequences of that search path are worth stating rather than leaving to be discovered. **`/etc` is not on it**, so the packaged system unit passes `--config /etc/kompressor/config.toml` explicitly, and a human running `kompressor stats` against that deployment must name the store too — with a user config present, a bare invocation silently answers from the wrong one rather than failing. **Paths are not expanded**: `$HOME` and `~` in a TOML value are literal, so `path = "$HOME/.local/share/kompressor/refs.db"` creates a directory called `$HOME`. The service templates substitute real absolute paths at install time for exactly that reason. QUICKSTART §9 has the commands.
+Two consequences of that search path are worth stating rather than leaving to be discovered. **`/etc` is not on it**, so the packaged system unit passes `--config /etc/kompressor/config.toml` explicitly, and `kompressor stats` falls back to it only when the search path found nothing, or found a config whose stats store does not exist while the system one's does (announced on stderr) — with a user config naming a live store present, a bare invocation still silently answers from that one rather than the service's. **Paths are not expanded**: `$HOME` and `~` in a TOML value are literal, so `path = "$HOME/.local/share/kompressor/refs.db"` creates a directory called `$HOME`. The service templates substitute real absolute paths at install time for exactly that reason. QUICKSTART §9 has the commands.
 
 ```toml
 # kompressor.toml — every key the configuration accepts, at its default.
@@ -2108,6 +2178,7 @@ listen        = "127.0.0.1:8817"    # shared listener for selected surfaces
 api_listen    = ""                  # per-surface listeners; empty means share `listen`
 mcp_listen    = ""
 proxy_listen  = ""
+stats_listen  = ""                  # live statistics on a port of their own, e.g. "127.0.0.1:8818"
 max_body_bytes            = 67108864   # bytes, not "64MiB"
 max_inflight_compressions = 0          # 0 = CPU count x 2
 queue_timeout   = "2s"              # then 503 with Retry-After
@@ -2172,6 +2243,7 @@ recent_cache_entries = 4096         # write-through cache
 recent_cache_bytes = 67108864       # …and its byte budget (64 MiB)
 purge_interval = "1m"
 max_bytes = 1073741824              # bytes, not "1GiB"
+browse = false                      # serve /v1/refs (§10.1); fragments can hold secrets
 
 [stats]
 enabled = true
@@ -2411,8 +2483,14 @@ wrap claude ── resolve port ──▶ serving? ──yes──▶ adopt (nev
                            and no other live session still holds it
 ```
 
-**Pointing the agent at the proxy.** Every agent already reads a base-URL
-environment variable; wrapping sets it. The two URL shapes are not
+**Pointing the agent at the proxy.** Most agents read a base-URL environment
+variable, and wrapping sets it. Two do not, and are wired through their own
+configuration instead: codex ignores `OPENAI_BASE_URL` and gets a marker-delimited
+block in `config.toml` (§12.5a), and opencode 2.x is *broken* by that variable —
+every model of the provider reports "unavailable" — so a launched session gets
+its provider `baseURL`s in `OPENCODE_CONFIG_CONTENT` and runs `--standalone`,
+because the background service that otherwise makes the calls never sees this
+command's environment (`docs/OPENCODE.md`). The two URL shapes are not
 interchangeable — an Anthropic-style client is given a host and appends
 `/v1/messages` itself, an OpenAI-style client is given a URL that already ends
 in `/v1` — so the catalogue records which shape each tool wants. An entry is a
@@ -2440,7 +2518,11 @@ A proxy this session did **not** start is never stopped by it.
 **Editor-hosted agents.** Environment variables only reach a process this command
 launches. An agent started by an editor inherits the editor's environment, so
 `--attach` writes the base URL into the settings file the agent reads for itself
-and holds the proxy up until interrupted. That turns a one-line change into
+and holds the proxy up until interrupted: `.claude/settings.local.json` for
+Claude Code, and the global `opencode.json` for opencode — followed by
+`opencode reload`, so the running background service, which OpenCode Desktop
+shares, picks it up (only when one is running: `reload` would otherwise start
+one). That turns a one-line change into
 shared mutable state on disk, with three failure modes and one answer to all of
 them — a sidecar recording who owns each key and what it held before any of them
 arrived:
@@ -2866,7 +2948,7 @@ Dockerfile exist and are run by hand.
 
 ## 19. Status
 
-Built and passing: ten crates, **1,157 tests**, clippy and rustfmt clean. Measured
+Built and passing: ten crates, **1,403 tests**, clippy and rustfmt clean. Measured
 numbers and the current gap list are in the README; what is *not* built is
 recorded there too rather than left to be discovered.
 
@@ -3576,6 +3658,38 @@ ALTER TABLE proxy_requests ADD COLUMN cache_write_1h_tokens INTEGER;
 -- (`proxy.cache_keep_warm`, §12.10). Its usage is real spend, so cost totals
 -- include it; counts of client requests and latency should filter it out.
 ALTER TABLE proxy_requests ADD COLUMN keep_warm INTEGER NOT NULL DEFAULT 0;
+
+-- v13: request provenance, phase timing, and daily experiment aggregates.
+-- `request_context` holds the run context (model, mode, experiment/run ids,
+-- settings) a request arrived with, keyed like the event tables so the
+-- analysis joins on (tenant, request_id). `timing_json` is a proxied request's
+-- per-phase timing; `context_json` is the context a retrieval carried itself.
+-- Once a day's raw events are folded into `daily_analysis` (one row of metrics
+-- per day, tenant and dimension) and `daily_analysis_conversations` (the
+-- conversation ids behind it, kept as a set so days union rather than add),
+-- the rows are marked `analysis_archived = 1` and the analysis reads the
+-- aggregate instead, so raw and archived copies never count twice.
+CREATE TABLE request_context (
+ tenant TEXT NOT NULL, request_id TEXT NOT NULL, time_ms INTEGER NOT NULL,
+ context TEXT, model TEXT, mode TEXT, PRIMARY KEY(tenant,request_id));
+CREATE INDEX request_context_time ON request_context(time_ms);
+ALTER TABLE proxy_requests ADD COLUMN timing_json TEXT;
+ALTER TABLE proxy_requests ADD COLUMN analysis_archived INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE optimization_events ADD COLUMN analysis_archived INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE retrieval_events ADD COLUMN analysis_archived INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE retrieval_events ADD COLUMN context_json TEXT;
+CREATE TABLE daily_analysis (
+ day_ms INTEGER NOT NULL, tenant TEXT NOT NULL, dimension TEXT NOT NULL,
+ metrics TEXT NOT NULL, PRIMARY KEY(day_ms,tenant,dimension));
+CREATE TABLE daily_analysis_conversations (
+ day_ms INTEGER NOT NULL, tenant TEXT NOT NULL, dimension TEXT NOT NULL,
+ conversation TEXT NOT NULL, PRIMARY KEY(day_ms,tenant,dimension,conversation));
+
+-- v14: whether a retrieval's range was read as asked (`exact`), salvaged from
+-- several variants (`salvaged`), read from a flat shape with one meaning such
+-- as {"lines":1,"end":60} (`normalized`), or not narrowable at all
+-- (`unusable`, the whole fragment went back). NULL when no range was asked.
+ALTER TABLE retrieval_events ADD COLUMN range_status TEXT;
 ```
 
 ## C. Configuration reference — flat environment mapping
@@ -3604,7 +3718,7 @@ be filled in.
 
 | Section | Reachable keys |
 |---|---|
-| `server` | `listen`, `api_listen`, `mcp_listen`, `proxy_listen` |
+| `server` | `listen`, `api_listen`, `mcp_listen`, `proxy_listen`, `stats_listen` |
 | `auth` | `mode` (`api_keys` only), `secret` |
 | `refs` | `path`, `backend` (`memory` only) |
 | `stats` | `path`, `enabled` |

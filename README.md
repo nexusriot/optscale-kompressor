@@ -349,6 +349,26 @@ prevents was about 0.35% of the bill
 prompt_cache_retention = "24h"
 ```
 
+### opencode — the TUI and OpenCode Desktop
+
+```bash
+kompressor wrap opencode                   # a TUI or `run` session of its own
+kompressor wrap opencode --attach          # Desktop, and every session on the background service
+```
+
+opencode 2.x is pointed at the proxy through its own configuration, never a
+variable: `OPENAI_BASE_URL` in its environment makes every OpenAI model
+"unavailable" (measured on 2.2.4). A launched session gets the overlay in
+`OPENCODE_CONFIG_CONTENT` and runs `--standalone`, because the shared background
+service that otherwise makes the model calls never sees our environment.
+Desktop uses that service, so `--attach` writes the overlay into the global
+`opencode.json`, runs `opencode reload`, and puts the file back on exit. Both
+route the built-in `openai`, `anthropic`, OpenCode Zen and OpenCode Go
+providers, and leave alone any provider whose `baseURL` you set yourself.
+OpenCode Desktop needs **2.2.4 or newer**: the CLI that 2.0.11 bundles does not
+reliably honour a provider's `baseURL`, so its traffic bypasses the proxy.
+Details, including a permanent setup: [docs/OPENCODE.md](docs/OPENCODE.md).
+
 ### Other agents
 
 ```bash
@@ -558,6 +578,10 @@ are in [docs/charts/](docs/charts/).
 | Agent wrap | `kompressor wrap <agent>`                                                                                                                                                   |
 | LLM proxy  | `kompressor serve --proxy`: OpenAI Chat Completions, OpenAI Responses, Anthropic Messages, and a WebSocket relay                                                            |
 | HTTP API   | `POST /v1/compress`, `/v1/compress/raw`, `/v1/retrieve`, `/v1/detect`; `GET /v1/stats/*`, `/healthz`, `/readyz`, `/metrics`                                                 |
+| Live stats | `GET /v1/stats/live`: JSON, or a self-refreshing dashboard in a browser; on its own port with `server.stats_listen`                                                       |
+| Cache      | `GET /v1/stats/cache`: prompt-cache reads, writes and losses per conversation, each loss put down to expiry or a prefix change, and what keep-warm bridged                |
+| Dashboards | `GET /v1/stats/{trends,yield,store-health,keepwarm,upstream,engine}`: long-horizon trends, yield by content type, store health, keep-warm return, upstream incidents, engine time; plus a conversation timeline page |
+| Ref store  | `GET /v1/refs`: search, inspect and delete stored fragments, as JSON or a page; off unless `refs.browse = true`                                                           |
 | MCP server | `kompressor serve --mcp` (streamable HTTP): `optscale_kompressor_retrieve`, `optscale_kompressor_compress`, `optscale_kompressor_compress_raw`, `optscale_kompressor_stats` |
 | CLI        | `kompressor compress`, `retrieve`, `detect`, `stats`, `bench`, `check-config`                                                                                               |
 | Library    | the `kompressor-engine` crate: compress a string or a conversation, no I/O                                                                                                  |
@@ -580,6 +604,143 @@ re-compresses the same growing history and credits the same bytes again.
 `kompressor_stats_dropped_total` on `/metrics` is zero; otherwise every report is
 an undercount. [docs/BENCHMARK.md](docs/BENCHMARK.md) explains how to measure
 against a live agent.
+
+To watch it as it happens, set `server.stats_listen = "127.0.0.1:8818"` and open
+`http://127.0.0.1:8818/`: a dashboard of the last hour (or 5 minutes, or 7
+days) — throughput, tokens removed, net of retrieval, cache reads, upstream
+status and latency, savings by provider, model and content type, why messages
+were left alone, and the latest requests — refreshed every two seconds. The
+same data is JSON at `/v1/stats/live`. It shows the dropped-event count too.
+
+`http://127.0.0.1:8818/cache` is the provider's prompt cache over the last six
+hours (or one, or 30 days): how much of the input was read from cache, what
+the cache saved against no cache at all, every turn that failed to read back
+the prefix the turn before left — put down to expiry when the conversation
+had idled past the cache lifetime, to a prefix change otherwise — the idle
+gaps before each turn, and what the keep-warm pings cost and bridged. Click a
+conversation for its turns one by one. The JSON is `/v1/stats/cache`.
+
+`http://127.0.0.1:8818/analysis` analyzes a fixed date range: conversation
+compression credits and retrieval debits, provider usage, cache losses, latency,
+and errors, plus compression outcomes and skipped categories ranked by token
+volume. Open a conversation for its turn timeline, with links to cache details
+and retrieved fragments (when ref browsing is enabled). The JSON endpoint is
+`/v1/stats/analysis?from=<epoch-ms>&to=<epoch-ms>`; `to` is exclusive, ranges
+span at most 90 days, and `conversation=<fingerprint>` adds turn details.
+Both `/v1` and `/v2` routes serve HTML with `?format=html`. Cache deep links also
+accept the same `from`/`to` pair. Analysis uses retained raw events; daily
+archives cannot reconstruct turn history. Token reduction remains an estimate
+per request, not a monetary saving or a count of unique content.
+
+Seven more pages sit beside those on the statistics listener, linked from each
+other and from every page's **Dashboards** link:
+
+- `/trends`: weekly (or daily, or monthly) net tokens removed, prompt-cache
+  saving, input cost, conversations and errors for up to two years. It reads the
+  daily archive as well as raw rows, so it reaches past the raw-row retention,
+  and marks the period each build was first seen.
+- `/yield`: what each content type gave up, and what retrieval took back by
+  fragment kind (how many stored fragments were ever asked for, and how soon).
+  The engine records messages per type rather than tokens, so the per-type
+  saving is an estimate; runs made of a single type give the exact figure.
+- `/timeline`: one conversation drawn turn by turn — what the cache read, wrote
+  and charged fresh, each lost prefix, the pings, compressions and retrievals.
+- `/store`: what the ref store holds by kind, age and time to expiry, against
+  its byte cap, how many minted handles were ever asked for, and asks that came
+  too late (expired) or for nothing (missing).
+- `/keepwarm`: what the keep-warm pings cost against the rewrites they avoided,
+  by pause length and per conversation, with the pings sent after a
+  conversation's last turn and the TTL losses no ping covered.
+- `/upstream`: status classes, 429s, 5xx and unanswered requests by upstream
+  and model, latency percentiles, incidents (three or more such failures within
+  a minute of each other) and the latest failures.
+- `/engine`: where compression time goes, by content type, prompt size, outcome
+  and surface, the slowest runs, the engine slots in use and dropped stats events.
+
+### Statistics JSON API for automation
+
+Every dashboard is backed by a JSON route, and a client that sends no `Accept`
+header, `*/*` or `application/json` always gets JSON (`?format=json` forces it
+even for a browser). The same routes are served under `/v2`, and on the
+statistics listener (`server.stats_listen`) as well.
+
+| Route | Answers |
+|---|---|
+| `GET /v1/stats/live?window=1h&recent=25` | the live dashboard's snapshot: totals, rates, timeline, upstream, by provider/model/type, skips, retrievals, recent requests, process info |
+| `GET /v1/stats/cache?window=6h` or `?from=&to=` | the cache dashboard's report; `conversation=<16 hex>` adds that conversation's turns |
+| `GET /v1/stats/analysis?from=&to=` | the analysis overview (`report`, `stats_dropped`, `retention_days`); defaults to the last 24 h |
+| `GET /v1/stats/analysis/retrievals?from=&to=` | retrieval amplification |
+| `GET /v1/stats/analysis/latency?from=&to=` | latency and reliability |
+| `GET /v1/stats/analysis/compare?from=&to=` | historical comparison; `compare_from`/`compare_to`, `model`, `mode`, `surface`, `experiment_id`, `run_id` |
+| `GET /v1/stats/trends?window=26w&bucket=week` | per-period history from raw rows and the daily archive; `window` up to `104w`, `bucket` `day`, `week` or `month`, or `from=&to=` up to 730 days |
+| `GET /v1/stats/yield?window=24h` | tokens removed per content type (estimated by message share) and retrieval asks per fragment kind |
+| `GET /v1/stats/store-health?window=24h` | the ref store's census by kind, age and expiry, its size over time, minted versus asked handles, expired and missing asks |
+| `GET /v1/stats/keepwarm?window=24h&conversations=50` | keep-warm ping cost against avoided rewrites, by pause length and per conversation |
+| `GET /v1/stats/upstream?window=24h` | status mix, latency and failures by upstream and model, incidents, latest failures |
+| `GET /v1/stats/engine?window=24h` | engine time by content type, prompt size, outcome and surface, slowest runs, process slots |
+| `GET /v1/stats/summary`, `histogram`, `by_type`, `retrievals`, `requests?request_id=`, `store` | the aggregate reports `kompressor stats` prints |
+
+`from`/`to` are epoch milliseconds (`to` exclusive, at most 90 days apart).
+Authenticate with `x-kompressor-key` (or `Authorization: Bearer`); a key reads
+only its own tenant, and a caller holding the cluster secret
+(`x-kompressor-secret`) may name any tenant with `?tenant=`. Unknown query
+parameters are refused with `422`, and every error uses the same
+`{"error":{"code","message"}}` envelope. With statistics off, the routes answer
+`404` saying so.
+
+```bash
+curl -s -H 'x-kompressor-key: sk-…' "http://127.0.0.1:8840/v1/stats/analysis/latency?from=$(( ($(date +%s) - 3600) * 1000 ))&to=$(( $(date +%s) * 1000 ))" | jq .total
+```
+
+Every dashboard has a **Download JSONL** button, and each of their JSON
+routes — `/v1/stats/live`, `/v1/stats/cache`, `/v1/stats/analysis` and its
+`retrievals`, `latency` and `compare` views, and the six dashboard routes above —
+also answers `?format=jsonl` with a JSON Lines attachment, under the same key
+and tenant rules as the JSON. The first line is `{"record":"summary",…}` with
+every field that is not a list; each list element follows on its own line,
+tagged with the list's dotted path, e.g. `{"record":"timeline",…}` or
+`{"record":"report.conversations",…}`:
+
+```bash
+curl -H 'x-kompressor-key: sk-…' 'http://127.0.0.1:8840/v1/stats/cache?window=24h&format=jsonl' > cache.jsonl
+```
+
+The Analysis page also includes retrieval amplification (negative-net requests,
+repeated reference asks, ranged/full retrieval volume, and budget refusals),
+historical comparison, and latency/reliability tabs. Their JSON endpoints are
+`/v1/stats/analysis/retrievals`, `/v1/stats/analysis/compare`, and
+`/v1/stats/analysis/latency`, each accepting `from`/`to` and the existing tenant
+credentials. They are also available under `/v2`.
+
+Comparison accepts `compare_from`/`compare_to` for the baseline (default: the
+preceding equal-length window) and exact `model`, `mode`, `surface`,
+`experiment_id`, and `run_id` filters applied to both periods. It reports totals,
+per-client/per-conversation values, absolute differences, and relative changes;
+zero denominators remain unavailable. To label a benchmark, set optional
+`stats.experiment_id` and `stats.run_id`. Otherwise each AppCore instance generates
+its own run ID. Events also carry the build version and a canonical fingerprint
+of an explicit allowlist of deployment compression/cache/retrieval settings,
+including provider policy overrides. Credentials and payloads are excluded.
+Actual compression mode is recorded separately; other per-request overrides
+are not separate configuration fingerprints.
+
+Schema v13 preserves daily experiment totals and conversation fingerprint sets
+before retention deletes raw events. Late arrivals are added once, and archived
+and raw totals can be combined. Archived comparisons require complete UTC days;
+partial archived days are explicitly omitted. Older legacy daily rollups lack
+experiment dimensions and are excluded from this comparison. Turn ordering,
+retrieval rankings, and latency percentiles still require retained raw events.
+
+New HTTP requests record upstream response-head wait for each attempt (including
+retries/failures), request-start-to-first-response-head time, and local retrieval
+answer/refusal execution time. Attempt detail is capped at 64 with the total
+count retained. This measures headers, not time to first token, and phases
+must not be added together. Latency reports exclude keep-warm pings, preserve
+missing sample counts, and show distributions, model/round/prompt-size/status
+breakdowns, slow requests, and error trends. Reports over more than 200,000 client
+rows explicitly use the newest 200,000. Detailed timing is unavailable for old
+rows and the WebSocket relay. Comparisons are observational and do not measure
+task-quality preservation or prove causation.
 
 ---
 
@@ -620,7 +781,7 @@ Good first issues are labelled
 | `make harbor-gates` | every live-agent benchmark gate, with no provider spend                                        |
 
 
-`cargo test --workspace` runs **1,157 tests** across ten crates; clippy and rustfmt
+`cargo test --workspace` runs **1,403 tests** across ten crates; clippy and rustfmt
 are clean. `make bench-save` and `make golden` move what the tests compare against,
 so both ask before they run.
 

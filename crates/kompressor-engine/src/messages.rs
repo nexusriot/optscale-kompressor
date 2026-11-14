@@ -15,7 +15,7 @@ use crate::detect::detect_result;
 use crate::markers::stale_read_marker;
 use crate::options::EngineOptions;
 use crate::pipeline::compress_content;
-use crate::read_lifecycle::{ReadMessage, ReadState, classify_reads};
+use crate::read_lifecycle::{ReadMessage, ReadState, classify_reads, reports_failure};
 use crate::refs::{RefCollector, RefId, refs_in};
 use crate::text::chars_len;
 use crate::tokens::estimate_tokens;
@@ -166,6 +166,11 @@ pub struct MessageMeta {
     /// `compress_messages`.
     #[serde(default)]
     pub one_text_block: bool,
+    /// The tool reported that it failed: Anthropic's `is_error`, or the same
+    /// flag on the message API. A failed write changed nothing, so it must not
+    /// mark the read before it stale.
+    #[serde(default)]
+    pub tool_error: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -648,6 +653,11 @@ pub struct CompressStats {
     ///   fetched back. Not a decline: the engine could have taken these tokens
     ///   and chose not to, because a retrieve round costs far more than they
     ///   are worth.
+    /// * `read_again` — it compressed, and the compression was thrown away
+    ///   because it would have elided, a second time, a fragment an earlier
+    ///   message of this conversation already elided. The model reading the
+    ///   same bytes again is the same demand as a fetch, made through its own
+    ///   tools instead of ours.
     pub skipped_by_reason: BTreeMap<String, u32>,
     /// The same partition, weighted by tokens instead of messages.
     ///
@@ -813,6 +823,10 @@ fn protection_for(
     None
 }
 
+/// The largest fragment a second read of it keeps inline. See `read_again`
+/// in [`compress_messages`].
+const READ_AGAIN_MAX_TOKENS: u32 = 2_048;
+
 /// Compress a conversation in place.
 pub fn compress_messages(
     messages: &mut [Message],
@@ -823,6 +837,11 @@ pub fn compress_messages(
     let mut stats = CompressStats::default();
     let mut protected_ref_ids: BTreeSet<RefId> = BTreeSet::new();
     let mut kept_inline_ids: BTreeSet<RefId> = BTreeSet::new();
+    // Every handle an earlier message of this request elided, or carries from
+    // an earlier elision. Taken before any keep-inline rollback, so a message's
+    // answer depends only on the messages ahead of it, and those are the
+    // prefix: the same history decides it the same way on every later turn.
+    let mut elided_before: BTreeSet<RefId> = BTreeSet::new();
 
     let read_states = if opts.enable_stale_read {
         let view: Vec<ReadMessage> = messages
@@ -831,6 +850,8 @@ pub fn compress_messages(
                 tool_name: m.meta.tool_name.as_deref(),
                 path: m.meta.file_path.as_deref(),
                 protected: m.meta.cache_control || m.meta.protected,
+                failed: m.meta.tool_error
+                    || (m.meta.file_path.is_some() && reports_failure(&m.content.joined_text())),
             })
             .collect();
         classify_reads(&view, req.effective_frozen())
@@ -878,6 +899,7 @@ pub fn compress_messages(
                 let found = refs_in(text);
                 if !found.is_empty() {
                     carried = true;
+                    elided_before.extend(found.iter().copied());
                     protected_ref_ids.extend(found);
                 }
             }
@@ -900,11 +922,11 @@ pub fn compress_messages(
         let mut applied: Vec<Kind> = Vec::new();
         let gated_before = refs.gated();
 
-        // Only cloned when there is something to check against, because the
-        // overwhelming majority of requests have retrieved nothing.
+        // Only cloned when there is something to check against: a fetched
+        // fragment, or one an earlier message elided and this one may repeat.
         let inline_mark = refs.mark();
-        let before_compression =
-            (!req.keep_inline.is_empty()).then(|| messages[index].content.clone());
+        let before_compression = (!req.keep_inline.is_empty() || !elided_before.is_empty())
+            .then(|| messages[index].content.clone());
 
         if stale
             && refs.is_enabled()
@@ -1037,34 +1059,106 @@ pub fn compress_messages(
         // purpose: `seen` must hold the bytes this message really ships, or a
         // later message folds against text that is not there.
         let mut kept_inline = false;
+        let mut kept_reason = "retrieved_before";
+        // A body this message would elide under a handle an earlier message
+        // already elided: the model asked for the same bytes again, through
+        // its own tools. Measured on the `ret-24h` run of 2026-11-09: one
+        // agent printed `split_recipient` three times, the last a 33-line
+        // window that came back as nothing but the marker, said "that function
+        // is still being compressed", then spent a retrieve round on it. Of
+        // nine handles elided twice in that run, five were then fetched.
+        //
+        // Never a stale read's marker: that content is wrong, not wanted. And
+        // only fragments of a size the evidence covers (75 to 885 tokens
+        // there); a large one read twice is cheaper fetched narrowed than
+        // shipped whole on every later turn.
+        //
+        // Read from every handle this message stashed, repeats included: a
+        // fragment an earlier message already holds is not in `pairs` again.
+        let stashed_here = refs.stashed_since(inline_mark);
+        let tokens_of = |id: &RefId| {
+            refs.fragment(*id)
+                .map_or(0, |fragment| estimate_tokens(fragment, &role))
+        };
+        let read_again: Vec<RefId> = if applied.contains(&Kind::StaleRead) {
+            Vec::new()
+        } else {
+            stashed_here
+                .iter()
+                .copied()
+                .filter(|id| elided_before.contains(id) && tokens_of(id) <= READ_AGAIN_MAX_TOKENS)
+                .collect()
+        };
+        elided_before.extend(stashed_here.iter().copied());
         if let Some(original) = before_compression {
+            // Unknown counts read as one demand; `u32::MAX` is a fragment an
+            // earlier turn already shipped whole, or one read again here. The
+            // second is pinned because the decision is the history's, not the
+            // turn's: priced again as the message ages, it would flip, and the
+            // flip would rewrite it.
+            let demand_of = |id: &RefId| {
+                if read_again.contains(id) {
+                    return u32::MAX;
+                }
+                req.fetches
+                    .iter()
+                    .find(|(other, _)| other == id)
+                    .map_or(1, |(_, n)| *n)
+            };
             // Only the fragments this message would re-elide, and only the ones
-            // already fetched back.
-            let protected: u32 = refs.pairs()[inline_mark.pairs..]
+            // already fetched back or read again. A fetched fragment is weighed
+            // where this request first elides it, as it always was: the proxy
+            // pins a promotion by handle across the conversation, so keeping a
+            // later copy of it would pin, and so rewrite, the first.
+            let here: Vec<(RefId, u32)> = refs.pairs()[inline_mark.pairs..]
                 .iter()
-                .filter(|(id, _)| req.keep_inline.contains(id))
-                .map(|(_, fragment)| estimate_tokens(fragment, &role))
-                .sum();
-            // The most-demanded fragment in this message decides it: promoting
+                .map(|(id, _)| *id)
+                .filter(|id| req.keep_inline.contains(id) && !read_again.contains(id))
+                .chain(read_again.iter().copied())
+                .map(|id| (id, tokens_of(&id)))
+                .collect();
+            let pinned: Vec<RefId> = here
+                .iter()
+                .filter(|(id, _)| demand_of(id) == u32::MAX)
+                .map(|(id, _)| *id)
+                .collect();
+            // A promotion buys only the fragments not already inline. Their
+            // pinned siblings' rewrite was paid on the turn that pinned them,
+            // and lending a newly fetched neighbour their unbounded demand let
+            // one fetch of 309 tokens re-write message 14 of a conversation
+            // 22,528 cached tokens behind it (`ret-off` run of 2026-11-09).
+            let unpinned = here.iter().filter(|(id, _)| !pinned.contains(id));
+            let protected: u32 = if pinned.len() < here.len() {
+                unpinned.clone().map(|(_, tokens)| *tokens).sum()
+            } else {
+                here.iter().map(|(_, tokens)| *tokens).sum()
+            };
+            // The most-demanded fragment the rewrite buys decides it: promoting
             // the message serves all of them, so the one asked for most often
-            // is what the rewrite buys. Unknown counts read as one demand.
-            let fetches: u32 = refs.pairs()[inline_mark.pairs..]
-                .iter()
-                .filter(|(id, _)| req.keep_inline.contains(id))
-                .map(|(id, _)| {
-                    req.fetches
-                        .iter()
-                        .find(|(other, _)| other == id)
-                        .map_or(1, |(_, n)| *n)
-                })
+            // is what the rewrite is worth.
+            let fetches: u32 = unpinned
+                .map(|(id, _)| demand_of(id))
                 .max()
+                .or_else(|| (!here.is_empty()).then_some(u32::MAX))
                 .unwrap_or(0);
             if compressed_here && protected > 0 {
-                let demanded: Vec<_> = refs.pairs()[inline_mark.pairs..]
+                let demanded: Vec<RefId> = here.iter().map(|(id, _)| *id).collect();
+                // Only fetched fragments are reported as kept: the proxy pins
+                // what it reads there across the conversation, and a body read
+                // twice is demand for the later copy, not the first.
+                let fetched_only = |ids: &mut dyn Iterator<Item = RefId>| -> Vec<RefId> {
+                    ids.filter(|id| req.keep_inline.contains(id) && !read_again.contains(id))
+                        .collect()
+                };
+                let keep_all: Vec<RefId> = req
+                    .keep_inline
                     .iter()
-                    .filter(|(id, _)| req.keep_inline.contains(id))
-                    .map(|(id, _)| *id)
+                    .chain(read_again.iter())
+                    .copied()
                     .collect();
+                if demanded.iter().all(|id| read_again.contains(id)) {
+                    kept_reason = "read_again";
+                }
                 // Everything after this message, which a rewrite here makes the
                 // provider read again, and the whole prompt it is a fraction
                 // of. Counted on what the messages hold right now: the ones
@@ -1100,12 +1194,38 @@ pub fn compress_messages(
                 let mut recovery_refs = refs.scratch();
                 let selective = repaid
                     .then(|| {
-                        compress_preserving_code(&original, &role, opts, req, &mut recovery_refs)
+                        compress_preserving_code(
+                            &original,
+                            &role,
+                            opts,
+                            req,
+                            &keep_all,
+                            &mut recovery_refs,
+                        )
                     })
                     .flatten();
                 let recovery_content = selective.as_ref().map_or(&original, |(content, _)| content);
+                // What this message shipped last turn when some of its
+                // fragments are already pinned: those whole, the rest elided.
+                // It is both the baseline a promotion gives compression up
+                // against and what a refusal ships, because re-eliding the
+                // pinned ones would be a second rewrite, not the absence of one.
+                let mixed = !pinned.is_empty() && pinned.len() < here.len();
+                let mut pinned_refs = refs.scratch();
+                let pinned_shape = if mixed {
+                    compress_preserving_code(&original, &role, opts, req, &pinned, &mut pinned_refs)
+                } else {
+                    None
+                };
+                let baseline = if mixed {
+                    pinned_shape
+                        .as_ref()
+                        .map_or(&original, |(content, _)| content)
+                } else {
+                    &messages[index].content
+                };
                 let forfeited = count_tokens(recovery_content, &role)
-                    .saturating_sub(count_tokens(&messages[index].content, &role));
+                    .saturating_sub(count_tokens(baseline, &role));
                 if keeping_it_inline_is_worth_it(
                     forfeited,
                     protected,
@@ -1127,7 +1247,7 @@ pub fn compress_messages(
                             "keeping demanded fragments inline"
                         );
                     }
-                    kept_inline_ids.extend(demanded);
+                    kept_inline_ids.extend(fetched_only(&mut demanded.iter().copied()));
                     refs.rollback(inline_mark);
                     compressed_here = if let Some((content, kinds)) = selective {
                         messages[index].content = content;
@@ -1140,6 +1260,22 @@ pub fn compress_messages(
                     };
                     kept_inline = true;
                 } else {
+                    if mixed {
+                        // The newly fetched fragment stays elided; its pinned
+                        // siblings stay where an earlier turn put them.
+                        kept_inline_ids.extend(fetched_only(&mut pinned.iter().copied()));
+                        refs.rollback(inline_mark);
+                        compressed_here = if let Some((content, kinds)) = pinned_shape {
+                            messages[index].content = content;
+                            applied = kinds;
+                            refs.adopt(pinned_refs);
+                            true
+                        } else {
+                            messages[index].content = original;
+                            false
+                        };
+                        kept_inline = true;
+                    }
                     // Said out loud, because the consequence is that the model
                     // may ask for this fragment again and spend another round
                     // doing it. The same reasoning put the ranged-retrieval
@@ -1193,7 +1329,7 @@ pub fn compress_messages(
         } else {
             stats.skipped_messages += 1;
             let reason = if kept_inline {
-                "retrieved_before".to_string()
+                kept_reason.to_string()
             } else if refs.gated() > gated_before {
                 // The compressors succeeded and the gate shipped the result
                 // whole; `declined:<type>` would say they had failed.
@@ -1213,7 +1349,7 @@ pub fn compress_messages(
     stats.finish(opts.mode, refs)
 }
 
-/// Build a recovery candidate with fetched source bodies held inline. Callers
+/// Build a recovery candidate with the source bodies in `keep` held inline. Callers
 /// can price it in a scratch collector before accepting the promotion. A
 /// fallback route must not hide a demanded body again; otherwise the caller
 /// must price and retain the original message instead.
@@ -1222,11 +1358,12 @@ fn compress_preserving_code(
     role: &str,
     opts: &EngineOptions,
     req: &RequestOptions,
+    keep: &[RefId],
     refs: &mut RefCollector,
 ) -> Option<(MessageContent, Vec<Kind>)> {
     let mut candidate = original.clone();
     let mut scratch = refs.scratch();
-    scratch.preserve_code(req.keep_inline);
+    scratch.preserve_code(keep);
     let mut applied = Vec::new();
     let mut changed = false;
     let mut compress = |text: &mut String| {
@@ -1252,12 +1389,7 @@ fn compress_preserving_code(
         }
         MessageContent::Opaque => return None,
     }
-    if !changed
-        || scratch
-            .pairs()
-            .iter()
-            .any(|(id, _)| req.keep_inline.contains(id))
-    {
+    if !changed || scratch.pairs().iter().any(|(id, _)| keep.contains(id)) {
         return None;
     }
     refs.adopt(scratch);
@@ -1867,6 +1999,68 @@ mod tests {
         assert!(!refs.is_empty());
     }
 
+    fn read_then_write(write_result: &str, tool_error: bool) -> Vec<Message> {
+        vec![
+            Message {
+                role: "tool".into(),
+                content: MessageContent::Text("x = 1\n".repeat(200)),
+                meta: MessageMeta {
+                    tool_name: Some("Read".into()),
+                    file_path: Some("src/a.rs".into()),
+                    ..Default::default()
+                },
+            },
+            Message {
+                role: "tool".into(),
+                content: MessageContent::Text(write_result.into()),
+                meta: MessageMeta {
+                    tool_name: Some("Write".into()),
+                    file_path: Some("src/a.rs".into()),
+                    tool_error,
+                    ..Default::default()
+                },
+            },
+        ]
+    }
+
+    /// A write that failed left the file as it was, so the read before it is
+    /// still the truth — and the one thing the agent needs to retry.
+    #[test]
+    fn a_write_that_failed_leaves_the_read_before_it_alone() {
+        let opts = EngineOptions::default();
+        for (result, flagged) in [
+            ("ERROR: permission denied; file unchanged", false),
+            (
+                "<tool_use_error>File has not been read yet.</tool_use_error>",
+                false,
+            ),
+            ("Error: old_string not found in file", false),
+            ("String to replace not found in file.", true),
+        ] {
+            let mut messages = read_then_write(result, flagged);
+            let mut refs = opts.collector();
+            let stats =
+                compress_messages(&mut messages, &opts, &RequestOptions::default(), &mut refs);
+            assert_eq!(stats.by_type.get("stale_read"), None, "{result}");
+            match &messages[0].content {
+                MessageContent::Text(t) => {
+                    assert!(!t.starts_with("[Read content stale"), "{result}: {t}")
+                }
+                _ => panic!(),
+            }
+        }
+    }
+
+    #[test]
+    fn a_write_that_succeeded_still_makes_the_read_stale() {
+        let opts = EngineOptions::default();
+        let mut messages =
+            read_then_write("The file src/a.rs has been updated successfully.", false);
+        let mut refs = opts.collector();
+        let stats = compress_messages(&mut messages, &opts, &RequestOptions::default(), &mut refs);
+        assert_eq!(stats.by_type.get("stale_read"), Some(&1));
+    }
+
     #[test]
     fn the_accounting_adds_up() {
         let opts = EngineOptions::default();
@@ -2314,6 +2508,256 @@ mod skip_reason_tests {
             original.content.joined_text(),
             "and ships whole"
         );
+    }
+
+    /// A source file whose function bodies are elided one handle each, the
+    /// handles in order, and a tail long enough that rewriting the file's
+    /// message is far from free.
+    #[cfg(feature = "code-aware")]
+    fn source_with_handles() -> (Message, Vec<(RefId, String)>, Message) {
+        let source: String = (0..18)
+            .map(|function| {
+                let body: String = (0..26)
+                    .map(|step| {
+                        format!(
+                            "    step_{step} = compute(entries, {})\n",
+                            function * 26 + step
+                        )
+                    })
+                    .collect();
+                format!("def reconcile_{function:02}(entries):\n{body}\n")
+            })
+            .collect();
+        let original = msg("tool", &source);
+        let mut first = vec![original.clone()];
+        let mut refs = RefCollector::new(1 << 20);
+        compress_messages(&mut first, &opts(), &RequestOptions::default(), &mut refs);
+        let handles = refs
+            .pairs()
+            .iter()
+            .map(|(id, f)| (*id, f.clone()))
+            .collect();
+        let tail: String = (0..6_000)
+            .map(|i| format!("a later turn carrying its own text, line {i}\n"))
+            .collect();
+        (original, handles, msg("user", &tail))
+    }
+
+    #[cfg(feature = "code-aware")]
+    fn ship(
+        original: &Message,
+        tail: &Message,
+        fetches: &[(RefId, u32)],
+    ) -> (String, CompressStats) {
+        let keep: Vec<RefId> = fetches.iter().map(|(id, _)| *id).collect();
+        let mut messages = vec![original.clone(), tail.clone()];
+        let mut refs = RefCollector::new(1 << 20);
+        let stats = compress_messages(
+            &mut messages,
+            &opts(),
+            &RequestOptions {
+                keep_inline: &keep,
+                fetches,
+                ..Default::default()
+            },
+            &mut refs,
+        );
+        (messages[0].content.joined_text(), stats)
+    }
+
+    /// Three bodies of a file already shipped whole, and a fourth fetched once.
+    ///
+    /// The fourth used to borrow its siblings' unbounded demand, so one fetch
+    /// of 309 tokens re-wrote the message with 22,528 cached tokens behind it
+    /// (`ret-off` run of 2026-11-09, conversation `21c3fb30`). Priced on its
+    /// own it does not repay that, and refusing it must leave the message
+    /// exactly as the turn before shipped it — not re-elide the three.
+    #[cfg(feature = "code-aware")]
+    #[test]
+    fn a_fragment_fetched_beside_pinned_ones_is_priced_on_its_own_demand() {
+        let (original, handles, tail) = source_with_handles();
+        let pinned: Vec<(RefId, u32)> =
+            handles[..3].iter().map(|(id, _)| (*id, u32::MAX)).collect();
+        let (before, _) = ship(&original, &tail, &pinned);
+
+        let mut fetched_once = pinned.clone();
+        fetched_once.push((handles[3].0, 1));
+        let (after, stats) = ship(&original, &tail, &fetched_once);
+
+        assert_eq!(
+            after, before,
+            "the message must not move in front of the tail"
+        );
+        for (_, body) in &handles[..3] {
+            assert!(after.contains(body.as_str()), "a pinned body was re-elided");
+        }
+        assert!(
+            !after.contains(handles[3].1.as_str()),
+            "one fetch must not buy the rewrite"
+        );
+        assert!(
+            after.contains(handles[3].0.to_string().as_str()),
+            "the fetched body stays recoverable"
+        );
+        let mut kept: Vec<RefId> = handles[..3].iter().map(|(id, _)| *id).collect();
+        kept.sort();
+        assert_eq!(stats.kept_inline_refs, kept);
+    }
+
+    /// And once the newcomer is asked for often enough, it joins them.
+    #[cfg(feature = "code-aware")]
+    #[test]
+    fn a_fragment_fetched_beside_pinned_ones_is_promoted_on_enough_demand() {
+        let (original, handles, tail) = source_with_handles();
+        let mut fetches: Vec<(RefId, u32)> =
+            handles[..3].iter().map(|(id, _)| (*id, u32::MAX)).collect();
+        fetches.push((handles[3].0, CACHE_DISCOUNT));
+        let (after, stats) = ship(&original, &tail, &fetches);
+        for (_, body) in &handles[..4] {
+            assert!(after.contains(body.as_str()));
+        }
+        assert!(
+            !after.contains(handles[4].1.as_str()),
+            "unfetched bodies stay elided"
+        );
+        assert_eq!(stats.kept_inline_refs.len(), 4);
+    }
+
+    #[cfg(feature = "code-aware")]
+    fn reconcile(functions: std::ops::Range<usize>) -> String {
+        functions
+            .map(|function| {
+                let body: String = (0..26)
+                    .map(|step| {
+                        format!(
+                            "    step_{step} = compute(entries, {})\n",
+                            function * 26 + step
+                        )
+                    })
+                    .collect();
+                format!("def reconcile_{function:02}(entries):\n{body}\n")
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "code-aware")]
+    fn shipped(messages: &mut [Message]) -> (Vec<String>, CompressStats) {
+        let mut refs = RefCollector::new(1 << 20);
+        let stats = compress_messages(messages, &opts(), &RequestOptions::default(), &mut refs);
+        (
+            messages.iter().map(|m| m.content.joined_text()).collect(),
+            stats,
+        )
+    }
+
+    /// A body the model reads a second time ships whole the second time.
+    ///
+    /// The `ret-24h` run of 2026-11-09: an agent printed `split_recipient`
+    /// three times — the last a narrow line window that came back as nothing
+    /// but the marker — then spent a retrieve round on it.
+    #[cfg(feature = "code-aware")]
+    #[test]
+    fn a_body_read_again_ships_whole_the_second_time() {
+        let mut messages = vec![
+            msg("tool", &reconcile(0..18)),
+            msg("user", "look at those two again"),
+            msg("tool", &reconcile(3..5)),
+        ];
+        let (out, stats) = shipped(&mut messages);
+
+        assert!(
+            !out[0].contains("step_0 = compute(entries, 78)"),
+            "the first read stays elided"
+        );
+        assert_eq!(out[2], reconcile(3..5), "the second read ships whole");
+        assert_eq!(stats.skipped_by_reason.get("read_again"), Some(&1));
+        assert!(
+            stats.kept_inline_refs.is_empty(),
+            "a re-read is not a fetch: the proxy must not pin its first copy"
+        );
+    }
+
+    /// Only the repeated bodies come back: a body the window shows for the
+    /// first time is elided as it always was.
+    #[cfg(feature = "code-aware")]
+    #[test]
+    fn a_new_body_beside_a_repeated_one_is_still_elided() {
+        let mut messages = vec![
+            msg("tool", &reconcile(0..4)),
+            msg("user", "and the next one"),
+            msg("tool", &reconcile(3..5)),
+        ];
+        let (out, _) = shipped(&mut messages);
+
+        assert!(
+            out[2].contains(&reconcile(3..4)),
+            "reconcile_03 was read before"
+        );
+        assert!(
+            !out[2].contains("step_0 = compute(entries, 104)"),
+            "reconcile_04 was not, and stays elided"
+        );
+    }
+
+    /// The decision belongs to the history ahead of the message, so a later
+    /// turn makes it the same way and the cached prefix does not move.
+    #[cfg(feature = "code-aware")]
+    #[test]
+    fn a_read_again_decision_survives_the_next_turn() {
+        let opening = vec![
+            msg("tool", &reconcile(0..18)),
+            msg("user", "look at those two again"),
+            msg("tool", &reconcile(3..5)),
+        ];
+        let (first, _) = shipped(&mut opening.clone());
+        let mut later = opening;
+        later.push(msg(
+            "user",
+            &"a later turn with its own text\n".repeat(4_000),
+        ));
+        later.push(msg("tool", &reconcile(10..12)));
+        let (second, _) = shipped(&mut later);
+
+        assert_eq!(second[..3], first[..], "the prefix ships identically");
+        assert_eq!(
+            second[4],
+            reconcile(10..12),
+            "and a third read is also a re-read"
+        );
+    }
+
+    /// A large fragment read twice stays elided: shipping it whole on every
+    /// later turn costs more than fetching the part that is wanted.
+    #[test]
+    fn a_large_fragment_read_again_stays_elided() {
+        let payload: String = (0..400)
+            .map(|i| {
+                format!(
+                    "2026-01-02T03:04:{:02}Z INFO worker seq={i} value={i}\n",
+                    i % 60
+                )
+            })
+            .collect();
+        let mut messages = vec![
+            msg("tool", &payload),
+            msg("user", "again"),
+            msg("tool", &payload),
+        ];
+        let mut refs = RefCollector::new(1 << 20);
+        let stats = compress_messages(
+            &mut messages,
+            &opts(),
+            &RequestOptions::default(),
+            &mut refs,
+        );
+
+        assert!(
+            refs.pairs()
+                .iter()
+                .all(|(_, f)| estimate_tokens(f, "tool") > READ_AGAIN_MAX_TOKENS)
+        );
+        assert!(messages[2].content.joined_text().len() < payload.len());
+        assert_eq!(stats.skipped_by_reason.get("read_again"), None);
     }
 
     fn cached(mut message: Message, blocks: u32, breakpoint: bool) -> Message {

@@ -50,6 +50,7 @@ macro_rules! say {
 pub mod agents;
 pub mod configfile;
 pub mod mcp;
+pub mod opencode;
 pub mod paths;
 pub mod proxy;
 pub mod settings;
@@ -231,13 +232,40 @@ async fn run(args: WrapArgs, agent: Option<&'static Agent>, config: Config) -> C
         proxy::find_free_port(preferred)?
     };
 
-    let env = resolve_env(agent, &args.env, port, |name| {
+    let mut env = resolve_env(agent, &args.env, port, |name| {
         std::env::var_os(name).is_some()
     })?;
 
+    // opencode is configured, not pointed: a launched session carries the
+    // overlay in its environment and runs a private server that can see it.
+    // `--attach` writes the overlay into the global file instead, further down.
+    let mut lead = Vec::new();
+    if agent.and_then(|a| a.config) == Some(agents::ConfigFile::OpenCode) && !args.attach {
+        let (content, routing) = opencode::launch_env(port)?;
+        if routing.routed.is_empty() {
+            return Err(CliError::Usage(
+                "every opencode provider kompressor knows already has a baseURL of your own, \
+                 so nothing would reach the proxy; see `kompressor wrap --list`"
+                    .into(),
+            ));
+        }
+        if !args.print {
+            routing.report(port);
+        }
+        env.push((opencode::CONTENT_VAR.to_string(), content));
+        lead = opencode::launch_args(&args.args)?;
+    }
+
     if args.print {
         for (name, value) in &env {
-            println!("export {name}={value}");
+            println!("export {name}={}", shell_quote(value));
+        }
+        if !lead.is_empty() {
+            say!(
+                "kompressor: run {} with {} or the overlay does not reach the model",
+                agent.map(|a| a.binary).unwrap_or("the agent"),
+                lead.join(" ")
+            );
         }
         return Ok(());
     }
@@ -299,7 +327,7 @@ async fn run(args: WrapArgs, agent: Option<&'static Agent>, config: Config) -> C
     // Edited before the agent starts and put back after it exits, so a wrapped
     // session never outlives its own changes to a file the user owns.
     let (injected, flags) = match agent.and_then(|a| a.config) {
-        Some(kind) => match claim_config(kind, port) {
+        Some(kind) => match claim_config(kind, port, args.attach) {
             Ok(wiring) => wiring,
             Err(e) => {
                 shutdown(&paths, started, port, stopping.hurried()).await;
@@ -336,10 +364,11 @@ async fn run(args: WrapArgs, agent: Option<&'static Agent>, config: Config) -> C
             Some(agents::Wiring::Manual { where_ }) => {
                 manual(agent, where_, &env, &mut interrupts).await
             }
-            _ if args.attach => attach(agent, &env, &mut interrupts).await,
+            _ if args.attach => attach(agent, &env, port, &mut interrupts).await,
             _ => {
                 let offered = offered.as_ref();
-                launch(agent, &args.args, &flags, &env, offered, &mut interrupts).await
+                let (extra, flags) = (&args.args, &flags);
+                launch(agent, &lead, extra, flags, &env, offered, &mut interrupts).await
             }
         }
     };
@@ -488,14 +517,22 @@ impl Interrupts {
     }
 }
 
+/// A config file this session changed and has to put back.
+enum Injected {
+    Codex(configfile::Target),
+    OpenCode(opencode::Target),
+}
+
 /// Point an agent's config file at the proxy, reporting what was done.
 ///
 /// Returns the file edited, if one was, and the flags to start the agent with
-/// instead, if that is how this agent is pointed.
+/// instead, if that is how this agent is pointed. No file for a launched
+/// opencode, which carries its overlay in the environment instead.
 fn claim_config(
     kind: agents::ConfigFile,
     port: u16,
-) -> Result<(Option<configfile::Target>, Vec<String>), CliError> {
+    attach: bool,
+) -> Result<(Option<Injected>, Vec<String>), CliError> {
     let target = match kind {
         agents::ConfigFile::Codex => {
             if let Some(flags) = configfile::Target::codex_flags(port) {
@@ -519,6 +556,8 @@ fn claim_config(
             }
             configfile::Target::codex(port)
         }
+        agents::ConfigFile::OpenCode if !attach => return Ok((None, Vec::new())),
+        agents::ConfigFile::OpenCode => return Ok((Some(claim_opencode(port)?), Vec::new())),
     };
     match configfile::claim(&target)? {
         configfile::Claimed::Injected => {
@@ -534,7 +573,45 @@ fn claim_config(
             );
         }
     }
-    Ok((Some(target), Vec::new()))
+    Ok((Some(Injected::Codex(target)), Vec::new()))
+}
+
+/// Point the global opencode config at the proxy and make the service see it.
+///
+/// Without the reload the running service keeps the URLs it started with, and
+/// the session routes nothing while the file says it does. Its failure is a
+/// warning, not an error: with no service running there is nothing to reload,
+/// and the next one to start reads the file.
+fn claim_opencode(port: u16) -> Result<Injected, CliError> {
+    let target = opencode::Target::global();
+    let routing = opencode::claim(&target, port)?;
+    if routing.routed.is_empty() {
+        let _ = opencode::release(&target, false);
+        return Err(CliError::Usage(format!(
+            "every opencode provider kompressor knows already has a baseURL of your own in \
+             {}, so nothing would reach the proxy",
+            target.path.display()
+        )));
+    }
+    say!(
+        "kompressor: {} now points at 127.0.0.1:{port}",
+        target.path.display()
+    );
+    routing.report(port);
+    match opencode::reload() {
+        Ok(opencode::Reloaded::Running) => {
+            say!("kompressor: opencode's background service reloaded its config")
+        }
+        Ok(opencode::Reloaded::NotRunning) => say!(
+            "kompressor: no opencode background service is running; the next one to start \
+             (Desktop, or a TUI) reads the file as it is now"
+        ),
+        Err(why) => say!(
+            "kompressor: {why}. A service already running keeps its old URLs until \
+             `opencode reload` or a restart"
+        ),
+    }
+    Ok(Injected::OpenCode(target))
 }
 
 /// Put the config file back, saying so only when something changed.
@@ -542,7 +619,11 @@ fn claim_config(
 /// A failure here is reported and not returned: the agent has already run, and
 /// turning a cleanup problem into the session's exit status would report the
 /// user's work as failed. The path is named because the repair is manual.
-fn release_config(target: &configfile::Target) {
+fn release_config(injected: &Injected) {
+    let target = match injected {
+        Injected::Codex(target) => target,
+        Injected::OpenCode(target) => return release_opencode(target),
+    };
     match configfile::release(target, false) {
         Ok(settings::Released::Restored) => {
             say!("kompressor: restored {}", target.path.display());
@@ -562,6 +643,51 @@ fn release_config(target: &configfile::Target) {
             );
         }
     }
+}
+
+/// The opencode half of [`release_config`]: restore, then reload so the
+/// service stops sending to a proxy that is about to go.
+fn release_opencode(target: &opencode::Target) {
+    match opencode::release(target, false) {
+        Ok(settings::Released::Restored) => {
+            say!("kompressor: restored {}", target.path.display());
+            if let Err(why) = opencode::reload() {
+                say!(
+                    "kompressor: {why}. Run `opencode reload`, or the service keeps \
+                     sending to 127.0.0.1 until it restarts"
+                );
+            }
+        }
+        Ok(settings::Released::StillInUse) => {
+            say!(
+                "kompressor: {} left in place, another session still holds it",
+                target.path.display()
+            );
+        }
+        Ok(settings::Released::NotOurs) => {}
+        Err(e) => {
+            say!(
+                "kompressor: could not restore {}: {e}\n           \
+                 Run `kompressor unwrap opencode` to put it back.",
+                target.path.display()
+            );
+        }
+    }
+}
+
+/// Quote a value for `export NAME=…` in a POSIX shell.
+///
+/// The base URLs never needed it; opencode's overlay is JSON, whose quotes and
+/// braces the shell would otherwise eat.
+fn shell_quote(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_-./:=@%+,".contains(&b))
+    {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 /// Milliseconds since the epoch, for scoping this session's statistics.
@@ -642,6 +768,7 @@ fn report_session(config: &Config, started_ms: i64, manual: bool) {
 /// Launch the agent with the proxy in its environment and wait for it.
 async fn launch(
     agent: Option<&'static Agent>,
+    lead: &[String],
     extra: &[String],
     flags: &[String],
     env: &[(String, String)],
@@ -693,6 +820,7 @@ async fn launch(
         // Before the user's own arguments, not after: the last of theirs may be a
         // positional the agent reads as a prompt, and a flag pair appended past it
         // would be swallowed into that string rather than parsed.
+        command.args(lead);
         command.args(flags);
         if let Some(offered) = offered {
             command.args(offered.args());
@@ -809,15 +937,29 @@ impl Drop for AttachedSettings {
 async fn attach(
     agent: Option<&'static Agent>,
     env: &[(String, String)],
+    port: u16,
     interrupts: &mut Interrupts,
 ) -> CliResult {
     let agent = agent.ok_or_else(|| {
         CliError::Usage("--attach needs a named agent whose settings file is known".into())
     })?;
+    // The file was claimed before the session started and is put back after it
+    // ends, like codex's — all that is left here is to hold the proxy up for
+    // the service and Desktop, which this command never launches.
+    if agent.config == Some(agents::ConfigFile::OpenCode) {
+        say!(
+            "kompressor: attached. opencode's background service and OpenCode Desktop now \
+             send through 127.0.0.1:{port}; Ctrl-C restores the config and releases the proxy."
+        );
+        interrupts.recv().await;
+        say!();
+        return Ok(());
+    }
     if agent.name != "claude" {
         return Err(CliError::Usage(format!(
             "--attach is only implemented for `claude` (Claude Code reads \
-             .claude/settings.local.json); {} is launched with `kompressor wrap {}`",
+             .claude/settings.local.json) and `opencode` (its global opencode.json); \
+             {} is launched with `kompressor wrap {}`",
             agent.name, agent.name
         )));
     }
@@ -963,9 +1105,25 @@ pub fn unwrap_agent(args: UnwrapArgs) -> CliResult {
     // A config-file agent keeps its wiring outside the project, so `unwrap` has
     // to look there whatever directory it is run from. The port is irrelevant
     // to a removal; the block is identified by its markers.
+    if agent.config == Some(agents::ConfigFile::OpenCode) {
+        let target = opencode::Target::global();
+        if opencode::release(&target, true)? == settings::Released::Restored {
+            println!("restored {}", target.path.display());
+            if let Err(why) = opencode::reload() {
+                println!("{why}; run `opencode reload` so the service stops using the proxy");
+            }
+        } else {
+            println!(
+                "nothing to undo in {}: no kompressor claim was recorded there",
+                target.path.display()
+            );
+        }
+        return Ok(());
+    }
     if let Some(kind) = agent.config {
         let target = match kind {
             agents::ConfigFile::Codex => configfile::Target::codex(0),
+            agents::ConfigFile::OpenCode => unreachable!("handled above"),
         };
         if configfile::release(&target, true)? == settings::Released::Restored {
             println!("restored {}", target.path.display());
@@ -1083,6 +1241,18 @@ mod tests {
         let _ = std::fs::remove_file(&planted);
         assert_eq!(without, None, "the working directory's launcher was picked");
         assert_eq!(with, Some(installed.path().join(format!("{name}.cmd"))));
+    }
+
+    #[test]
+    fn printed_values_survive_the_shell() {
+        assert_eq!(
+            shell_quote("http://127.0.0.1:8817/v1"),
+            "http://127.0.0.1:8817/v1"
+        );
+        // opencode's overlay is JSON: unquoted, the shell strips its quotes.
+        assert_eq!(shell_quote(r#"{"a":"b"}"#), r#"'{"a":"b"}'"#);
+        assert_eq!(shell_quote("it's"), r#"'it'\''s'"#);
+        assert_eq!(shell_quote(""), "''");
     }
 
     #[test]

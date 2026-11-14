@@ -212,6 +212,9 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
     } else {
         detect_family(&route.path)
     };
+    // After `decoded` is taken, so a renamed model reads as a rewritten body and
+    // is re-encoded rather than forwarded as the bytes that arrived.
+    let body = model_for_upstream(body, family, route.origin());
     let identity = resolve_identity(&state, &parts.headers);
     let mode = resolve_mode(
         &state,
@@ -309,7 +312,7 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
         if let Some(json) = prepared.json.clone() {
             outbound = outbound.with_json(json);
         }
-        outbound = outbound.with_retention(retention);
+        outbound = outbound.with_retention(retention).with_started(started);
         if !prepared.stream {
             outbound = outbound.with_timeout(proxy.upstream_read_timeout);
         }
@@ -345,6 +348,7 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
                 // compression itself declined.
                 prepared.prefix,
             )
+            .with_timing(outbound.timing())
         });
     let budget = Budget::new(
         proxy.retrieve_max_rounds,
@@ -361,6 +365,7 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
         // Taken before `outbound` is moved into whichever path sends it.
         outbound.waited(),
     );
+    recorder.timing = Some(outbound.timing());
     recorder.keep_warm = keep_warm;
 
     if prepared.stream {
@@ -805,7 +810,9 @@ async fn prepare(
         {
             CacheTtl::Default => false,
             CacheTtl::OneHour => true,
-            CacheTtl::Adaptive => fingerprint.is_some_and(|key| state.prefixes.long_ttl(key)),
+            CacheTtl::Adaptive => {
+                identified.is_some_and(|(key, messages)| state.prefixes.long_ttl(key, messages))
+            }
         };
     let mut prepared = prepare_inner(
         state,
@@ -970,6 +977,20 @@ async fn prepare_inner(
         && held < walk.frozen_message_count
     {
         thaw_the_uncached_tail(&mut walk, held);
+    }
+
+    // Recoverable means the model can ask for what was elided. A `tool_choice`
+    // of `"none"`, or one forcing a different tool, takes that away for this
+    // request: it would answer from markers it is not allowed to resolve.
+    if options.mode == kompressor_engine::Mode::Recoverable
+        && proxy.retrieve_tool != RetrieveTool::Never
+        && tool::choice_forbids_retrieval(&value, family)
+    {
+        tracing::debug!(
+            request_id,
+            "tool_choice forbids the retrieve tool; forwarding as it arrived"
+        );
+        return passthrough_with_stable_tools(proxy, options.mode, family, body, stream, model);
     }
 
     let before = compressible_tokens(&walk);
@@ -1497,6 +1518,52 @@ fn force_usage(value: &mut Value, family: ApiFamily) -> bool {
         }
     }
     true
+}
+
+/// The body with a namespaced Anthropic model name made one the API accepts.
+///
+/// Gateways such as OpenRouter name Claude models `anthropic/<id>`, and
+/// clients configured for one keep the namespace: Harbor's claude-code agent
+/// hands it to Claude Code, which sends it on every subagent request. Anthropic's
+/// own API answers that name with a 404, so each subagent died on its first call
+/// ("Agent terminated early due to an API error: There's an issue with the
+/// selected model"). Measured on the three 1.5.14 Harbor runs of 2026-11-02:
+/// every subagent launched failed this way, two in `protein-assembly` and
+/// `dna-assembly` on the last one, while the main agent ran on the bare name
+/// `suite.sh` sets.
+///
+/// Only Messages requests bound for `api.anthropic.com`, the one place the
+/// namespace can never be right: a gateway behind this proxy wants it kept.
+/// Every other body comes back untouched, and so does one that does not parse.
+fn model_for_upstream(body: Bytes, family: Option<ApiFamily>, origin: &str) -> Bytes {
+    const NAMESPACE: &str = "anthropic/";
+    let anthropic_api = origin
+        .strip_prefix("https://")
+        .is_some_and(|host| host == "api.anthropic.com" || host.starts_with("api.anthropic.com:"));
+    if family != Some(ApiFamily::AnthropicMessages)
+        || !anthropic_api
+        || !body
+            .windows(NAMESPACE.len())
+            .any(|window| window == NAMESPACE.as_bytes())
+    {
+        return body;
+    }
+    let Ok(mut value) = serde_json::from_slice::<Value>(&body) else {
+        return body;
+    };
+    let Some(model) = value
+        .get("model")
+        .and_then(Value::as_str)
+        .and_then(|model| model.strip_prefix(NAMESPACE))
+        .map(str::to_string)
+    else {
+        return body;
+    };
+    value["model"] = Value::String(model);
+    match serde_json::to_vec(&value) {
+        Ok(out) => Bytes::from(out),
+        Err(_) => body,
+    }
 }
 
 fn is_json(headers: &HeaderMap) -> bool {
@@ -2218,6 +2285,7 @@ pub(crate) struct Recorder {
     /// Provider wait, accumulated by the `Outbound` this request sends through.
     /// Shared rather than copied so the retrieve loop's extra rounds are in it.
     waited: Arc<AtomicU64>,
+    timing: Option<Arc<std::sync::Mutex<kompressor_stats::context::ProxyTiming>>>,
     /// The keep-warm ping to arm if the response stops on `tool_use`, or on
     /// `end_turn` with a background task running.
     pub(crate) keep_warm: Option<KeepWarmPlan>,
@@ -2241,6 +2309,8 @@ impl Recorder {
         waited: Arc<AtomicU64>,
     ) -> Recorder {
         let event = ProxyRequestEvent {
+            context: None,
+            timing: None,
             time_ms: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_millis() as i64)
@@ -2281,6 +2351,7 @@ impl Recorder {
             core: state.core.clone(),
             event,
             waited,
+            timing: None,
             prefixes: state.prefixes.clone(),
             prefix: prepared.prefix,
             keep_warm: None,
@@ -2330,6 +2401,10 @@ impl Recorder {
         started: Instant,
         error: Option<String>,
     ) {
+        self.event.timing = self
+            .timing
+            .as_ref()
+            .map(|t| t.lock().unwrap_or_else(|e| e.into_inner()).clone());
         self.event.status = status;
         self.event.retrieve_rounds = rounds;
         self.event.retrieve_tokens_injected = injected;
@@ -2410,6 +2485,58 @@ fn billed(usage: &Value, keys: &[&str]) -> Option<u32> {
 mod tests {
     use super::{RefId, inline_set_under_ceiling};
     use kompressor_engine::refs::ref_for;
+
+    #[test]
+    fn a_namespaced_model_is_renamed_for_anthropics_own_api() {
+        use bytes::Bytes;
+        use kompressor_wire::ApiFamily;
+        let body = |model: &str| {
+            Bytes::from(
+                serde_json::json!({"model": model, "max_tokens": 64000,
+                                   "messages": [{"role": "user", "content": "anthropic/ stays"}]})
+                .to_string(),
+            )
+        };
+        let model = |bytes: &Bytes| {
+            serde_json::from_slice::<serde_json::Value>(bytes).unwrap()["model"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let anthropic = Some(ApiFamily::AnthropicMessages);
+        let renamed = super::model_for_upstream(
+            body("anthropic/claude-opus-5-5"),
+            anthropic,
+            "https://api.anthropic.com",
+        );
+        assert_eq!(model(&renamed), "claude-opus-5-5");
+        let content = serde_json::from_slice::<serde_json::Value>(&renamed).unwrap();
+        assert_eq!(
+            content["messages"][0]["content"], "anthropic/ stays",
+            "only the model field is touched"
+        );
+
+        // A gateway wants the namespace; so does every other family.
+        for (family, origin) in [
+            (anthropic, "https://openrouter.ai"),
+            (anthropic, "http://127.0.0.1:8080"),
+            (Some(ApiFamily::OpenAiChat), "https://api.anthropic.com"),
+            (None, "https://api.anthropic.com"),
+        ] {
+            let sent = body("anthropic/claude-opus-5-5");
+            assert_eq!(
+                super::model_for_upstream(sent.clone(), family, origin),
+                sent,
+                "{family:?} to {origin}"
+            );
+        }
+        // A bare name is forwarded byte for byte.
+        let bare = body("claude-opus-5-5");
+        assert_eq!(
+            super::model_for_upstream(bare.clone(), anthropic, "https://api.anthropic.com"),
+            bare
+        );
+    }
 
     #[test]
     fn the_prompt_outside_the_messages_is_its_system_prompt_and_tools() {
@@ -2697,11 +2824,15 @@ mod tests {
 
         let first = identify(&attempt("a", 0));
         assert_eq!(identify(&attempt("a", 4)), first);
-        // Its opening alone cannot be told apart, and nothing has parted yet.
-        assert_eq!(identify(&attempt("b", 0)), first);
-
-        let second = identify(&attempt("b", 1));
-        assert_ne!(second, first, "a departure is another conversation");
+        // Only the opening of a history eight messages longer: not that
+        // conversation's next turn, so another attempt from its first request.
+        let second = identify(&attempt("b", 0));
+        assert_ne!(second, first, "a fresh attempt is another conversation");
+        assert_eq!(
+            identify(&attempt("b", 1)),
+            second,
+            "and stays one once it parts"
+        );
         for turns in 2..6 {
             assert_eq!(identify(&attempt("b", turns)), second, "turn {turns}");
             assert_eq!(identify(&attempt("a", turns + 4)), first, "turn {turns}");
@@ -2728,8 +2859,50 @@ mod tests {
             identify(&["preamble", "task", "call", "retried", "reminder", "next"]),
             id
         );
-        // A replay of an earlier turn is not a departure either.
-        assert_eq!(identify(&["preamble", "task", "call"]), id);
+        // A replay that stops within the rewrite allowance is not a
+        // departure either.
+        assert_eq!(identify(&["preamble", "task", "call", "retried"]), id);
+    }
+
+    #[test]
+    fn a_fresh_attempt_leaves_the_running_one_its_identity() {
+        // Measured: a second attempt at a Harbor task started while the first
+        // was still working. Filed under the first, its opening request read
+        // as a 15k-token cache loss 52 s after the first's last turn.
+        let tracker = prefixcache::PrefixTracker::new(Duration::ZERO);
+        let identify = |texts: &[&str]| tracker.identify(&prefixcache::identity_chain(texts));
+        let running = ["preamble", "task", "a1", "r1", "a2", "r2", "a3", "r3"];
+        let first = identify(&running[..2]);
+        assert_eq!(identify(&running), first);
+
+        let fresh = identify(&["preamble", "task"]);
+        assert_ne!(fresh, first);
+        // Both carry on, interleaved, each as itself — the earlier one
+        // through a rewrite of its tail too.
+        assert_eq!(identify(&["preamble", "task", "b1", "s1"]), fresh);
+        assert_eq!(identify(&[&running[..], &["a4", "r4"]].concat()), first);
+        assert_eq!(identify(&["preamble", "task", "b1", "s1", "b2"]), fresh);
+        assert_eq!(identify(&[&running[..], &["a4b", "r4b"]].concat()), first);
+
+        // A third attempt is a third conversation.
+        let third = identify(&["preamble", "task"]);
+        assert!(third != first && third != fresh);
+        assert_eq!(identify(&["preamble", "task", "c1", "t1"]), third);
+        assert_eq!(
+            identify(&["preamble", "task", "b1", "s1", "b2", "s2"]),
+            fresh
+        );
+    }
+
+    #[test]
+    fn a_short_history_still_shares_its_opening_until_it_parts() {
+        // Within the rewrite allowance a replay is indistinguishable from a
+        // retry, so the two stay together until a departure.
+        let tracker = prefixcache::PrefixTracker::new(Duration::ZERO);
+        let identify = |texts: &[&str]| tracker.identify(&prefixcache::identity_chain(texts));
+        let first = identify(&["preamble", "task"]);
+        assert_eq!(identify(&["preamble", "task", "a1", "r1"]), first);
+        assert_eq!(identify(&["preamble", "task"]), first);
     }
 
     #[test]

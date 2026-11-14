@@ -81,6 +81,10 @@ struct Identities {
     /// request that departs from it is another conversation that opened the
     /// same way.
     history: HashMap<u64, (Vec<u64>, Instant)>,
+    /// How many conversations have been told apart by [`Self::reopening`];
+    /// mixed into the identity each one gets, since its opening hash is
+    /// already the identity of the conversation it opened like.
+    reopened: u64,
 }
 
 /// How far from the end of a conversation's history a request may differ and
@@ -129,6 +133,31 @@ impl Identities {
             .take_while(|(a, b)| a == b)
             .count();
         (common < chain.len() && common + TAIL_REWRITE < history.len()).then_some(common)
+    }
+
+    /// Where to re-anchor `id` when `chain` replays its history from the
+    /// start but stops well short of it: another conversation that opened
+    /// the same way and has not parted yet.
+    ///
+    /// A later turn appends, and a retry or tail rewrite reaches at most
+    /// [`TAIL_REWRITE`] messages back, so a request that is only the opening
+    /// of a long history is not that conversation's next turn. Measured on a
+    /// 164-minute, 18-trial Harbor run: every one of the 16 requests that
+    /// replayed a strict prefix of a known history was the first or second
+    /// request of a fresh attempt at the same task, none a replay inside a
+    /// running session. Filed under the earlier attempt, each one read as a
+    /// cache loss of everything that attempt had cached (seven false
+    /// warnings, 129k tokens), switched `cache_ttl = "adaptive"` to one-hour
+    /// writes on the strength of the earlier attempt's idle gap, and moved
+    /// its keep-warm target.
+    ///
+    /// The depth returned keeps [`TAIL_REWRITE`] in hand, so the earlier
+    /// conversation is still recognised after rewriting its tail.
+    fn reopening(&self, id: u64, chain: &[u64]) -> Option<(usize, u64)> {
+        let (history, _) = self.history.get(&id)?;
+        let replays = chain.len() <= history.len() && history[..chain.len()] == *chain;
+        let depth = history.len() - TAIL_REWRITE.min(history.len());
+        (replays && chain.len() < depth).then(|| (depth, history[depth - 1]))
     }
 
     fn insert(&mut self, len: usize, hash: u64, id: u64) {
@@ -189,6 +218,10 @@ struct Seen {
     /// test run once is the kind that does it again. What `CacheTtl::Adaptive`
     /// reads.
     idled_past_ttl: bool,
+    /// The most messages a request under this identity has carried — what
+    /// [`PrefixTracker::long_ttl`] reads to tell a conversation coming back
+    /// from a pause from a new one that opens with the same bytes.
+    most_messages: usize,
     /// Whether the response behind `cache_read` also wrote to the cache.
     ///
     /// A zero read that came with a write is a miss the provider has already
@@ -503,6 +536,9 @@ impl PrefixTracker {
         let idled_past_ttl = seen
             .get(&fingerprint)
             .is_some_and(|prior| prior.idled_past_ttl);
+        let most_messages = seen
+            .get(&fingerprint)
+            .map_or(0, |prior| prior.most_messages);
         // Like `known`: a usage-less finish says nothing about writes either.
         let rewritten =
             cache_read.is_none() && seen.get(&fingerprint).is_some_and(|prior| prior.rewritten);
@@ -544,6 +580,7 @@ impl PrefixTracker {
                 was_warm,
                 rounds,
                 idled_past_ttl,
+                most_messages,
                 rewritten,
             },
         );
@@ -757,14 +794,27 @@ impl PrefixTracker {
     /// entry its predecessor wrote. Measured on the 89-task tuned run, all 11
     /// conversations that switched one request late rewrote the prefix again
     /// 2-43 s after the first rewrite, 208K tokens at the one-hour price.
-    pub fn long_ttl(&self, fingerprint: u64) -> bool {
+    ///
+    /// Only a request that carries more messages than any before it under this
+    /// identity can find the gap. One that does not is a new agent opening
+    /// with the same bytes, not this conversation coming back: Claude Code
+    /// opens every trial of a task with an identical two-message request, so
+    /// those share an identity however far apart they start. Measured on the
+    /// 2026-11-09 keep-warm run: a crack-7z trial opening 36 minutes after the
+    /// previous one was switched to an hour, and because one-hour requests do
+    /// not read five-minute entries it missed the 13,690-token system and
+    /// tools prefix every task had kept warm, then wrote 17,401 tokens twice
+    /// at the one-hour price.
+    pub fn long_ttl(&self, fingerprint: u64, messages: usize) -> bool {
         let Ok(mut seen) = self.seen.lock() else {
             return false;
         };
         let Some(entry) = seen.get_mut(&fingerprint) else {
             return false;
         };
-        if entry.at.elapsed() > PROVIDER_CACHE_TTL {
+        let continues = messages > entry.most_messages;
+        entry.most_messages = entry.most_messages.max(messages);
+        if continues && entry.at.elapsed() > PROVIDER_CACHE_TTL {
             entry.idled_past_ttl = true;
         }
         entry.idled_past_ttl
@@ -965,8 +1015,13 @@ impl PrefixTracker {
     /// Two conversations that open identically match one entry, and are told
     /// apart at the first request that departs from the history the entry's
     /// conversation has sent: that request is filed as a new conversation,
-    /// registered at the message where the two part. Their very first request
-    /// cannot be told apart, and is filed under the earlier one.
+    /// registered at the message where the two part. Before that, a request
+    /// that replays only the start of a much longer history is the later one
+    /// opening (see `Identities::reopening`): it gets an identity of its own
+    /// and the opening's key, and the earlier conversation is re-registered
+    /// deeper in its own history. Only when the earlier history is itself no
+    /// more than `TAIL_REWRITE` messages past the opening are the two still
+    /// filed together until they part.
     ///
     /// `None` only for an empty chain. A poisoned lock degrades to the
     /// first-sight hash, which is stable for as long as the lock stays broken.
@@ -983,6 +1038,17 @@ impl PrefixTracker {
             .filter(|&len| len <= chain.len())
             .find_map(|len| ids.by_prefix.get(&(len, chain[len - 1])).map(|e| e.id));
         if let Some(id) = found {
+            if let Some((depth, anchor)) = ids.reopening(id, chain) {
+                // Another conversation on the same opening. The earlier one
+                // is registered deeper, at a message only its own later
+                // turns reach, and gives up the shallower key to this one.
+                ids.insert(depth, anchor, id);
+                ids.reopened += 1;
+                let fresh = newest ^ ids.reopened.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                ids.insert(chain.len(), newest, fresh);
+                ids.extend(fresh, chain);
+                return Some(fresh);
+            }
             let Some(at) = ids.departure(id, chain) else {
                 ids.extend(id, chain);
                 return Some(id);
@@ -1035,6 +1101,7 @@ impl PrefixTracker {
                 // happened yet, and nothing has been read from cache to drop.
                 rounds: 0,
                 idled_past_ttl: false,
+                most_messages: 0,
                 rewritten: false,
             },
         );
@@ -1377,6 +1444,72 @@ mod tests {
         );
     }
 
+    /// The cache report (`/v1/stats/cache`) prices rows with its own copy of
+    /// this table, because the statistics crate cannot depend on the proxy.
+    /// The two must not drift.
+    #[test]
+    fn the_cache_report_prices_reads_and_writes_as_the_proxy_does() {
+        for family in [
+            ApiFamily::AnthropicMessages,
+            ApiFamily::OpenAiChat,
+            ApiFamily::OpenAiResponses,
+        ] {
+            for model in [
+                None,
+                Some("claude-opus-5-5"),
+                Some("anthropic/claude-sonnet-5-5"),
+                Some("claude-fable-5-1"),
+                Some("claude-mythos-5-1"),
+                Some("claude-haiku-5-5"),
+                Some("claude-opus-4-8"),
+                Some("gpt-5.5"),
+            ] {
+                let report = kompressor_stats::cache::rates(family.as_str(), model);
+                let short = CachePrices::for_model(family, model, false);
+                let long = CachePrices::for_model(family, model, true);
+                let ppm = |rate: f64| (rate * 1_000_000.0).round() as u32;
+                assert_eq!(ppm(report.read), short.read_ppm, "{family:?} {model:?}");
+                assert_eq!(
+                    ppm(report.write_5m),
+                    short.write_ppm,
+                    "{family:?} {model:?}"
+                );
+                assert_eq!(ppm(report.write_1h), long.write_ppm, "{family:?} {model:?}");
+            }
+        }
+    }
+
+    /// `kompressor stats cache` and `stats conversations` price rows with the
+    /// statistics crate's `breakdown::prices`, another copy of this table for
+    /// the same reason. Same check.
+    #[test]
+    fn the_stats_cli_prices_reads_and_writes_as_the_proxy_does() {
+        for family in [
+            ApiFamily::AnthropicMessages,
+            ApiFamily::OpenAiChat,
+            ApiFamily::OpenAiResponses,
+        ] {
+            for model in [
+                None,
+                Some("claude-opus-5-5"),
+                Some("anthropic/claude-sonnet-5-5"),
+                Some("claude-fable-5-1"),
+                Some("claude-mythos-5-1"),
+                Some("claude-haiku-5-5"),
+                Some("claude-opus-4-8"),
+                Some("gpt-5.5"),
+            ] {
+                let cli = kompressor_stats::breakdown::prices(family.as_str(), model);
+                let short = CachePrices::for_model(family, model, false);
+                let long = CachePrices::for_model(family, model, true);
+                let ppm = |rate: f64| (rate * 1_000_000.0).round() as u32;
+                assert_eq!(ppm(cli.read), short.read_ppm, "{family:?} {model:?}");
+                assert_eq!(ppm(cli.write_5m), short.write_ppm, "{family:?} {model:?}");
+                assert_eq!(ppm(cli.write_1h), long.write_ppm, "{family:?} {model:?}");
+            }
+        }
+    }
+
     /// Demand is what the last few requests asked for, not what the
     /// conversation ever did.
     #[test]
@@ -1420,12 +1553,12 @@ mod tests {
     fn a_conversation_asks_for_an_hour_once_it_idles_past_the_ttl() {
         let tracker = PrefixTracker::new(Duration::from_secs(0));
         assert!(
-            !tracker.long_ttl(9),
+            !tracker.long_ttl(9, 2),
             "a conversation never seen asks for nothing"
         );
         tracker.floor(9, 1);
         assert!(
-            !tracker.long_ttl(9),
+            !tracker.long_ttl(9, 2),
             "a busy conversation keeps the default"
         );
 
@@ -1436,16 +1569,16 @@ mod tests {
         };
         idle(&tracker);
         assert!(
-            tracker.long_ttl(9),
+            tracker.long_ttl(9, 4),
             "the request that finds the gap rewrites the expired prefix once, at an hour"
         );
         assert!(
-            tracker.long_ttl(9),
+            tracker.long_ttl(9, 4),
             "every request after it asks for an hour"
         );
         tracker.record(9, Some(100), Some(1_000), 0);
         assert!(
-            tracker.long_ttl(9),
+            tracker.long_ttl(9, 6),
             "and the flag survives the response being recorded"
         );
     }
@@ -1462,20 +1595,56 @@ mod tests {
         };
         idle(&tracker);
         tracker.kept_warm(9);
-        assert!(!tracker.long_ttl(9), "the ping read the prefix just now");
+        assert!(!tracker.long_ttl(9, 4), "the ping read the prefix just now");
 
         idle(&tracker);
-        assert!(tracker.long_ttl(9), "without one, the same pause switches");
+        assert!(
+            tracker.long_ttl(9, 6),
+            "without one, the same pause switches"
+        );
         tracker.kept_warm(9);
         assert!(
-            tracker.long_ttl(9),
+            tracker.long_ttl(9, 8),
             "and a ping later does not take the switch back"
         );
 
         tracker.kept_warm(42);
         assert!(
-            !tracker.long_ttl(42),
+            !tracker.long_ttl(42, 2),
             "a conversation never seen is not created by a ping"
+        );
+    }
+
+    /// A new agent that opens with the same bytes as one seen long ago is not
+    /// that conversation coming back from a pause, and keeps the default TTL:
+    /// one-hour requests do not read the five-minute entries every other
+    /// conversation has kept warm. The 2026-11-09 keep-warm run: a crack-7z
+    /// trial opening 36 minutes after the previous one missed the 13,690-token
+    /// shared prefix that way.
+    #[test]
+    fn a_repeated_opening_after_a_pause_keeps_the_default_ttl() {
+        let tracker = PrefixTracker::new(Duration::from_secs(0));
+        tracker.floor(9, 1);
+        assert!(!tracker.long_ttl(9, 2), "the first trial opens");
+        assert!(!tracker.long_ttl(9, 2), "its concurrent twin");
+        let idle = |tracker: &PrefixTracker| {
+            let mut seen = tracker.seen.lock().unwrap();
+            seen.get_mut(&9).unwrap().at = Instant::now() - Duration::from_secs(2_155);
+        };
+        idle(&tracker);
+        assert!(
+            !tracker.long_ttl(9, 2),
+            "a later trial opening with the same two messages is not a resumption"
+        );
+        assert!(
+            !tracker.long_ttl(9, 1),
+            "nor is a shorter request under the same identity"
+        );
+
+        idle(&tracker);
+        assert!(
+            tracker.long_ttl(9, 3),
+            "a request that carries the conversation further still finds the gap"
         );
     }
 

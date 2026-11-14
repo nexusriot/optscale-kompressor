@@ -6,8 +6,9 @@
 //! rounds, and a base prompt that drifts is a provider cache prefix that
 //! misses — which costs more than the whole compression saved.
 
-use std::sync::Arc;
+use kompressor_stats::context::ProxyTiming;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -42,6 +43,8 @@ pub(crate) struct Outbound {
     /// understate the wait by exactly the part the loop added. Accumulating at
     /// the one place every path goes through is what stops the two disagreeing.
     waited_us: Arc<AtomicU64>,
+    timing: Arc<Mutex<ProxyTiming>>,
+    started: Instant,
     /// Set when the proxy added `prompt_cache_retention`, so a refusal of it
     /// can be answered by sending without it. See [`crate::retention`].
     retention: Option<retention::Guard>,
@@ -75,8 +78,18 @@ impl Outbound {
             timeout: None,
             encoding,
             waited_us: Arc::new(AtomicU64::new(0)),
+            timing: Arc::new(Mutex::new(ProxyTiming::default())),
+            started: Instant::now(),
             retention: None,
         }
+    }
+
+    pub(crate) fn with_started(mut self, started: Instant) -> Self {
+        self.started = started;
+        self
+    }
+    pub(crate) fn timing(&self) -> Arc<Mutex<ProxyTiming>> {
+        self.timing.clone()
     }
 
     /// The body carries a `prompt_cache_retention` the proxy added.
@@ -205,6 +218,15 @@ impl Outbound {
             began.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
             Ordering::Relaxed,
         );
+        self.timing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .record_attempt(
+                began.elapsed().as_secs_f64() * 1000.0,
+                self.started.elapsed().as_secs_f64() * 1000.0,
+                result.as_ref().ok().map(|r| r.status().as_u16()),
+                result.is_err(),
+            );
         result
     }
 

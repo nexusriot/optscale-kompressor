@@ -381,6 +381,31 @@ const V12: &str = r#"
 ALTER TABLE proxy_requests ADD COLUMN keep_warm INTEGER NOT NULL DEFAULT 0;
 "#;
 
+// v13: request provenance, phase timing, and daily experiment aggregates.
+const V13: &str = r#"
+CREATE TABLE request_context (
+ tenant TEXT NOT NULL, request_id TEXT NOT NULL, time_ms INTEGER NOT NULL,
+ context TEXT, model TEXT, mode TEXT, PRIMARY KEY(tenant,request_id));
+CREATE INDEX request_context_time ON request_context(time_ms);
+ALTER TABLE proxy_requests ADD COLUMN timing_json TEXT;
+ALTER TABLE proxy_requests ADD COLUMN analysis_archived INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE optimization_events ADD COLUMN analysis_archived INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE retrieval_events ADD COLUMN analysis_archived INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE retrieval_events ADD COLUMN context_json TEXT;
+CREATE TABLE daily_analysis (
+ day_ms INTEGER NOT NULL, tenant TEXT NOT NULL, dimension TEXT NOT NULL,
+ metrics TEXT NOT NULL, PRIMARY KEY(day_ms,tenant,dimension));
+CREATE TABLE daily_analysis_conversations (
+ day_ms INTEGER NOT NULL, tenant TEXT NOT NULL, dimension TEXT NOT NULL,
+ conversation TEXT NOT NULL, PRIMARY KEY(day_ms,tenant,dimension,conversation));
+"#;
+
+// v14: whether a retrieval's range was read as asked, normalized, salvaged, or
+// unusable (the whole fragment went back). NULL when no range was asked for.
+const V14: &str = r#"
+ALTER TABLE retrieval_events ADD COLUMN range_status TEXT;
+"#;
+
 pub const MIGRATIONS: &[(u32, &str)] = &[
     (1, V1),
     (2, V2),
@@ -394,6 +419,8 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
     (10, V10),
     (11, V11),
     (12, V12),
+    (13, V13),
+    (14, V14),
 ];
 
 /// The version a freshly migrated database reports in `PRAGMA user_version`.
@@ -456,6 +483,18 @@ fn set_pragmas(conn: &Connection, read_only: bool) -> Result<(), StatsError> {
         conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
     }
     conn.execute_batch("PRAGMA busy_timeout=5000;")?;
+    if read_only {
+        // Report queries sort and group whole windows (percentiles, per-request
+        // joins): keep those temporary B-trees in memory, give the page cache
+        // room for a day of rows, and map the file rather than copying pages
+        // through read(2). All three are per-connection settings and change
+        // nothing about the file.
+        conn.execute_batch(
+            "PRAGMA temp_store=MEMORY;
+             PRAGMA cache_size=-16384;
+             PRAGMA mmap_size=268435456;",
+        )?;
+    }
     Ok(())
 }
 
