@@ -54,6 +54,7 @@ fn build_core(config: Config) -> Result<(Arc<AppCore>, Running), CliError> {
     stats_config.channel_capacity = config.stats.queue_size;
     stats_config.flush_interval = config.stats.flush_interval;
     stats_config.retention_days = config.stats.retention_days;
+    stats_config.context_retention_days = config.stats.context_retention_days;
     if config.stats.enabled
         && let Some(parent) = config.stats.path.parent()
         && !parent.as_os_str().is_empty()
@@ -84,9 +85,24 @@ fn maintenance(
                     let result = tokio::task::spawn_blocking(move || {
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-                        if let Err(error) = core.refs().purge_expired(now.as_secs()) {
+                        let started = std::time::Instant::now();
+                        let purged = core.refs().purge_expired(now.as_secs());
+                        if let Err(error) = &purged {
                             tracing::warn!(%error, "fragment retention failed");
                         }
+                        // What the sweep freed goes back to the disk a bounded
+                        // step at a time, on a store that can do that.
+                        let reclaimed = purged.as_ref().ok().map(|_| core.refs().reclaim());
+                        if let Some(Err(error)) = &reclaimed {
+                            tracing::warn!(%error, "fragment store did not give pages back");
+                        }
+                        core.note_refs_sweep(kompressor_core::RefsSweep {
+                            at_ms: now.as_millis() as i64,
+                            took_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                            removed: purged.as_ref().ok().copied(),
+                            reclaimed_bytes: reclaimed.and_then(Result::ok),
+                            error: purged.err().map(|error| error.to_string()),
+                        });
                         match core.refs().stats() {
                             Ok(stats) => core.stats().send(kompressor_stats::events::Event::StoreSample {
                                 time_ms: now.as_millis() as i64,
@@ -101,6 +117,253 @@ fn maintenance(
             }
         }
     })
+}
+
+/// How long after a scheduled backup fails before it is tried again. A full
+/// disk does not clear in a minute, and a warning a minute buries the log.
+const BACKUP_RETRY: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// Take the scheduled backups (`maintenance.backup_dir`, `backup_every`).
+///
+/// `None` when there is no schedule. Only `serve` runs this: an `mcp serve`
+/// started per agent session opens the same databases, and a dozen of them
+/// would each take the same backup.
+///
+/// Whether one is due is read from the directory each time — the newest
+/// archive's age — so a restart neither skips a backup nor takes an extra
+/// one, and a service that was down over the hour takes it on coming back.
+fn scheduled_backups(
+    core: Arc<AppCore>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let (dir, every) = core.config().maintenance.schedule()?;
+    tracing::info!(
+        dir = %dir.display(),
+        every = ?every,
+        keep = core.config().maintenance.backup_keep,
+        "backups are scheduled"
+    );
+    let tick = (every / 4).clamp(
+        std::time::Duration::from_millis(50),
+        std::time::Duration::from_secs(60),
+    );
+    let retry = BACKUP_RETRY.min(every);
+    Some(tokio::spawn(async move {
+        let mut ticks = tokio::time::interval(tick);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut failed_at: Option<std::time::Instant> = None;
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.changed() => break,
+                _ = ticks.tick() => {
+                    if failed_at.is_some_and(|at| at.elapsed() < retry) {
+                        continue;
+                    }
+                    let for_task = core.clone();
+                    let taken = tokio::task::spawn_blocking(move || {
+                        let core = for_task;
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|since| since.as_millis() as i64)
+                            .unwrap_or(0);
+                        let config = core.config();
+                        let (dir, every) = config.maintenance.schedule()?;
+                        if kompressor_core::backup::next_due_ms(dir, every, now_ms) > now_ms {
+                            return None;
+                        }
+                        // What is still queued belongs in the snapshot.
+                        let _ = core.stats().flush();
+                        Some(kompressor_core::backup::run_scheduled(config, now_ms))
+                    })
+                    .await;
+                    // On record either way, for "when was the last backup".
+                    let record = |destination: String, bytes: u64, databases: usize, error: Option<String>| {
+                        core.stats().send(kompressor_stats::Event::Backup(
+                            kompressor_stats::events::BackupEvent {
+                                time_ms: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|since| since.as_millis() as i64)
+                                    .unwrap_or(0),
+                                origin: "schedule".to_string(),
+                                destination,
+                                bytes: i64::try_from(bytes).unwrap_or(i64::MAX),
+                                databases: databases as i64,
+                                ok: error.is_none(),
+                                error,
+                            },
+                        ));
+                    };
+                    let directory = || {
+                        core.config().maintenance.backup_dir.display().to_string()
+                    };
+                    match taken {
+                        Ok(None) | Ok(Some(Ok(None))) => {}
+                        Ok(Some(Ok(Some(done)))) => {
+                            failed_at = None;
+                            record(
+                                done.archive.display().to_string(),
+                                done.bytes,
+                                done.manifest.databases.len(),
+                                None,
+                            );
+                            tracing::info!(
+                                archive = %done.archive.display(),
+                                bytes = done.bytes,
+                                databases = done.manifest.databases.len(),
+                                removed = done.removed.len(),
+                                "scheduled backup written"
+                            );
+                        }
+                        Ok(Some(Err(error))) => {
+                            failed_at = Some(std::time::Instant::now());
+                            record(directory(), 0, 0, Some(error.to_string()));
+                            tracing::warn!(%error, retry_in = ?retry, "scheduled backup failed");
+                        }
+                        Err(error) => {
+                            failed_at = Some(std::time::Instant::now());
+                            tracing::warn!(%error, "scheduled backup task stopped");
+                        }
+                    }
+                }
+            }
+        }
+    }))
+}
+
+/// Whether an optimize last done at `last_ms` (none on record: never) is due
+/// again at `now_ms`.
+fn optimize_due(last_ms: Option<i64>, every: std::time::Duration, now_ms: i64) -> bool {
+    let every = i64::try_from(every.as_millis()).unwrap_or(i64::MAX);
+    // A record dated in the future — a clock that was wrong — must not put
+    // the next one off for ever.
+    last_ms.is_none_or(|last| last > now_ms || now_ms - last >= every)
+}
+
+/// Refresh the query planner's statistics on each database every
+/// `maintenance.optimize_every`, as the page's Optimize does by hand.
+///
+/// `None` when that is zero. Only `serve` runs this, as it runs the backups.
+/// When each was last done is read from the record of maintenance work, so a
+/// restart neither skips one nor repeats it; with statistics off it is this
+/// process's own memory.
+fn scheduled_optimize(
+    core: Arc<AppCore>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let every = core.config().maintenance.optimize_every;
+    if every.is_zero() {
+        return None;
+    }
+    let tick = (every / 4).clamp(
+        std::time::Duration::from_millis(50),
+        std::time::Duration::from_secs(600),
+    );
+    Some(tokio::spawn(async move {
+        let mut ticks = tokio::time::interval(tick);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let done_here: Arc<std::sync::Mutex<BTreeMap<&'static str, i64>>> = Arc::default();
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.changed() => break,
+                _ = ticks.tick() => {
+                    let core = core.clone();
+                    let done_here = done_here.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        optimize_what_is_due(&core, every, &done_here);
+                    })
+                    .await;
+                    if let Err(error) = result {
+                        tracing::warn!(%error, "scheduled optimize stopped");
+                    }
+                }
+            }
+        }
+    }))
+}
+
+fn optimize_what_is_due(
+    core: &AppCore,
+    every: std::time::Duration,
+    done_here: &std::sync::Mutex<BTreeMap<&'static str, i64>>,
+) {
+    let config = core.config();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as i64);
+    let recorded: Vec<kompressor_stats::MaintenanceEvent> =
+        if config.stats.enabled && config.stats.path.is_file() {
+            kompressor_stats::StatsReader::open(&config.stats.path)
+                .and_then(|reader| reader.latest_maintenance())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+    let mut databases: Vec<(&'static str, PathBuf)> = Vec::new();
+    if config.stats.enabled && config.stats.path.is_file() {
+        databases.push(("stats.db", config.stats.path.clone()));
+    }
+    if config.refs.backend == kompressor_core::config::RefsBackend::Sqlite
+        && config.refs.path.is_file()
+    {
+        databases.push(("refs.db", config.refs.path.clone()));
+    }
+    for (name, path) in databases {
+        let on_record = recorded
+            .iter()
+            .filter(|work| work.target == name && work.action == "optimize" && work.ok)
+            .map(|work| work.time_ms)
+            .max();
+        let here = done_here
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(name)
+            .copied();
+        if !optimize_due(on_record.max(here), every, now_ms) {
+            continue;
+        }
+        let started = std::time::Instant::now();
+        let result = if name == "stats.db" {
+            core.stats()
+                .exclusive(move || kompressor_store::sqlite::optimize(&path))
+                .map_err(|error| error.to_string())
+                .and_then(|done| done.map_err(|error| error.to_string()))
+        } else {
+            kompressor_store::sqlite::optimize(&path).map_err(|error| error.to_string())
+        };
+        let finished_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(now_ms, |since| since.as_millis() as i64);
+        // Not tried again before the interval, failed or not: a failure is
+        // on record and in the log, and one an interval is enough.
+        done_here
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(name, finished_ms);
+        match &result {
+            Ok(described) => tracing::info!(database = name, described, "scheduled optimize"),
+            Err(error) => tracing::warn!(database = name, %error, "scheduled optimize failed"),
+        }
+        core.stats().send(kompressor_stats::Event::Maintenance(
+            kompressor_stats::MaintenanceEvent {
+                time_ms: finished_ms,
+                action: "optimize".to_string(),
+                target: name.to_string(),
+                origin: "schedule".to_string(),
+                actor: None,
+                took_ms: i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
+                ok: result.is_ok(),
+                bytes_before: None,
+                bytes_after: None,
+                detail: result
+                    .as_ref()
+                    .ok()
+                    .map(|described| serde_json::json!({"described": described}).to_string()),
+                error: result.err(),
+            },
+        ));
+    }
 }
 
 /// Compose the selected surfaces into one router.
@@ -171,6 +434,20 @@ fn upstream_client(config: &Config) -> Result<reqwest::Client, CliError> {
 ///
 /// `RUST_LOG` wins over the configured level, as the configuration says it does.
 fn init_logging(log: &kompressor_core::config::LogConfig) {
+    init_logging_to(log, std::io::stdout, None);
+}
+
+/// [`init_logging`], writing somewhere other than stdout.
+///
+/// `ansi` is `Some(false)` for a destination that ends up in a file rather
+/// than a terminal, where colour codes are noise in every line, and `None` to
+/// leave the subscriber's own default alone. That default honours `NO_COLOR`;
+/// `with_ansi(true)` overrides it, so stdout logging must not pass a value —
+/// it did for one merge, and an operator's `NO_COLOR=1` stopped working.
+fn init_logging_to<W>(log: &kompressor_core::config::LogConfig, writer: W, ansi: Option<bool>)
+where
+    W: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
+{
     use tracing_subscriber::filter::EnvFilter;
     use tracing_subscriber::fmt;
 
@@ -180,13 +457,26 @@ fn init_logging(log: &kompressor_core::config::LogConfig) {
 
     // `try_init` rather than `init`: a second call must not take the process
     // down, and a caller that already installed one keeps it.
-    let _ = match log.format.as_str() {
-        "json" => fmt::Subscriber::builder()
+    let _ = match (log.format.as_str(), ansi) {
+        ("json", Some(ansi)) => fmt::Subscriber::builder()
             .json()
             .with_env_filter(filter)
+            .with_writer(writer)
+            .with_ansi(ansi)
             .try_init(),
-        _ => fmt::Subscriber::builder()
+        ("json", None) => fmt::Subscriber::builder()
+            .json()
             .with_env_filter(filter)
+            .with_writer(writer)
+            .try_init(),
+        (_, Some(ansi)) => fmt::Subscriber::builder()
+            .with_env_filter(filter)
+            .with_writer(writer)
+            .with_ansi(ansi)
+            .try_init(),
+        (_, None) => fmt::Subscriber::builder()
+            .with_env_filter(filter)
+            .with_writer(writer)
             .try_init(),
     };
 }
@@ -200,16 +490,29 @@ fn init_logging(log: &kompressor_core::config::LogConfig) {
 /// [`run`]: there is no address to bind and no listener to compose, and the
 /// process must keep stdout clear for the protocol.
 ///
-/// That last point is why logging is deliberately not initialised here. Every
-/// other command is free to write progress to the terminal; here a single
-/// stray line on stdout is a protocol violation that the runtime reports as a
-/// broken server. Tracing's default is stdout, so the safe thing is to leave it
-/// off entirely rather than to configure it and hope.
+/// That last point is why logging goes to **stderr** here. Every other command
+/// logs to stdout; here a single stray line on stdout is a protocol violation
+/// that the runtime reports as a broken server. Stderr is the channel MCP
+/// leaves a stdio server for exactly this, and runtimes keep it — Claude
+/// Desktop in its per-server log file.
+///
+/// It used to be off entirely, which was safe and left proxy mode mute: a
+/// fronted server that did not start, did not answer `initialize`, or was
+/// skipped for its configuration vanished from the tool list with nothing
+/// anywhere to say why.
 ///
 /// The store this opens is the one named by `config`, which is how a fragment
 /// the proxy elided becomes one this server can hand back: the wrap points both
 /// at the same configuration, so a handle minted on the proxy resolves here.
 pub async fn run_stdio(config: Config) -> CliResult {
+    // rmcp logs every handshake and notification at `info`, peer info and all,
+    // which in a per-server log buries the lines that say a fronted server was
+    // skipped. Held to `warn` here; `RUST_LOG` still overrides the whole filter.
+    let log = kompressor_core::config::LogConfig {
+        level: format!("{},rmcp=warn", config.log.level),
+        ..config.log.clone()
+    };
+    init_logging_to(&log, std::io::stderr, Some(false));
     let (core, running) = build_core(config)?;
     let (stop, rx) = tokio::sync::watch::channel(false);
     let upkeep = maintenance(core.clone(), rx);
@@ -271,6 +574,7 @@ pub async fn run(
             .map_err(|e| CliError::Runtime(format!("could not bind {addr}: {e}")))?;
         bound.push((addr, listener, selected));
     }
+    let stats_listener = bind_stats_listener(core.config(), &bound).await?;
     for (addr, listener, selected) in bound {
         let mut enabled = Vec::new();
         if selected.api {
@@ -283,7 +587,25 @@ pub async fn run(
             enabled.push("proxy");
         }
         tracing::info!(address = %addr, surfaces = %enabled.join(","), mode = %core.config().engine.mode, "listening");
+        core.runtime().listening(addr.to_string(), &enabled);
         let app = compose(&core, selected, client.clone());
+        let mut rx = shutdown_rx.clone();
+        servers.spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    while !*rx.borrow() {
+                        if rx.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                })
+                .await
+        });
+    }
+    if let Some((addr, listener)) = stats_listener {
+        tracing::info!(address = %addr, "live statistics at http://{addr}/, cache analysis at http://{addr}/cache");
+        core.runtime().listening(addr.to_string(), &["statistics"]);
+        let app = kompressor_server::stats_listener_router(ServerState::new(core.clone()));
         let mut rx = shutdown_rx.clone();
         servers.spawn(async move {
             axum::serve(listener, app)
@@ -319,6 +641,8 @@ pub async fn run(
             fingerprint = %bound.fingerprint(),
             "intercepting"
         );
+        core.runtime()
+            .listening(bound.address().to_string(), &["interception"]);
         let app = compose(&core, surfaces_for_intercept(&core), client.clone());
         let mut rx = shutdown_rx.clone();
         servers.spawn(async move {
@@ -335,6 +659,8 @@ pub async fn run(
         });
     }
 
+    let backups = scheduled_backups(core.clone(), shutdown_rx.clone());
+    let optimizes = scheduled_optimize(core.clone(), shutdown_rx.clone());
     let upkeep = maintenance(core.clone(), shutdown_rx);
     let mut serve_error = None;
     tokio::select! {
@@ -355,6 +681,14 @@ pub async fn run(
     }
 
     let _ = upkeep.await;
+    // A backup under way when the stop came is finished, not cut short: the
+    // task checks for shutdown between backups, never inside one.
+    if let Some(backups) = backups {
+        let _ = backups.await;
+    }
+    if let Some(optimizes) = optimizes {
+        let _ = optimizes.await;
+    }
 
     // Statistics are written off the request path, so a process that exits the
     // moment the listener closes loses whatever was still queued. The shutdown
@@ -369,6 +703,44 @@ pub async fn run(
         return Err(CliError::Runtime(error));
     }
     Ok(())
+}
+
+/// Bind `server.stats_listen`, when it names an address.
+///
+/// Separate from [`listener_groups`] because it is not a surface: it serves
+/// the live statistics whatever surfaces were selected, so `serve --proxy`
+/// still has its dashboard. Sharing an address with a surface listener is
+/// refused rather than merged — the API surface already serves
+/// `/v1/stats/live` on its own listener, and a second bind would fail with a
+/// less useful message.
+async fn bind_stats_listener(
+    config: &Config,
+    surfaces: &[(SocketAddr, tokio::net::TcpListener, Surfaces)],
+) -> Result<Option<(SocketAddr, tokio::net::TcpListener)>, CliError> {
+    let address = config.server.stats_listen.trim();
+    if address.is_empty() {
+        return Ok(None);
+    }
+    let addr: SocketAddr = address
+        .parse()
+        .map_err(|e| CliError::Usage(format!("invalid server.stats_listen {address:?}: {e}")))?;
+    if surfaces.iter().any(|(bound, _, _)| *bound == addr) {
+        return Err(CliError::Usage(format!(
+            "server.stats_listen {addr} is already a surface listener; give it a port of its \
+             own, or leave it empty and use /v1/stats/live on the API listener"
+        )));
+    }
+    if !config.stats.enabled {
+        tracing::warn!(
+            address = %addr,
+            "server.stats_listen is set but statistics are disabled; not listening"
+        );
+        return Ok(None);
+    }
+    let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
+        CliError::Runtime(format!("could not bind server.stats_listen {addr}: {e}"))
+    })?;
+    Ok(Some((addr, listener)))
 }
 
 fn listener_groups(
@@ -627,6 +999,124 @@ mod tests {
         config.refs.backend = RefsBackend::Memory;
         config.stats.enabled = false;
         config
+    }
+
+    /// With a schedule, `serve` takes a backup without being asked — at once
+    /// when the directory holds none — keeps taking them, prunes to
+    /// `backup_keep`, and stops with the service. With none, there is no task.
+    #[tokio::test]
+    async fn scheduled_backups_are_taken_pruned_and_stop_on_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        let (_, idle) = tokio::sync::watch::channel(false);
+        let unscheduled = Arc::new(AppCore::new(
+            config.clone(),
+            kompressor_core::build_ref_store(&config).unwrap(),
+            kompressor_stats::null_sink(),
+        ));
+        assert!(scheduled_backups(unscheduled, idle).is_none());
+
+        config.refs.backend = RefsBackend::Sqlite;
+        config.refs.path = dir.path().join("refs.db");
+        let backups = dir.path().join("backups");
+        config.maintenance.backup_dir = backups.clone();
+        // One a second: archives are named to the second.
+        config.maintenance.backup_every = std::time::Duration::from_secs(1);
+        config.maintenance.backup_keep = 2;
+        let core = Arc::new(AppCore::new(
+            config.clone(),
+            kompressor_core::build_ref_store(&config).unwrap(),
+            kompressor_stats::null_sink(),
+        ));
+        let (stop, rx) = tokio::sync::watch::channel(false);
+        let task = scheduled_backups(core, rx).expect("a schedule");
+
+        let listed = || kompressor_core::backup::list_archives(&backups);
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let mut seen = std::collections::BTreeSet::new();
+            while seen.len() < 3 {
+                seen.extend(listed().into_iter().map(|archive| archive.name));
+                // One over while the new archive is written: the old one
+                // goes only once its replacement is there.
+                assert!(listed().len() <= 3, "backup_keep, and the one in hand");
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("three backups, the first of them at once");
+        assert!(listed().iter().all(|archive| archive.bytes > 0));
+
+        stop.send(true).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("stops with the service")
+            .unwrap();
+        let after = listed().len();
+        assert_eq!(after, 2, "settled at backup_keep");
+        tokio::time::sleep(std::time::Duration::from_millis(1_300)).await;
+        assert_eq!(listed().len(), after, "and takes no more");
+    }
+
+    #[test]
+    fn an_optimize_is_due_an_interval_after_the_last() {
+        let day = std::time::Duration::from_secs(86_400);
+        let now = 10 * 86_400_000;
+        assert!(optimize_due(None, day, now), "never done: due now");
+        assert!(!optimize_due(Some(now - 3_600_000), day, now));
+        assert!(optimize_due(Some(now - 86_400_000), day, now));
+        assert!(
+            optimize_due(Some(now + 3_600_000), day, now),
+            "a record from the future"
+        );
+    }
+
+    /// Each database on disk is optimized when due, put on record as the
+    /// schedule's work, and not again within the interval.
+    #[tokio::test]
+    async fn scheduled_optimizes_are_recorded_and_not_repeated() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        config.refs.backend = RefsBackend::Sqlite;
+        config.refs.path = dir.path().join("refs.db");
+        let (sink, events) = kompressor_stats::writer::capturing_sink(32);
+        let core = Arc::new(AppCore::new(
+            config.clone(),
+            kompressor_core::build_ref_store(&config).unwrap(),
+            sink,
+        ));
+        let every = std::time::Duration::from_secs(3_600);
+        let done_here = std::sync::Mutex::new(BTreeMap::new());
+        optimize_what_is_due(&core, every, &done_here);
+        let work: Vec<_> = events
+            .drain()
+            .into_iter()
+            .filter_map(|event| match event {
+                kompressor_stats::Event::Maintenance(work) => Some(work),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(work.len(), 1, "the ref store; statistics are off: {work:?}");
+        assert_eq!(work[0].target, "refs.db");
+        assert_eq!(work[0].action, "optimize");
+        assert_eq!(work[0].origin, "schedule");
+        assert!(work[0].ok, "{work:?}");
+        assert!(
+            kompressor_store::sqlite::facts(&config.refs.path)
+                .unwrap()
+                .analyzed
+        );
+        optimize_what_is_due(&core, every, &done_here);
+        assert!(events.drain().is_empty(), "not again within the interval");
+
+        let mut off = config.clone();
+        off.maintenance.optimize_every = std::time::Duration::ZERO;
+        let (_, idle) = tokio::sync::watch::channel(false);
+        let unscheduled = Arc::new(AppCore::new(
+            off.clone(),
+            kompressor_core::build_ref_store(&off).unwrap(),
+            kompressor_stats::null_sink(),
+        ));
+        assert!(scheduled_optimize(unscheduled, idle).is_none());
     }
 
     #[test]
@@ -888,6 +1378,54 @@ mod tests {
     fn an_unparseable_listen_address_is_a_usage_error() {
         let err = "not:an:address".parse::<SocketAddr>();
         assert!(err.is_err());
+    }
+
+    fn stats_config(listen: &str, enabled: bool) -> Config {
+        let mut config = Config::default();
+        config.server.stats_listen = listen.to_string();
+        config.stats.enabled = enabled;
+        config
+    }
+
+    #[tokio::test]
+    async fn the_statistics_listener_binds_only_when_named_and_statistics_are_on() {
+        assert!(
+            bind_stats_listener(&stats_config("", true), &[])
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            bind_stats_listener(&stats_config("127.0.0.1:0", false), &[])
+                .await
+                .unwrap()
+                .is_none(),
+            "with nothing recorded there is nothing to show; a warning, not a failure"
+        );
+        let (addr, _listener) = bind_stats_listener(&stats_config("127.0.0.1:0", true), &[])
+            .await
+            .unwrap()
+            .expect("binds");
+        assert!(addr.ip().is_loopback());
+    }
+
+    #[tokio::test]
+    async fn a_statistics_address_that_is_not_one_or_is_taken_is_refused() {
+        let bad = bind_stats_listener(&stats_config("localhost:abc", true), &[]).await;
+        assert!(matches!(bad, Err(CliError::Usage(_))));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let surfaces = Surfaces::resolve(true, false, false);
+        let shared = [(addr, listener, surfaces)];
+        let clash = bind_stats_listener(&stats_config(&addr.to_string(), true), &shared).await;
+        match clash {
+            Err(CliError::Usage(message)) => assert!(message.contains("surface listener")),
+            other => panic!(
+                "sharing a surface's address must be refused, got {:?}",
+                other.map(|o| o.map(|(a, _)| a))
+            ),
+        }
     }
 
     /// `nohup` leaves SIGHUP ignored, and the proxy must then outlive the

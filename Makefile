@@ -27,7 +27,7 @@ SHELL := /bin/bash
 help: ## List the targets worth knowing
 	@awk 'BEGIN {FS = ":.*##"; printf "\nkompressor\n"} \
 		/^##@ / { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } \
-		/^[a-zA-Z0-9_-]+:.*?##/ { printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
+		/^[a-zA-Z0-9_-]+:.*?##/ { printf "  \033[36m%-26s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 	@echo
 
 .PHONY: build
@@ -191,6 +191,43 @@ harbor-watch: ## Live view of the newest benchmark run
 
 harbor-lab: release ## Offline: one codex-shaped turn through the proxy, against a recording upstream
 	scripts/harbor/lab/lab.sh openai
+
+##@ Subscription sweeps (sweep, retrieval and bughunt spend plan quota)
+
+SWEEP := scripts/kompressor-sweep
+
+# claude.sh and opencode.sh measure the repo's release build, so they depend
+# on `release`. codex.sh builds and installs the binary itself (SKIP_BUILD=1 or
+# KOMPRESSOR=... to opt out), so its targets have no prerequisite.
+.PHONY: sweep-claude-all sweep-claude-sweep sweep-claude-retrieval sweep-claude-bughunt
+sweep-claude-all: release ## Claude Code: fixtures, sweep, retrieval, bughunt, report. Costs quota
+	$(SWEEP)/claude.sh all
+sweep-claude-sweep: release ## Claude Code: one compression sweep session. Costs quota
+	$(SWEEP)/claude.sh sweep
+sweep-claude-retrieval: release ## Claude Code: can the model fetch back a planted token? Costs quota
+	$(SWEEP)/claude.sh retrieval
+sweep-claude-bughunt: release ## Claude Code: code compressor + retrieval, eight languages. Costs quota
+	$(SWEEP)/claude.sh bughunt
+
+.PHONY: sweep-codex-all sweep-codex-sweep sweep-codex-retrieval sweep-codex-bughunt
+sweep-codex-all: ## Codex: reset, fixtures, sweep, retrieval, bughunt, report. Costs quota
+	$(SWEEP)/codex.sh all
+sweep-codex-sweep: ## Codex: one compression sweep session. Costs quota
+	$(SWEEP)/codex.sh sweep
+sweep-codex-retrieval: ## Codex: can the model fetch back a planted token? Costs quota
+	$(SWEEP)/codex.sh retrieval
+sweep-codex-bughunt: ## Codex: code compressor + retrieval, eight languages. Costs quota
+	$(SWEEP)/codex.sh bughunt
+
+.PHONY: sweep-opencode-all sweep-opencode-sweep sweep-opencode-retrieval sweep-opencode-bughunt
+sweep-opencode-all: release ## opencode: fixtures, sweep, retrieval, bughunt, report. Costs money
+	$(SWEEP)/opencode.sh all
+sweep-opencode-sweep: release ## opencode: one compression sweep session. Costs money
+	$(SWEEP)/opencode.sh sweep
+sweep-opencode-retrieval: release ## opencode: can the model fetch back a planted token? Costs money
+	$(SWEEP)/opencode.sh retrieval
+sweep-opencode-bughunt: release ## opencode: code compressor + retrieval, eight languages. Costs money
+	$(SWEEP)/opencode.sh bughunt
 
 ##@ Docs
 

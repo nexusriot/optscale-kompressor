@@ -46,6 +46,11 @@ pub struct AppCore {
     /// without limit — and a proxy timeout does not cancel the task it gave up
     /// on, so abandoned work kept running and kept its copy of the messages.
     engine_slots: Arc<tokio::sync::Semaphore>,
+    /// What the last sweep of expired fragments did. In memory, as the
+    /// integrity checks are: it is about this process.
+    refs_sweep: std::sync::Mutex<Option<RefsSweep>>,
+    /// The listeners this process is bound to and the requests it carries.
+    runtime: Arc<crate::runtime::Runtime>,
 }
 
 /// What one compression run produced, beyond the mutated messages.
@@ -105,8 +110,25 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// One sweep of expired fragments out of the ref store
+/// (`refs.purge_interval`).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct RefsSweep {
+    /// When it ran, and for how long.
+    pub at_ms: i64,
+    pub took_ms: u64,
+    /// Fragments it removed. Absent when it failed.
+    pub removed: Option<u64>,
+    /// Bytes of free pages it then handed back to the disk
+    /// (`RefStore::reclaim`). Absent when it failed.
+    pub reclaimed_bytes: Option<u64>,
+    /// Why it failed, when it did.
+    pub error: Option<String>,
+}
+
 impl AppCore {
     pub fn new(config: Config, refs: Arc<dyn RefStore>, stats: StatsSink) -> AppCore {
+        let stats = stats.with_context(crate::analysis_context::context(&config));
         let auth = Authenticator::new(config.auth.clone());
         let providers = config
             .proxy
@@ -121,7 +143,31 @@ impl AppCore {
             refs,
             stats,
             config,
+            refs_sweep: std::sync::Mutex::new(None),
+            runtime: Arc::default(),
         }
+    }
+
+    /// The process's record of its listeners and of the requests under way.
+    pub fn runtime(&self) -> &Arc<crate::runtime::Runtime> {
+        &self.runtime
+    }
+
+    /// Put on record what a sweep of expired fragments did, for the
+    /// Maintenance page. Whoever runs the sweep calls this: `serve` does.
+    pub fn note_refs_sweep(&self, sweep: RefsSweep) {
+        *self
+            .refs_sweep
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(sweep);
+    }
+
+    /// The last sweep of expired fragments in this process, if there was one.
+    pub fn refs_sweep(&self) -> Option<RefsSweep> {
+        self.refs_sweep
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// The permits every surface acquires before running the engine.
@@ -238,6 +284,7 @@ impl AppCore {
             // This surface sees messages alone; nothing outside them to price.
             outside_tokens: 0,
             cache_pricing: None,
+            read_ledger: None,
         };
         let computed = Computed {
             stats: compress_messages(messages, options, &req, &mut refs),
@@ -283,6 +330,10 @@ impl AppCore {
         // The provider's prices for a promotion, when the caller knows them.
         // `None` prices it from `cache_hit_per_mille`.
         cache_pricing: Option<kompressor_engine::messages::CachePricing>,
+        // What this conversation has decided about its file reads, and
+        // whether this run may decide more. `None` is the read lifecycle as it
+        // always was; see `kompressor_engine::messages::ReadLedger`.
+        read_ledger: Option<kompressor_engine::messages::ReadLedger<'_>>,
     ) -> Computed {
         let started = Instant::now();
         let time_ms = now_ms();
@@ -297,6 +348,7 @@ impl AppCore {
             cache_hit_per_mille,
             outside_tokens,
             cache_pricing,
+            read_ledger,
         };
         let stats = compress_messages(messages, options, &req, &mut refs);
         Computed {
@@ -727,6 +779,7 @@ impl AppCore {
             return;
         }
         self.stats.send(Event::Retrieval(RetrievalEvent {
+            context: None,
             time_ms: now_ms(),
             tenant: identity.tenant.as_str().to_string(),
             request_id: Some(request.request_id.to_string()).filter(|r| !r.is_empty()),
@@ -761,6 +814,7 @@ impl AppCore {
         }
         let returned = result.content.as_deref().unwrap_or("");
         self.stats.send(Event::Retrieval(RetrievalEvent {
+            context: None,
             time_ms,
             tenant: identity.tenant.as_str().to_string(),
             request_id: Some(request.request_id.to_string()).filter(|r| !r.is_empty()),
@@ -1065,6 +1119,7 @@ mod tests {
             &[],
             1000,
             0,
+            None,
             None,
         );
         assert!(
