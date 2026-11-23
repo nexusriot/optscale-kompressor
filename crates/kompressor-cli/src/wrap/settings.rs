@@ -238,7 +238,7 @@ impl Drop for Lock {
 /// Treating a file with a trailing comma as empty was how a claim replaced the
 /// user's permissions and hooks with `{"env":{…}}`, and the ownership record
 /// keeps one value, not the file, so nothing could put them back.
-fn read_json(path: &Path) -> Result<Map<String, Value>, CliError> {
+pub(crate) fn read_json(path: &Path) -> Result<Map<String, Value>, CliError> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Map::new()),
@@ -262,7 +262,7 @@ fn read_json(path: &Path) -> Result<Map<String, Value>, CliError> {
     }
 }
 
-fn write_json(path: &Path, object: &Map<String, Value>) -> Result<(), CliError> {
+pub(crate) fn write_json(path: &Path, object: &Map<String, Value>) -> Result<(), CliError> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)
             .map_err(|e| CliError::runtime(&format!("could not create {}", dir.display()), e))?;

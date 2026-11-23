@@ -51,6 +51,25 @@ const END: &str = "# --- end kompressor wrap ---";
 /// edited mid-session, which the plain block-stripping path cannot do.
 const DISABLED: &str = "# kompressor wrap disabled this line: ";
 
+/// The three strings that delimit and annotate a managed block.
+///
+/// `wrap` and `setup` each own a block of their own in the same file, and each
+/// must strip and reinstate only its own: a `setup` block is durable and has to
+/// survive every `wrap` session that comes and goes on top of it.
+#[derive(Clone, Copy, Debug)]
+pub struct Markers {
+    pub begin: &'static str,
+    pub end: &'static str,
+    pub disabled: &'static str,
+}
+
+/// The markers of a `wrap` session's block.
+const WRAP: Markers = Markers {
+    begin: BEGIN,
+    end: END,
+    disabled: DISABLED,
+};
+
 /// The key the ownership sidecar records this file's claim under.
 ///
 /// One key for the whole file rather than one per TOML key: the blocks are
@@ -100,7 +119,7 @@ pub enum CodexAuth {
 /// subscription session that is handed the API-key block fails loudly at
 /// startup, which is recoverable, while the reverse would route a key-holder's
 /// traffic past the proxy in silence.
-fn codex_auth(home: &Path) -> CodexAuth {
+pub fn codex_auth(home: &Path) -> CodexAuth {
     let Ok(text) = std::fs::read_to_string(home.join("auth.json")) else {
         return CodexAuth::ApiKey;
     };
@@ -184,21 +203,21 @@ impl Target {
     }
 
     /// The text of the two blocks, head first, with `eol` ending each line.
-    fn render(&self, eol: &str) -> (String, String) {
+    fn render_with(&self, eol: &str, markers: &Markers) -> (String, String) {
         let mut head = String::new();
         if !self.head.is_empty() {
-            head.push_str(BEGIN);
+            head.push_str(markers.begin);
             head.push_str(eol);
             for (key, value) in &self.head {
                 head.push_str(&format!("{key} = {value}{eol}"));
             }
-            head.push_str(END);
+            head.push_str(markers.end);
             head.push_str(eol);
         }
 
         let mut foot = String::new();
         if !self.tables.is_empty() {
-            foot.push_str(BEGIN);
+            foot.push_str(markers.begin);
             foot.push_str(eol);
             for table in &self.tables {
                 foot.push_str(&format!("[{}]{eol}", table.name));
@@ -206,7 +225,7 @@ impl Target {
                     foot.push_str(&format!("{key} = {value}{eol}"));
                 }
             }
-            foot.push_str(END);
+            foot.push_str(markers.end);
             foot.push_str(eol);
         }
         (head, foot)
@@ -241,7 +260,7 @@ impl Target {
     /// Whole statements are disabled, not lines: a multi-line string or array
     /// commented out on its first line only leaves the rest of the value
     /// standing on its own, which is a file codex will not load.
-    fn disable_collisions(&self, body: &str) -> String {
+    fn disable_collisions_with(&self, body: &str, markers: &Markers) -> String {
         let keys: Vec<&str> = self.head.iter().map(|(key, _)| key.as_str()).collect();
         let tables: Vec<&str> = self
             .tables
@@ -276,7 +295,7 @@ impl Target {
             };
             for line in &physical[start..end] {
                 if disable {
-                    out.push_str(DISABLED);
+                    out.push_str(markers.disabled);
                 }
                 out.push_str(line);
             }
@@ -301,7 +320,7 @@ fn proxy_base(port: u16) -> String {
 }
 
 /// Codex's configuration directory.
-fn codex_home() -> PathBuf {
+pub fn codex_home() -> PathBuf {
     codex_home_in(|name| std::env::var_os(name))
 }
 
@@ -334,7 +353,7 @@ fn codex_home_in(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> PathBuf {
 /// The values here are URLs and identifiers this command builds, so the escape
 /// set is small — but a path from `CODEX_HOME` can reach a base URL, and an
 /// unescaped quote there would produce a file Codex cannot read.
-fn quoted(value: &str) -> String {
+pub fn quoted(value: &str) -> String {
     let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
     format!("\"{escaped}\"")
 }
@@ -435,14 +454,19 @@ fn statements(lines: &[&str]) -> Vec<(usize, usize)> {
     spans
 }
 
-/// Undo [`Target::disable_collisions`], whatever else happened to the file.
+/// Undo [`Target::disable_collisions_with`], whatever else happened to the file.
 fn reinstate(content: &str) -> String {
-    if !content.contains(DISABLED) {
+    reinstate_with(content, &WRAP)
+}
+
+/// [`reinstate`] for any owner's markers.
+fn reinstate_with(content: &str, markers: &Markers) -> String {
+    if !content.contains(markers.disabled) {
         return content.to_string();
     }
     let mut out = String::with_capacity(content.len());
     for line in content.split_inclusive('\n') {
-        out.push_str(line.strip_prefix(DISABLED).unwrap_or(line));
+        out.push_str(line.strip_prefix(markers.disabled).unwrap_or(line));
     }
     out
 }
@@ -464,13 +488,18 @@ fn line_ending(content: &str) -> &'static str {
 /// user edited by hand, and guessing where the block ended could delete their
 /// content.
 fn strip_blocks(content: &str) -> String {
+    strip_blocks_with(content, &WRAP)
+}
+
+/// [`strip_blocks`] for any owner's markers.
+fn strip_blocks_with(content: &str, markers: &Markers) -> String {
     let mut out = String::with_capacity(content.len());
     let mut rest = content;
-    while let Some(start) = rest.find(BEGIN) {
-        let Some(end_rel) = rest[start..].find(END) else {
+    while let Some(start) = rest.find(markers.begin) {
+        let Some(end_rel) = rest[start..].find(markers.end) else {
             break;
         };
-        let end = start + end_rel + END.len();
+        let end = start + end_rel + markers.end.len();
         out.push_str(&rest[..start]);
         let after = &rest[end..];
         rest = after
@@ -636,9 +665,16 @@ fn release_as(target: &Target, how: Release) -> Result<Released, CliError> {
 }
 
 fn injected_content(target: &Target, current: &str) -> String {
+    inject_with(target, current, &WRAP)
+}
+
+/// The file with `markers`' blocks rewritten for `target`: any earlier block of
+/// the same owner replaced, and the user's own definitions of what the block
+/// sets commented out with `markers.disabled`. Pure; writes nothing.
+pub fn inject_with(target: &Target, current: &str, markers: &Markers) -> String {
     let eol = line_ending(current);
-    let (head, foot) = target.render(eol);
-    let body = target.disable_collisions(&strip_blocks(current));
+    let (head, foot) = target.render_with(eol, markers);
+    let body = target.disable_collisions_with(&strip_blocks_with(current, markers), markers);
     // Nothing outside the markers is changed: no blank line trimmed after the
     // head, none added before the foot. `strip_blocks` removes exactly what is
     // between the markers, so whatever is added out here stays behind whenever
@@ -658,6 +694,13 @@ fn injected_content(target: &Target, current: &str) -> String {
     next.push_str(&foot);
 
     next
+}
+
+/// The file with `markers`' blocks removed and every line they disabled
+/// reinstated: the exact reversal of [`inject_with`], whatever else the user
+/// edited in between. Pure; writes nothing.
+pub fn clean_with(current: &str, markers: &Markers) -> String {
+    reinstate_with(&strip_blocks_with(current, markers), markers)
 }
 
 /// Remove our settings while preserving edits made during the session.

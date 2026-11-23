@@ -148,7 +148,9 @@ Zen and Go.
 ## Permanent setup
 
 `wrap opencode` is per session: `--attach` edits the config, holds a proxy up
-and puts the file back on exit. To leave compression on for every opencode
+and puts the file back on exit. `kompressor setup` does the permanent setup
+below in one command, and `kompressor setup remove` undoes it
+([SETUP.md](SETUP.md)). To leave compression on for every opencode
 session — Desktop, the TUI, `opencode run` — run kompressor as a service and
 write the opencode side once. Everything served by the background service then
 goes through the proxy, with no terminal left open.

@@ -69,7 +69,7 @@ pub const PROVIDERS: &[(&str, &str)] = &[
 /// no retrieve loop, so the session would be compressed without being
 /// measurable or recoverable. `http` keeps both — measured, the turn then
 /// reported its prompt tokens. The key exists in 2.0.11 and 2.2.4 alike.
-const OPENAI_TRANSPORT: &str = "http";
+pub(crate) const OPENAI_TRANSPORT: &str = "http";
 
 /// The variable a launched session's overlay travels in. It outranks every
 /// config file opencode reads.
@@ -79,12 +79,12 @@ pub const CONTENT_VAR: &str = "OPENCODE_CONFIG_CONTENT";
 const FILE_KEY: &str = "\u{1}opencode-config";
 
 /// The dotted path of a provider setting.
-fn setting(provider: &str, name: &str) -> String {
+pub(crate) fn setting(provider: &str, name: &str) -> String {
     format!("providers.{provider}.settings.{name}")
 }
 
 /// The base URL this wrap writes for `provider`.
-fn base_url(port: u16, path: &str) -> String {
+pub(crate) fn base_url(port: u16, path: &str) -> String {
     format!("http://127.0.0.1:{port}{path}")
 }
 
@@ -94,7 +94,7 @@ fn base_url(port: u16, path: &str) -> String {
 /// that as the user's gateway would make every later launch skip every
 /// provider. Only the exact shape is recognised: a different local service on
 /// a loopback port is someone's decision and stays theirs.
-fn is_ours(provider: &str, url: &str) -> bool {
+pub(crate) fn is_ours(provider: &str, url: &str) -> bool {
     let Some(path) = PROVIDERS
         .iter()
         .find(|(id, _)| *id == provider)
@@ -191,7 +191,7 @@ pub fn strip_jsonc(text: &str) -> String {
 }
 
 /// Parse a config file's text, accepting what opencode accepts.
-fn parse_lenient(text: &str) -> Option<Map<String, Value>> {
+pub(crate) fn parse_lenient(text: &str) -> Option<Map<String, Value>> {
     if text.trim().is_empty() {
         return Some(Map::new());
     }
@@ -287,7 +287,7 @@ fn apply_overlay(
     routing
 }
 
-fn get_path<'a>(config: &'a Map<String, Value>, dotted: &str) -> Option<&'a Value> {
+pub(crate) fn get_path<'a>(config: &'a Map<String, Value>, dotted: &str) -> Option<&'a Value> {
     let mut parts = dotted.split('.');
     let mut current = config.get(parts.next()?)?;
     for part in parts {
@@ -301,7 +301,7 @@ fn get_path<'a>(config: &'a Map<String, Value>, dotted: &str) -> Option<&'a Valu
 /// Removal prunes every object it leaves empty, so a key this command created
 /// takes its parents with it — the file then compares equal to the original
 /// and is put back byte for byte.
-fn set_path(config: &mut Map<String, Value>, dotted: &str, value: Option<String>) {
+pub(crate) fn set_path(config: &mut Map<String, Value>, dotted: &str, value: Option<String>) {
     let parts: Vec<&str> = dotted.split('.').collect();
     set_in(config, &parts, value);
 }
@@ -343,7 +343,7 @@ fn set_in(map: &mut Map<String, Value>, parts: &[&str], value: Option<String>) {
 }
 
 /// opencode's global config directory, as opencode resolves it.
-fn config_dir() -> PathBuf {
+pub(crate) fn config_dir() -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME")
         .filter(|dir| !dir.is_empty())
         .map(PathBuf::from)
@@ -499,7 +499,7 @@ impl Target {
 /// Strict JSON only. A file that parses only once its comments are stripped
 /// would lose them on the way back out, and a user's annotated configuration
 /// is not a fair price for a session's compression.
-fn read_for_edit(path: &Path) -> Result<(Option<String>, Map<String, Value>), CliError> {
+pub(crate) fn read_for_edit(path: &Path) -> Result<(Option<String>, Map<String, Value>), CliError> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((None, Map::new())),
@@ -532,7 +532,7 @@ fn read_for_edit(path: &Path) -> Result<(Option<String>, Map<String, Value>), Cl
     }
 }
 
-fn write_map(path: &Path, map: &Map<String, Value>) -> Result<(), CliError> {
+pub(crate) fn write_map(path: &Path, map: &Map<String, Value>) -> Result<(), CliError> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)
             .map_err(|e| CliError::runtime(&format!("could not create {}", dir.display()), e))?;

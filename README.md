@@ -352,6 +352,22 @@ kompressor version
 
 To build from source instead, see [Install](#install).
 
+### Every agent at once, for good
+
+```bash
+kompressor setup --dry-run   # the plan and a diff of every file it would touch
+kompressor setup             # apply it, after asking
+```
+
+`wrap` is per session; `setup` leaves compression on. It finds the installed
+service (or installs a systemd user service), writes the recommended profile
+into an overlay beside its configuration (`/etc/kompressor/config.d/50-setup.toml`;
+your own config file is not edited), restarts it, waits for `/healthz`, and only
+then points Claude Code, Codex and opencode at it — the CLIs and the desktop
+apps alike. Every edit is recorded; `kompressor setup status` checks it end to
+end and `kompressor setup remove` puts every file back.
+Details: [docs/SETUP.md](docs/SETUP.md).
+
 ### Codex
 
 ```bash
@@ -626,7 +642,7 @@ are in [docs/charts/](docs/charts/).
 | MCP proxy  | `kompressor mcp serve` (stdio): the same tools, plus those of every `[[mcp.servers]]` it fronts, with their results compressed                                            |
 | Backup     | `kompressor backup`, the Maintenance page (off unless `maintenance.backup = true`), or on a schedule (`maintenance.backup_dir`): every database as one `.tar.gz`, service running; each is recorded and Health warns when the last is stale; `kompressor restore` puts one back |
 | Databases  | `kompressor db status`, `check`, `checkpoint`, and the same on the Maintenance page: size, write-ahead log, schema version, reclaimable space, integrity; the page also vacuums, optimizes, shows space per table, retention runs and disk headroom, and can trim request settings or delete statistics by day, tenant, run or experiment (preview first), verify archives against their `.sha256`, show what is running and the effective configuration, keep a history of all of it, and erase all statistics (off unless `maintenance.erase = true`) |
-| CLI        | `kompressor compress`, `retrieve`, `detect`, `stats`, `bench`, `backup`, `restore`, `db`, `check-config`                                                                                     |
+| CLI        | `kompressor compress`, `retrieve`, `detect`, `stats`, `bench`, `backup`, `restore`, `db`, `check-config`, `setup`                                                                                     |
 | Library    | the `kompressor-engine` crate: compress a string or a conversation, no I/O                                                                                                  |
 
 
