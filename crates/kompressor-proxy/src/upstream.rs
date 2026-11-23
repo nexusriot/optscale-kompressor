@@ -85,6 +85,12 @@ impl Outbound {
         }
     }
 
+    /// Add `traceparent` for the current span to the headers sent upstream.
+    pub(crate) fn with_trace_context(mut self) -> Self {
+        kompressor_core::trace_ctx::inject_current(&mut self.headers);
+        self
+    }
+
     pub(crate) fn with_started(mut self, started: Instant) -> Self {
         self.started = started;
         self

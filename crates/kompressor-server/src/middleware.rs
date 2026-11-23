@@ -140,9 +140,17 @@ async fn request_context(surface: &'static str, mut request: Request, next: Next
         surface = surface,
         method = %request.method(),
         path = %request.uri().path(),
+        // Filled in by `metrics::compression` and below; absent when the
+        // request compressed nothing.
+        mode = tracing::field::Empty,
+        tokens_in = tracing::field::Empty,
+        tokens_out = tracing::field::Empty,
+        http.response.status_code = tracing::field::Empty,
     );
+    kompressor_core::trace_ctx::adopt_parent(&span, request.headers());
 
-    let mut response = next.run(request).instrument(span).await;
+    let mut response = next.run(request).instrument(span.clone()).await;
+    span.record("http.response.status_code", response.status().as_u16());
     if let Ok(value) = HeaderValue::from_str(id.as_str()) {
         response
             .headers_mut()

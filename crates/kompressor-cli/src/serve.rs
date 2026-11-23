@@ -549,8 +549,9 @@ fn upstream_client(config: &Config) -> Result<reqwest::Client, CliError> {
 /// proxy's log file for the whole run was zero bytes.
 ///
 /// `RUST_LOG` wins over the configured level, as the configuration says it does.
+#[cfg(test)]
 fn init_logging(log: &kompressor_core::config::LogConfig) {
-    init_logging_to(log, std::io::stdout, None);
+    let _ = init_logging_to(log, std::io::stdout, None, None);
 }
 
 /// [`init_logging`], writing somewhere other than stdout.
@@ -560,41 +561,69 @@ fn init_logging(log: &kompressor_core::config::LogConfig) {
 /// leave the subscriber's own default alone. That default honours `NO_COLOR`;
 /// `with_ansi(true)` overrides it, so stdout logging must not pass a value —
 /// it did for one merge, and an operator's `NO_COLOR=1` stopped working.
-fn init_logging_to<W>(log: &kompressor_core::config::LogConfig, writer: W, ansi: Option<bool>)
+///
+/// `otel` adds the OpenTelemetry layer (see [`crate::telemetry`]) when given
+/// and enabled. The returned guard flushes it on drop, so the caller keeps it
+/// alive until shutdown. The two layers are filtered separately: `log.level`
+/// governs the log lines only, so `warn` logging does not also thin out the
+/// spans a collector is there to receive.
+fn init_logging_to<W>(
+    log: &kompressor_core::config::LogConfig,
+    writer: W,
+    ansi: Option<bool>,
+    otel: Option<&kompressor_core::config::OtelConfig>,
+) -> Option<crate::telemetry::Guard>
 where
     W: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
 {
+    use tracing_subscriber::Layer as _;
     use tracing_subscriber::filter::EnvFilter;
     use tracing_subscriber::fmt;
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
 
     let filter = EnvFilter::try_from_default_env()
         .or_else(|_| EnvFilter::try_new(&log.level))
         .unwrap_or_else(|_| EnvFilter::new("info"));
 
+    let fmt_layer = |ansi: Option<bool>| {
+        let layer = fmt::layer().with_writer(writer);
+        match ansi {
+            Some(ansi) => layer.with_ansi(ansi),
+            None => layer,
+        }
+    };
+    let logs = if log.format == "json" {
+        fmt_layer(ansi).json().with_filter(filter).boxed()
+    } else {
+        fmt_layer(ansi).with_filter(filter).boxed()
+    };
+
+    let telemetry = otel.and_then(crate::telemetry::init);
+    let (otel_layer, recorder, guard) = match telemetry {
+        Some(t) => (t.layer, t.recorder, Some(t.guard)),
+        None => (None, None, None),
+    };
+    let otel_layer = otel_layer.map(|layer| layer.with_filter(EnvFilter::new("info")));
+
     // `try_init` rather than `init`: a second call must not take the process
     // down, and a caller that already installed one keeps it.
-    let _ = match (log.format.as_str(), ansi) {
-        ("json", Some(ansi)) => fmt::Subscriber::builder()
-            .json()
-            .with_env_filter(filter)
-            .with_writer(writer)
-            .with_ansi(ansi)
-            .try_init(),
-        ("json", None) => fmt::Subscriber::builder()
-            .json()
-            .with_env_filter(filter)
-            .with_writer(writer)
-            .try_init(),
-        (_, Some(ansi)) => fmt::Subscriber::builder()
-            .with_env_filter(filter)
-            .with_writer(writer)
-            .with_ansi(ansi)
-            .try_init(),
-        (_, None) => fmt::Subscriber::builder()
-            .with_env_filter(filter)
-            .with_writer(writer)
-            .try_init(),
-    };
+    let installed = tracing_subscriber::registry()
+        .with(otel_layer)
+        .with(logs)
+        .try_init()
+        .is_ok();
+    // The OpenTelemetry metrics sink joins Prometheus's in the one global
+    // recorder, so it has to go in before any server state asks for it.
+    #[cfg(feature = "otel")]
+    if let Some(recorder) = recorder {
+        let _ = kompressor_server::metrics::install_with(Some(recorder));
+    }
+    #[cfg(not(feature = "otel"))]
+    let _ = recorder;
+    // Not installed means the layer never saw a span; do not hold a guard
+    // that would flush nothing.
+    if installed { guard } else { None }
 }
 
 /// Serve the MCP tools over stdin and stdout until the launching runtime hangs
@@ -628,7 +657,7 @@ pub async fn run_stdio(config: Config) -> CliResult {
         level: format!("{},rmcp=warn", config.log.level),
         ..config.log.clone()
     };
-    init_logging_to(&log, std::io::stderr, Some(false));
+    let _ = init_logging_to(&log, std::io::stderr, Some(false), None);
     let (core, running) = build_core(config)?;
     let (stop, rx) = tokio::sync::watch::channel(false);
     let upkeep = maintenance(core.clone(), rx);
@@ -667,7 +696,8 @@ pub async fn run(
     listen: Option<String>,
     supervision: Supervision,
 ) -> CliResult {
-    init_logging(&config.log);
+    // Held to the end of `run`: dropping it flushes the spans still buffered.
+    let _telemetry = init_logging_to(&config.log, std::io::stdout, None, Some(&config.otel));
     let listen = listen.unwrap_or_else(|| config.server.listen.clone());
     let grace = config.server.shutdown_grace;
     let client = upstream_client(&config)?;

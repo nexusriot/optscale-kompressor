@@ -678,6 +678,48 @@ Write absolute paths, or let a service template substitute them at install time
 
 ---
 
+### OpenTelemetry traces
+
+Optional, and off twice over: it is compiled in only with a build that asks for
+it, and even then does nothing until the configuration turns it on.
+
+```bash
+cargo build --release -p kompressor-cli --features otel   # or: make release-otel
+```
+
+```toml
+[otel]
+enabled = true                       # default false
+endpoint = "http://127.0.0.1:4318"   # OTLP/HTTP collector; /v1/traces is appended
+service_name = "kompressor"
+sample_ratio = 1.0                   # 0.0 – 1.0
+traces = true                        # spans
+metrics = true                       # the /metrics series, pushed over OTLP
+metrics_interval = "30s"
+propagate_upstream = false           # send traceparent to the LLM provider
+# headers = { authorization = "Bearer ..." }   # or OTEL_EXPORTER_OTLP_HEADERS
+```
+
+Every `[otel]` key has a `KOMPRESSOR__OTEL__<KEY>` variable except `headers`.
+
+What is exported:
+
+- **Spans**: the ones the server (`request`) and proxy (`proxy`) already open —
+  request id, method, path, tenant, response status, and for a compression the
+  mode, `tokens_in`, `tokens_out` (`tokens_saved` on the proxy). No payload or
+  fragment is attached, whatever `log.payloads` says.
+- **Metrics**: the same `kompressor_*` series `/metrics` serves, pushed every
+  `metrics_interval`. Prometheus keeps working beside it. The three store
+  gauges (`kompressor_refs_live` and friends) are refreshed when `/metrics` is
+  scraped, so they are only as fresh as the last scrape.
+- **Trace context**: a caller's `traceparent` makes the request span a child of
+  their trace. With `propagate_upstream = true` the proxy also sends one to the
+  provider; off by default, because a trace id is a handle a third party would
+  not otherwise get.
+
+A binary built without the feature
+that is given `enabled = true` prints one line saying so and runs normally.
+
 ## 9. Running it as a service
 
 Two shapes, for two different jobs.

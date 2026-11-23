@@ -105,6 +105,20 @@ url = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
 
+# OpenTelemetry export, behind the `otel` feature of kompressor-cli (off by
+# default). The otlp crate's own reqwest features are deliberately NOT used:
+# 0.33 pulls reqwest 0.13, i.e. the platform verifier and aws-lc-rs that the
+# reqwest pin above exists to keep out. The exporter is handed a client built on
+# the workspace's reqwest 0.12 instead (crates/kompressor-cli/src/telemetry.rs).
+# The opentelemetry crates move together.
+opentelemetry = "0.33"
+opentelemetry_sdk = "0.33"
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "metrics", "http-proto"] }
+metrics-exporter-opentelemetry = "0.2"
+opentelemetry-http = "0.33"
+async-trait = "0.1"
+tracing-opentelemetry = { version = "0.34", default-features = false }
+
 # --- storage ---
 rusqlite = { version = "0.43", features = ["bundled"] }
 

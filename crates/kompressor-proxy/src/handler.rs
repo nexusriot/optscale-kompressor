@@ -60,8 +60,24 @@ pub(crate) async fn handle(
     request: axum::extract::Request,
 ) -> Response {
     let request_id = request_id(request.headers());
-    let span = tracing::info_span!("proxy", request_id = %request_id);
-    run(state, request, request_id).instrument(span).await
+    let span = tracing::info_span!(
+        "proxy",
+        request_id = %request_id,
+        method = %request.method(),
+        path = %request.uri().path(),
+        // Recorded as the request resolves; Empty until then (and for a
+        // request that never gets that far).
+        tokens_saved = tracing::field::Empty,
+        http.response.status_code = tracing::field::Empty,
+    );
+    // The proxy listener is not behind the server's request middleware, so
+    // this is where a caller's `traceparent` is adopted.
+    kompressor_core::trace_ctx::adopt_parent(&span, request.headers());
+    let response = run(state, request, request_id)
+        .instrument(span.clone())
+        .await;
+    span.record("http.response.status_code", response.status().as_u16());
+    response
 }
 
 async fn run(state: ProxyState, request: axum::extract::Request, request_id: String) -> Response {
@@ -377,6 +393,11 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
             outbound = outbound.with_json(json);
         }
         outbound = outbound.with_retention(retention).with_started(started);
+        // Off unless `otel.propagate_upstream`: the provider is a third party,
+        // and a trace id is a correlation handle they would otherwise not get.
+        if config.otel.propagate_upstream {
+            outbound = outbound.with_trace_context();
+        }
         if !prepared.stream {
             outbound = outbound.with_timeout(proxy.upstream_read_timeout);
         }
@@ -2184,6 +2205,7 @@ async fn compress_with_ledger(
                 .stats
                 .tokens_in
                 .saturating_sub(outcome.stats.tokens_out);
+            tracing::Span::current().record("tokens_saved", saved);
             Some((messages, saved, outcome.stats.read_decisions))
         }
         // Queued past the deadline: the closure declined to start. A deadline

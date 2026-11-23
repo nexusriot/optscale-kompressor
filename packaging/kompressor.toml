@@ -112,6 +112,21 @@ path = "/var/lib/kompressor/stats.db"
 level = "info"
 format = "json"
 
+# OpenTelemetry trace export. Off. It also needs a binary built with
+# `--features otel` (`make release-otel`); the packaged one is not, and says so
+# at startup if this is turned on. Spans (request id, route, status, tokens
+# in/out, timings) and the kompressor_* metrics; never payloads or fragments.
+# [otel]
+# enabled = true
+# endpoint = "http://127.0.0.1:4318"   # OTLP/HTTP; /v1/traces is appended
+# service_name = "kompressor"
+# sample_ratio = 1.0
+# traces = true
+# metrics = true                       # the /metrics series, pushed over OTLP
+# metrics_interval = "30s"
+# propagate_upstream = false           # send traceparent to the LLM provider
+# headers = { authorization = "Bearer ..." }   # or OTEL_EXPORTER_OTLP_HEADERS
+
 [proxy]
 retrieve_tool = "auto"
 frozen_prefix = "marker"

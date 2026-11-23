@@ -38,6 +38,10 @@ build: ## Debug build of the whole workspace
 release: ## Optimised build of the binary
 	$(CARGO) build --release -p kompressor-cli
 
+.PHONY: release-otel
+release-otel: ## Optimised build with OpenTelemetry export compiled in (off until [otel] enabled = true)
+	$(CARGO) build --release -p kompressor-cli --features otel
+
 .PHONY: test
 test: ## Run every test
 	$(CARGO) test --workspace

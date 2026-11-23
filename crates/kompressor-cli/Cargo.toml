@@ -212,6 +212,21 @@ path = "src/main.rs"
 
 [features]
 default = ["code-aware"]
+# OpenTelemetry trace export (`[otel]` in the configuration). Off in a default
+# build: none of the opentelemetry crates is compiled or linked without it.
+otel = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:opentelemetry-http",
+    "dep:metrics",
+    "dep:metrics-exporter-opentelemetry",
+    "kompressor-core/otel",
+    "dep:async-trait",
+    "dep:http",
+    "dep:bytes",
+    "dep:tracing-opentelemetry",
+]
 code-aware = [
     "kompressor-engine/code-aware",
     "kompressor-core/code-aware",
@@ -240,6 +255,16 @@ tokio = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+opentelemetry-http = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
+metrics = { version = "0.24", optional = true }
+metrics-exporter-opentelemetry = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
 
 [dev-dependencies]
 assert_cmd = "2"

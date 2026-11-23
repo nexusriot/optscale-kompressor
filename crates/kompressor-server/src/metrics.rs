@@ -35,13 +35,35 @@ const DURATION_BUCKETS: &[f64] = &[
 /// process that mounts the API, the tool server and the proxy builds three
 /// [`crate::ServerState`]s. They share this one.
 pub fn install() -> PrometheusHandle {
+    install_with(None)
+}
+
+/// [`install`], also feeding every metric to `extra` — the OpenTelemetry
+/// exporter, when that is on. Takes effect only if it is the first call: the
+/// recorder is global and set once, so the caller that wants a second sink
+/// must be ahead of every [`crate::ServerState`] being built.
+pub fn install_with(extra: Option<Box<dyn metrics::Recorder + Send + Sync>>) -> PrometheusHandle {
     static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
     HANDLE
         .get_or_init(|| {
             let builder = PrometheusBuilder::new()
                 .set_buckets(DURATION_BUCKETS)
                 .expect("the bucket list is non-empty and sorted");
-            match builder.install_recorder() {
+            let installed = match extra {
+                None => builder.install_recorder().map_err(|e| e.to_string()),
+                Some(extra) => {
+                    let recorder = builder.build_recorder();
+                    let handle = recorder.handle();
+                    let fanout = metrics_util::layers::FanoutBuilder::default()
+                        .add_recorder(recorder)
+                        .add_recorder(extra)
+                        .build();
+                    metrics::set_global_recorder(fanout)
+                        .map(|()| handle)
+                        .map_err(|e| e.to_string())
+                }
+            };
+            match installed {
                 Ok(handle) => {
                     describe();
                     handle
@@ -121,6 +143,13 @@ fn describe() {
 /// Record everything one compression produced.
 pub fn compression(surface: &'static str, stats: &CompressStats, elapsed: Duration) {
     let mode = stats.mode.as_str();
+    // Onto the request span (a no-op when there is none, or the field is not
+    // declared on it), so a trace says what each call saved without the
+    // collector having to join it against the metrics.
+    let span = tracing::Span::current();
+    span.record("mode", mode);
+    span.record("tokens_in", stats.tokens_in);
+    span.record("tokens_out", stats.tokens_out);
     metrics::counter!(
         "kompressor_compress_requests_total",
         "surface" => surface,

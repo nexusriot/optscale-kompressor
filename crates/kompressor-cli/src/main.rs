@@ -24,6 +24,7 @@ mod restore;
 mod retrieve;
 mod serve;
 mod stats;
+mod telemetry;
 mod wrap;
 
 use std::path::PathBuf;

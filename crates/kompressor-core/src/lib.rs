@@ -17,6 +17,7 @@ pub mod error;
 pub mod retrieve;
 pub mod runtime;
 pub mod s3;
+pub mod trace_ctx;
 
 pub use auth::{Authenticator, Credentials, Identity};
 pub use config::Config;

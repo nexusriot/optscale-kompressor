@@ -35,6 +35,7 @@ pub struct Config {
     pub mcp: McpConfig,
     pub proxy: ProxyConfig,
     pub log: LogConfig,
+    pub otel: OtelConfig,
     pub maintenance: MaintenanceConfig,
     /// Environment overrides that named a value this build does not know, for
     /// the settings where carrying on regardless is not safe. Reported by
@@ -1561,6 +1562,66 @@ impl Default for LogConfig {
     }
 }
 
+/// OpenTelemetry trace export.
+///
+/// The section is always accepted, so one configuration file works for every
+/// build; whether anything is exported also depends on the binary having been
+/// built with `--features otel`. A build without it, given `enabled = true`,
+/// says so at startup and carries on rather than refusing to start.
+///
+/// Off by default, and what is exported is spans only: the request and
+/// compression spans `tracing` already emits (request id, route, status,
+/// timings). Payloads and fragments are never attached, whatever `log.payloads`
+/// says.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OtelConfig {
+    /// Export spans over OTLP. Default off.
+    pub enabled: bool,
+    /// OTLP/HTTP collector base URL; `/v1/traces` is appended.
+    pub endpoint: String,
+    /// The `service.name` resource attribute.
+    pub service_name: String,
+    /// Fraction of traces kept, 0.0 to 1.0 (parent-based, by trace id).
+    pub sample_ratio: f64,
+    /// Export spans. On whenever `enabled` is; set false for metrics alone.
+    pub traces: bool,
+    /// Also export the metrics `/metrics` serves (the `kompressor_*` series),
+    /// over OTLP, every `metrics_interval`. They stay on `/metrics` too.
+    pub metrics: bool,
+    #[serde(with = "humantime_serde")]
+    pub metrics_interval: Duration,
+    /// Send `traceparent` on the requests the proxy makes to the provider, so
+    /// a trace continues through it. Off by default: the provider is a third
+    /// party and a trace id is a handle they would not otherwise get. A
+    /// caller's own `traceparent` is always honoured when export is on.
+    pub propagate_upstream: bool,
+    /// Per-export timeout.
+    #[serde(with = "humantime_serde")]
+    pub timeout: Duration,
+    /// Extra request headers for the collector, e.g. an auth token. A secret
+    /// belongs here only if the file's mode allows it; `OTEL_EXPORTER_OTLP_HEADERS`
+    /// is read as well.
+    pub headers: BTreeMap<String, String>,
+}
+
+impl Default for OtelConfig {
+    fn default() -> Self {
+        OtelConfig {
+            enabled: false,
+            endpoint: "http://127.0.0.1:4318".to_string(),
+            service_name: "kompressor".to_string(),
+            sample_ratio: 1.0,
+            traces: true,
+            metrics: true,
+            metrics_interval: Duration::from_secs(30),
+            propagate_upstream: false,
+            timeout: Duration::from_secs(10),
+            headers: BTreeMap::new(),
+        }
+    }
+}
+
 impl Config {
     /// Read a TOML file, then overlay the environment.
     /// The configuration file to read when none was named.
@@ -1916,6 +1977,42 @@ impl Config {
                 }
                 _ => {}
             },
+            "otel" => match field {
+                "enabled" => {
+                    self.otel.enabled = parse_bool_setting("otel.enabled", value, self.otel.enabled)
+                }
+                "endpoint" => self.otel.endpoint = value.to_string(),
+                "service_name" => self.otel.service_name = value.to_string(),
+                "sample_ratio" => {
+                    if let Ok(v) = value.parse() {
+                        self.otel.sample_ratio = v;
+                    }
+                }
+                "timeout" => {
+                    if let Some(d) = parse_duration(value) {
+                        self.otel.timeout = d;
+                    }
+                }
+                "metrics_interval" => {
+                    if let Some(d) = parse_duration(value) {
+                        self.otel.metrics_interval = d;
+                    }
+                }
+                "traces" => {
+                    self.otel.traces = parse_bool_setting("otel.traces", value, self.otel.traces)
+                }
+                "metrics" => {
+                    self.otel.metrics = parse_bool_setting("otel.metrics", value, self.otel.metrics)
+                }
+                "propagate_upstream" => {
+                    self.otel.propagate_upstream = parse_bool_setting(
+                        "otel.propagate_upstream",
+                        value,
+                        self.otel.propagate_upstream,
+                    )
+                }
+                _ => {}
+            },
             "engine" => self.apply_engine_field(field, value),
             "proxy" => self.apply_proxy_field(field, value),
             _ => {}
@@ -2265,6 +2362,25 @@ impl Config {
                     .into(),
             ));
         }
+        if !(0.0..=1.0).contains(&self.otel.sample_ratio) {
+            return Err(ConfigError::Invalid(
+                "otel.sample_ratio must be between 0 and 1".into(),
+            ));
+        }
+        if self.otel.enabled
+            && self.otel.metrics
+            && self.otel.metrics_interval < Duration::from_secs(1)
+        {
+            return Err(ConfigError::Invalid(
+                "otel.metrics_interval must be at least one second".into(),
+            ));
+        }
+        if self.otel.enabled && url::Url::parse(&self.otel.endpoint).is_err() {
+            return Err(ConfigError::Invalid(format!(
+                "otel.endpoint is not a URL: {}",
+                self.otel.endpoint
+            )));
+        }
         if self.refs.purge_interval.is_zero() {
             return Err(ConfigError::Invalid(
                 "refs.purge_interval must be greater than zero".into(),
@@ -2465,6 +2581,27 @@ fn parse_duration(value: &str) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn otel_is_off_by_default_and_validated() {
+        let mut config = Config::default();
+        assert!(!config.otel.enabled);
+        // Opt-in beyond the master switch: nothing leaves the host upstream.
+        assert!(!config.otel.propagate_upstream);
+        config.validate().unwrap();
+
+        let parsed: Config =
+            toml::from_str("[otel]\nenabled = true\nsample_ratio = 0.25\n").unwrap();
+        assert!(parsed.otel.enabled);
+        parsed.validate().unwrap();
+
+        config.otel.sample_ratio = 1.5;
+        assert!(config.validate().is_err());
+        config.otel.sample_ratio = 1.0;
+        config.otel.enabled = true;
+        config.otel.endpoint = "not a url".into();
+        assert!(config.validate().is_err());
+    }
 
     #[test]
     fn mcp_servers_are_none_by_default() {

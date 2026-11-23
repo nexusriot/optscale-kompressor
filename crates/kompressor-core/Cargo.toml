@@ -10,6 +10,13 @@ description = "Shared spine for every OptScale Kompressor surface: configuration
 [features]
 default = ["code-aware"]
 code-aware = ["kompressor-engine/code-aware"]
+# W3C trace-context in and out (see `trace_ctx`). Without it those functions
+# are empty; with it the opentelemetry crates are linked.
+otel = [
+    "dep:opentelemetry",
+    "dep:opentelemetry-http",
+    "dep:tracing-opentelemetry",
+]
 
 [dependencies]
 blake2 = { workspace = true }
@@ -25,6 +32,10 @@ thiserror = { workspace = true }
 # `sync` only: the engine permit every surface shares lives on `AppCore`.
 tokio = { workspace = true }
 tracing = { workspace = true }
+http = { workspace = true }
+opentelemetry = { workspace = true, optional = true }
+opentelemetry-http = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
 url = { workspace = true }
 # The backup archive: database snapshots, tarred and gzipped.
 tar = { workspace = true }
