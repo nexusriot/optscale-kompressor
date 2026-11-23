@@ -1037,3 +1037,92 @@ fn the_budget_is_priced_in_the_same_unit_the_statistics_record() {
         "expected the prose discount to be material, got {overshoot:.3}x"
     );
 }
+
+#[tokio::test]
+async fn the_relay_dials_its_upstream_through_the_socks5_proxy() {
+    use kompressor_core::network::testing::SocksServer;
+    let upstream = echo_server().await;
+    let port = upstream.rsplit(':').next().unwrap().to_string();
+    let server = SocksServer::with_password("alice", "s3cret");
+    // `ws.test` is a name only the SOCKS5 proxy resolves, so a frame that
+    // comes back at all came back through it.
+    let proxy = proxy_with(&format!("ws.test:{port}"), |config| {
+        config.proxy.allow_insecure_upstream = true;
+        config.network.socks5 = server.url();
+        config.network.socks5_username = "alice".into();
+        config.network.socks5_password = "s3cret".into();
+    })
+    .await;
+
+    let mut socket = connect(&proxy).await;
+    socket
+        .send(Message::Text("{\"type\":\"response.create\"}".into()))
+        .await
+        .unwrap();
+    let echoed = tokio::time::timeout(Duration::from_secs(5), socket.next())
+        .await
+        .expect("the relay should answer well inside the timeout")
+        .expect("the stream should still be open")
+        .unwrap();
+    assert_eq!(
+        echoed,
+        Message::Text("{\"type\":\"response.create\"}".into())
+    );
+    assert_eq!(server.connected(), [format!("ws.test:{port}")]);
+    assert_eq!(
+        server.seen()[0].credentials,
+        Some(("alice".to_string(), "s3cret".to_string()))
+    );
+}
+
+#[tokio::test]
+async fn a_rejected_socks5_password_ends_the_relay_session() {
+    use kompressor_core::network::testing::{Outcome, SocksServer};
+    let upstream = echo_server().await;
+    let port = upstream.rsplit(':').next().unwrap().to_string();
+    let server = SocksServer::with_password("alice", "s3cret");
+    let proxy = proxy_with(&format!("ws.test:{port}"), |config| {
+        config.proxy.allow_insecure_upstream = true;
+        config.network.socks5 = format!("socks5h://alice:wrong@{}", server.address());
+    })
+    .await;
+
+    let Ok((mut socket, _)) =
+        tokio_tungstenite::connect_async(format!("ws://{proxy}/v1/responses")).await
+    else {
+        return;
+    };
+    let ended = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(message) = socket.next().await {
+            if message.is_err() {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(
+        ended.is_ok(),
+        "a refused proxy must end the session, not hang it"
+    );
+    assert_eq!(server.seen()[0].outcome, Outcome::AuthRejected);
+}
+
+#[tokio::test]
+async fn a_loopback_relay_upstream_does_not_use_the_socks5_proxy() {
+    use kompressor_core::network::testing::SocksServer;
+    let upstream = echo_server().await;
+    let server = SocksServer::open();
+    let proxy = proxy_with(&upstream, |config| {
+        config.network.socks5 = server.url();
+    })
+    .await;
+    let mut socket = connect(&proxy).await;
+    socket.send(Message::Text("ping".into())).await.unwrap();
+    let echoed = tokio::time::timeout(Duration::from_secs(5), socket.next())
+        .await
+        .expect("answered")
+        .expect("open")
+        .unwrap();
+    assert_eq!(echoed, Message::Text("ping".into()));
+    assert!(server.seen().is_empty(), "{:?}", server.seen());
+}

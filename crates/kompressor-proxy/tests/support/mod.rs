@@ -66,9 +66,18 @@ impl Harness {
         }];
         configure(&mut config);
 
+        // Built the way `serve` builds it: through `[network]`, which is
+        // direct unless a test names a SOCKS5 proxy.
+        let client = config
+            .network
+            .outbound()
+            .expect("a valid [network]")
+            .apply(reqwest::Client::builder())
+            .and_then(|builder| builder.build())
+            .expect("an upstream client");
         let (sink, events) = kompressor_stats::writer::capturing_sink(256);
         let core = Arc::new(AppCore::new(config, store, sink));
-        let state = ProxyState::new(core, reqwest::Client::new());
+        let state = ProxyState::new(core, client);
         let failopen = state.failopen();
         Harness {
             server,

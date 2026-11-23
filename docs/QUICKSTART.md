@@ -676,6 +676,73 @@ directory *called* `$HOME` under whatever the working directory happens to be.
 Write absolute paths, or let a service template substitute them at install time
 (below).
 
+### Behind a SOCKS5 proxy
+
+On a network whose only way out is a SOCKS5 proxy, name it once and every
+connection kompressor opens goes through it: the providers, the websocket
+relay, the intercept listener's tunnels and S3 uploads.
+
+```toml
+[network]
+socks5 = "socks5h://proxy.internal:1080"
+socks5_username = "kompressor"
+socks5_password = "change-me"           # or KOMPRESSOR__NETWORK__SOCKS5_PASSWORD
+no_proxy = ["minio.internal", "10.0.0.0/8"]   # reached directly
+```
+
+* `socks5h://` has the proxy resolve host names, which is what a network
+  without DNS of its own needs and keeps the names out of local DNS.
+  `socks5://` resolves them here and sends the proxy an address. The port
+  defaults to 1080.
+* The username and password are RFC 1929 authentication. They can be written
+  into the URL instead (`socks5h://user:pass@host:1080`, percent-encoded), and
+  the settings win over the URL. The password is shown as `<redacted>` by
+  `check-config`, `/v1/config` and the Maintenance page.
+* Loopback (`localhost`, `127.0.0.0/8`, `::1`) is always reached directly, so
+  a local upstream keeps working. `no_proxy` adds names (which cover their
+  subdomains), addresses, CIDR blocks, or `*`.
+* With `socks5` set, kompressor ignores `HTTPS_PROXY` and `ALL_PROXY` for its
+  own connections: the file says where traffic goes.
+* An address that is not `socks5://` or `socks5h://` stops the service at
+  startup. A wrong password or an unreachable proxy does not. Each request
+  then answers 502 and nothing falls back to a direct connection. The log
+  says why: `SocksConnect(V5(Auth(Failed)))` for a provider request, and
+  `the SOCKS5 proxy rejected the username and password` for a tunnel.
+
+Every setting has an environment form, so a wrapped session can be pointed at
+the proxy without a file:
+
+```bash
+KOMPRESSOR__NETWORK__SOCKS5=socks5h://proxy.internal:1080 \
+KOMPRESSOR__NETWORK__SOCKS5_USERNAME=kompressor \
+KOMPRESSOR__NETWORK__SOCKS5_PASSWORD=change-me \
+  kompressor wrap claude
+```
+
+That covers Claude Code's model requests, which go to kompressor on
+`127.0.0.1` and leave through the proxy. (A proxy that `wrap` adopts because it
+is already serving keeps the settings it was started with.) Claude Code's
+other traffic, such as sign-in, token refresh and updates, does not pass
+through kompressor, and Claude Code speaks HTTP proxies, not SOCKS5. To route
+it, turn on the intercept listener with no intercepted hosts. That makes it a
+plain HTTP `CONNECT` proxy which decrypts nothing, so no certificate has to be
+trusted. Its tunnels go out through `[network]`:
+
+```toml
+[proxy.intercept]
+listen = "127.0.0.1:8840"
+intercept_hosts = []
+```
+
+```bash
+HTTPS_PROXY=http://127.0.0.1:8840 NO_PROXY=127.0.0.1,localhost kompressor wrap claude
+```
+
+Claude Desktop already talks to the internet through that listener (see
+[CLAUDE-DESKTOP.md](CLAUDE-DESKTOP.md)). With `[network]` set, both the
+intercepted `api.anthropic.com` and everything it tunnels leave through the
+SOCKS5 proxy.
+
 ---
 
 ## 9. Running it as a service

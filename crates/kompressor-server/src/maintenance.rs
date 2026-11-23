@@ -1783,7 +1783,7 @@ async fn s3_list(
     let core = state.core.clone();
     let started = std::time::Instant::now();
     let archives = tokio::task::spawn_blocking(move || {
-        kompressor_core::s3::S3::new(&core.config().maintenance.s3)?.list()
+        kompressor_core::s3::S3::new(&core.config().maintenance.s3, &core.config().network)?.list()
     })
     .await
     .map_err(|error| ApiError::Internal(format!("s3 list: {error}")))?
@@ -1805,7 +1805,7 @@ async fn s3_test(
     s3_ready(state.core.config())?;
     let core = state.core.clone();
     let took = tokio::task::spawn_blocking(move || {
-        kompressor_core::s3::S3::new(&core.config().maintenance.s3)?.probe()
+        kompressor_core::s3::S3::new(&core.config().maintenance.s3, &core.config().network)?.probe()
     })
     .await
     .map_err(|error| ApiError::Internal(format!("s3 test: {error}")))?

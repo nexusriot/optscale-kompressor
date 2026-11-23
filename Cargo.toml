@@ -100,7 +100,9 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = ["c
 #
 # Revisit when reqwest offers rustls without the platform verifier, or the
 # macOS builder gains an SDK.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "http2", "stream", "json"] }
+# `socks`: the `[network] socks5` route (`kompressor_core::network`). Only a
+# flag over hyper-util code reqwest already compiles in; no new crate.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "http2", "stream", "json", "socks"] }
 url = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }

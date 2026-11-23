@@ -40,7 +40,7 @@ use ring::{digest, hmac};
 use serde::{Deserialize, Serialize};
 
 use crate::backup;
-use crate::config::{Config, S3Config};
+use crate::config::{Config, NetworkConfig, S3Config};
 use crate::error::CoreError;
 
 /// The largest archive sent as one `PutObject`. Above this it goes in parts:
@@ -86,13 +86,21 @@ pub struct S3 {
 }
 
 impl S3 {
-    pub fn new(config: &S3Config) -> Result<S3, CoreError> {
+    /// `network` is the deployment's `[network]`: a bucket outside reaches
+    /// through the same SOCKS5 proxy every other connection does.
+    pub fn new(config: &S3Config, network: &NetworkConfig) -> Result<S3, CoreError> {
         if let Some(problem) = config.problem() {
             return Err(CoreError::BadRequest(problem));
         }
-        let http = Client::builder()
+        let outbound = network
+            .outbound()
+            .map_err(|error| CoreError::BadRequest(error.to_string()))?;
+        let builder = Client::builder()
             .user_agent(concat!("kompressor/", env!("CARGO_PKG_VERSION")))
-            .connect_timeout(Duration::from_secs(15))
+            .connect_timeout(Duration::from_secs(15));
+        let http = outbound
+            .apply_blocking(builder)
+            .map_err(|error| CoreError::ObjectStore(format!("http client: {error}")))?
             .build()
             .map_err(|error| CoreError::ObjectStore(format!("http client: {error}")))?;
         Ok(S3 {
@@ -439,9 +447,9 @@ impl S3 {
             None => request,
         };
         let what = format!("{method} {}", key.unwrap_or("(bucket)"));
-        let response = request
-            .send()
-            .map_err(|error| CoreError::ObjectStore(format!("{what}: {}", error.without_url())))?;
+        let response = request.send().map_err(|error| {
+            CoreError::ObjectStore(format!("{what}: {}", with_causes(&error.without_url())))
+        })?;
         if response.status().is_success() {
             return Ok(response);
         }
@@ -452,6 +460,24 @@ impl S3 {
             describe_error(&text)
         )))
     }
+}
+
+/// An error and the causes beneath it, joined with `: `. reqwest's own text
+/// is only "error sending request"; why — a SOCKS5 proxy refusing its
+/// password, a refused connection, a name that did not resolve — is in the
+/// sources. A cause whose text is already shown is skipped.
+fn with_causes(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let line = cause.to_string();
+        if !text.contains(&line) {
+            text.push_str(": ");
+            text.push_str(&line);
+        }
+        source = cause.source();
+    }
+    text
 }
 
 /// The part of an S3 error body worth showing: its code and message.
@@ -597,7 +623,7 @@ pub fn upload_archive(config: &Config, archive: &Path, name: &str) -> Result<Upl
             "{name:?} is not a name this writes archives under"
         )));
     }
-    let s3 = S3::new(&config.maintenance.s3)?;
+    let s3 = S3::new(&config.maintenance.s3, &config.network)?;
     let sha256 = backup::sha256_file(archive)?;
     let bytes = s3.put_file(archive, name, &sha256)?;
     // The checksum goes after the archive: one there, in the bucket, is
@@ -645,7 +671,7 @@ pub fn sync_newest(config: &Config) -> Result<Option<(String, Option<Uploaded>)>
     let Some(newest) = backup::list_archives(dir).into_iter().next() else {
         return Ok(None);
     };
-    let s3 = S3::new(&config.maintenance.s3)?;
+    let s3 = S3::new(&config.maintenance.s3, &config.network)?;
     if s3.list()?.iter().any(|remote| remote.name == newest.name) {
         return Ok(Some((newest.name, None)));
     }
@@ -727,7 +753,7 @@ mod tests {
                 ..S3Config::default()
             };
             config.prefix = prefix.into();
-            S3::new(&config).expect("valid")
+            S3::new(&config, &NetworkConfig::default()).expect("valid")
         };
         assert_eq!(client("").prefix(), "");
         assert_eq!(client("/").prefix(), "");
@@ -953,7 +979,7 @@ mod tests {
             assert_eq!(done.bytes, format!("archive {index}").len() as u64);
             assert_eq!(done.destination, format!("s3://bucket/kompressor/{name}"));
         }
-        let kept = S3::new(&config.maintenance.s3)
+        let kept = S3::new(&config.maintenance.s3, &config.network)
             .expect("client")
             .list()
             .expect("list");
@@ -974,10 +1000,96 @@ mod tests {
     }
 
     #[test]
+    fn uploads_go_through_the_socks5_proxy_with_its_password() {
+        use crate::network::testing::SocksServer;
+        let (url, store) = fake_store();
+        let port = url.rsplit(':').next().expect("port");
+        let server = SocksServer::with_password("alice", "s3cret");
+        // A name only the proxy resolves: reaching it at all proves the route.
+        let mut config = configured(&format!("http://s3.test:{port}"), 0);
+        config.network.socks5 = server.url();
+        config.network.socks5_username = "alice".into();
+        config.network.socks5_password = "s3cret".into();
+        let dir = tempfile::tempdir().expect("dir");
+        let name = backup::archive_name(1_000_000_000_000);
+        let path = dir.path().join(&name);
+        std::fs::write(&path, "through socks").expect("write");
+        upload_archive(&config, &path, &name).expect("uploaded through the proxy");
+        assert_eq!(
+            store.lock().expect("lock").objects[&format!("kompressor/{name}")],
+            b"through socks"
+        );
+        let targets = server.connected();
+        assert!(!targets.is_empty());
+        assert!(
+            targets.iter().all(|t| t == &format!("s3.test:{port}")),
+            "{targets:?}"
+        );
+    }
+
+    /// Found on a VPS behind a password SOCKS5 proxy: the Maintenance page and
+    /// the scheduled-backup warning said only "error sending request", which
+    /// does not tell a wrong proxy password from a proxy that is down.
+    #[test]
+    fn a_proxy_failure_says_what_went_wrong() {
+        use crate::network::testing::{SocksServer, closed_port};
+        let (url, _store) = fake_store();
+        let port = url.rsplit(':').next().expect("port");
+
+        let server = SocksServer::with_password("alice", "s3cret");
+        let mut config = configured(&format!("http://s3.test:{port}"), 0);
+        config.network.socks5 = server.url();
+        config.network.socks5_username = "alice".into();
+        config.network.socks5_password = "wrong".into();
+        let error = S3::new(&config.maintenance.s3, &config.network)
+            .expect("client")
+            .probe()
+            .expect_err("refused by the proxy")
+            .to_string();
+        assert!(error.contains("credentials not accepted"), "{error}");
+
+        config.network.socks5 = format!("socks5h://127.0.0.1:{}", closed_port());
+        let error = S3::new(&config.maintenance.s3, &config.network)
+            .expect("client")
+            .probe()
+            .expect_err("no proxy there")
+            .to_string();
+        assert!(error.contains("SOCKS"), "{error}");
+    }
+
+    #[test]
+    fn a_bucket_listed_in_no_proxy_is_reached_directly() {
+        use crate::network::testing::SocksServer;
+        let (url, _store) = fake_store();
+        let server = SocksServer::open();
+        let mut config = configured(&url, 0);
+        config.network.socks5 = server.url();
+        // 127.0.0.1 is direct anyway; the list is honoured beside it.
+        config.network.no_proxy = vec!["minio.internal".into()];
+        S3::new(&config.maintenance.s3, &config.network)
+            .expect("client")
+            .probe()
+            .expect("reached");
+        assert!(server.seen().is_empty(), "{:?}", server.seen());
+    }
+
+    #[test]
+    fn an_invalid_network_setting_is_refused_before_any_request() {
+        let (url, _store) = fake_store();
+        let mut config = configured(&url, 0);
+        config.network.socks5 = "http://proxy:3128".into();
+        let error = S3::new(&config.maintenance.s3, &config.network)
+            .err()
+            .expect("refused")
+            .to_string();
+        assert!(error.contains("network.socks5"), "{error}");
+    }
+
+    #[test]
     fn a_large_archive_is_sent_in_parts_and_comes_back_whole() {
         let (url, store) = fake_store();
         let config = configured(&url, 0);
-        let mut client = S3::new(&config.maintenance.s3).expect("client");
+        let mut client = S3::new(&config.maintenance.s3, &config.network).expect("client");
         client.single_max = 10;
         client.part_size = 7;
         let dir = tempfile::tempdir().expect("dir");
@@ -1000,7 +1112,7 @@ mod tests {
         let (url, store) = fake_store();
         store.lock().expect("lock").refuse = Some(403);
         let config = configured(&url, 0);
-        let error = S3::new(&config.maintenance.s3)
+        let error = S3::new(&config.maintenance.s3, &config.network)
             .expect("client")
             .probe()
             .expect_err("refused")

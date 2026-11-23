@@ -218,7 +218,13 @@ pub fn wrap(args: WrapArgs) -> CliResult {
 }
 
 async fn run(args: WrapArgs, agent: Option<&'static Agent>, config: Config) -> CliResult {
-    let client = reqwest::Client::new();
+    // Only ever asks the local proxy whether it is up. `no_proxy`, so a
+    // shell with `ALL_PROXY=socks5h://…` set — a network whose way out is a
+    // SOCKS5 proxy — does not send a question about 127.0.0.1 to it.
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .map_err(|e| CliError::runtime("could not build the local client", e))?;
     let paths = Paths::from_env();
     let preferred = resolve_port(&args, &config)?;
 

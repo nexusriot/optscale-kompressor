@@ -526,13 +526,19 @@ fn compose(core: &Arc<AppCore>, surfaces: Surfaces, client: reqwest::Client) -> 
 }
 
 fn upstream_client(config: &Config) -> Result<reqwest::Client, CliError> {
-    reqwest::Client::builder()
+    let builder = reqwest::Client::builder()
         .connect_timeout(config.proxy.upstream_connect_timeout)
         .read_timeout(config.proxy.upstream_read_timeout)
         // The proxy re-reads bodies it may need to resend for a retrieval round,
         // so redirects are followed by us rather than silently by the client.
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
+        .redirect(reqwest::redirect::Policy::none());
+    let outbound = config
+        .network
+        .outbound()
+        .map_err(|e| CliError::Runtime(e.to_string()))?;
+    outbound
+        .apply(builder)
+        .and_then(|builder| builder.build())
         .map_err(|e| CliError::Runtime(format!("could not build the upstream client: {e}")))
 }
 
@@ -671,6 +677,14 @@ pub async fn run(
     let listen = listen.unwrap_or_else(|| config.server.listen.clone());
     let grace = config.server.shutdown_grace;
     let client = upstream_client(&config)?;
+    if let Some(route) = config
+        .network
+        .outbound()
+        .ok()
+        .and_then(|outbound| outbound.describe())
+    {
+        tracing::info!(%route, "outbound connections go through a SOCKS5 proxy");
+    }
     let (core, running) = build_core(config)?;
     let groups = listener_groups(core.config(), surfaces, &listen);
     if groups.is_empty() {
@@ -749,7 +763,13 @@ pub async fn run(
             intercept.leaf_cache_entries,
         )
         .await
-        .map_err(|e| CliError::Runtime(e.to_string()))?;
+        .map_err(|e| CliError::Runtime(e.to_string()))?
+        .with_outbound(
+            core.config()
+                .network
+                .outbound()
+                .map_err(|e| CliError::Runtime(e.to_string()))?,
+        );
         tracing::info!(
             address = %bound.address(),
             hosts = %intercept.intercept_hosts.join(","),
@@ -1105,6 +1125,53 @@ mod logging_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn the_upstream_client_goes_through_the_configured_socks5_proxy() {
+        use kompressor_core::network::testing::{SocksServer, http_origin};
+        let origin = http_origin("upstream via socks");
+        let socks = SocksServer::with_password("alice", "s3cret");
+        let mut config = Config::default();
+        config.network.socks5 = socks.url();
+        config.network.socks5_username = "alice".into();
+        config.network.socks5_password = "s3cret".into();
+        let client = upstream_client(&config).expect("client");
+        // Only the proxy resolves `provider.test`.
+        let body = client
+            .get(format!("http://provider.test:{origin}/"))
+            .send()
+            .await
+            .expect("reached through the proxy")
+            .text()
+            .await
+            .unwrap();
+        assert_eq!(body, "upstream via socks");
+        assert_eq!(socks.connected(), [format!("provider.test:{origin}")]);
+    }
+
+    #[tokio::test]
+    async fn without_a_socks5_proxy_the_upstream_client_connects_directly() {
+        use kompressor_core::network::testing::http_origin;
+        let origin = http_origin("direct");
+        let client = upstream_client(&Config::default()).expect("client");
+        let body = client
+            .get(format!("http://127.0.0.1:{origin}/"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert_eq!(body, "direct");
+    }
+
+    #[test]
+    fn an_invalid_socks5_setting_stops_the_upstream_client_from_being_built() {
+        let mut config = Config::default();
+        config.network.socks5 = "http://proxy:3128".into();
+        let error = upstream_client(&config).expect_err("refused").to_string();
+        assert!(error.contains("network.socks5"), "{error}");
+    }
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use kompressor_core::config::RefsBackend;

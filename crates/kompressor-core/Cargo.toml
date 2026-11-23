@@ -10,6 +10,8 @@ description = "Shared spine for every OptScale Kompressor surface: configuration
 [features]
 default = ["code-aware"]
 code-aware = ["kompressor-engine/code-aware"]
+# `network::testing`: a SOCKS5 server and an HTTP origin for other crates' tests.
+test-support = []
 
 [dependencies]
 blake2 = { workspace = true }
