@@ -217,3 +217,130 @@ async fn a_request_that_is_not_connect_is_refused_in_http() {
     let _ = stop_tx.send(());
     let _ = std::fs::remove_dir_all(&ca_dir);
 }
+
+/// Send `CONNECT target` to the listener at `proxy` and return its status
+/// line and the stream, positioned after the response head.
+async fn connect_via(proxy: std::net::SocketAddr, target: &str) -> (String, TcpStream) {
+    let mut stream = TcpStream::connect(proxy).await.unwrap();
+    stream
+        .write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        if stream.read_exact(&mut byte).await.is_err() {
+            break;
+        }
+        head.push(byte[0]);
+    }
+    let status = String::from_utf8_lossy(&head)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    (status, stream)
+}
+
+/// An intercept listener with nothing to intercept — a plain `CONNECT`
+/// proxy — whose tunnels leave through `network`.
+async fn tunnel_only(
+    name: &str,
+    network: kompressor_core::config::NetworkConfig,
+) -> (
+    std::net::SocketAddr,
+    tokio::sync::oneshot::Sender<()>,
+    PathBuf,
+) {
+    let ca_dir = temp_dir(name);
+    let intercept = Intercept::bind("127.0.0.1:0", &[], &ca_dir, &["http/1.1".to_string()], 8)
+        .await
+        .expect("bind")
+        .with_outbound(network.outbound().expect("valid"));
+    let proxy = intercept.address();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(intercept.serve(router(), async move {
+        let _ = stop_rx.await;
+    }));
+    (proxy, stop_tx, ca_dir)
+}
+
+#[tokio::test]
+async fn a_tunnelled_host_is_reached_through_the_socks5_proxy() {
+    use kompressor_core::config::NetworkConfig;
+    use kompressor_core::network::testing::{SocksServer, http_origin};
+    let origin = http_origin("through socks");
+    let server = SocksServer::with_password("alice", "s3cret");
+    let (proxy, stop, ca_dir) = tunnel_only(
+        "socks",
+        NetworkConfig {
+            socks5: server.url(),
+            socks5_username: "alice".into(),
+            socks5_password: "s3cret".into(),
+            no_proxy: vec![],
+        },
+    )
+    .await;
+
+    // What Claude Code or Desktop does with HTTPS_PROXY pointed here, for a
+    // host only the SOCKS5 proxy can resolve.
+    let (status, mut stream) = connect_via(proxy, &format!("origin.test:{origin}")).await;
+    assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+    stream.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply).await.unwrap();
+    assert!(reply.ends_with("through socks"), "{reply}");
+    assert_eq!(server.connected(), [format!("origin.test:{origin}")]);
+
+    let _ = stop.send(());
+    let _ = std::fs::remove_dir_all(&ca_dir);
+}
+
+#[tokio::test]
+async fn a_rejected_socks5_password_answers_the_connect_with_502() {
+    use kompressor_core::config::NetworkConfig;
+    use kompressor_core::network::testing::{Outcome, SocksServer};
+    let server = SocksServer::with_password("alice", "s3cret");
+    let (proxy, stop, ca_dir) = tunnel_only(
+        "socks-refused",
+        NetworkConfig {
+            socks5: format!("socks5h://alice:wrong@{}", server.address()),
+            ..NetworkConfig::default()
+        },
+    )
+    .await;
+
+    let (status, _stream) = connect_via(proxy, "origin.test:443").await;
+    assert!(status.starts_with("HTTP/1.1 502"), "{status}");
+    assert_eq!(server.seen()[0].outcome, Outcome::AuthRejected);
+
+    let _ = stop.send(());
+    let _ = std::fs::remove_dir_all(&ca_dir);
+}
+
+#[tokio::test]
+async fn a_loopback_tunnel_does_not_use_the_socks5_proxy() {
+    use kompressor_core::config::NetworkConfig;
+    use kompressor_core::network::testing::{SocksServer, http_origin};
+    let origin = http_origin("direct");
+    let server = SocksServer::open();
+    let (proxy, stop, ca_dir) = tunnel_only(
+        "socks-loopback",
+        NetworkConfig {
+            socks5: server.url(),
+            ..NetworkConfig::default()
+        },
+    )
+    .await;
+
+    let (status, mut stream) = connect_via(proxy, &format!("127.0.0.1:{origin}")).await;
+    assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+    stream.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply).await.unwrap();
+    assert!(reply.ends_with("direct"), "{reply}");
+    assert!(server.seen().is_empty(), "{:?}", server.seen());
+
+    let _ = stop.send(());
+    let _ = std::fs::remove_dir_all(&ca_dir);
+}

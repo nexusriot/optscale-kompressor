@@ -14,6 +14,7 @@ pub mod backup;
 pub mod config;
 pub mod core;
 pub mod error;
+pub mod network;
 pub mod retrieve;
 pub mod runtime;
 pub mod s3;

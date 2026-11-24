@@ -2276,3 +2276,81 @@ fn restore_refuses_while_the_service_is_running() {
         .success()
         .stdout(predicate::str::contains("Restored. Start the service."));
 }
+
+#[test]
+fn check_config_shows_the_socks5_proxy_but_never_its_password() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write(
+        dir.path(),
+        "kompressor.toml",
+        "[network]\nsocks5 = \"socks5h://alice:urlpass@proxy.internal:1080\"\nno_proxy = [\"minio.internal\"]\n",
+    );
+    kompressor()
+        .args(["check-config", "--config", path.to_str().unwrap()])
+        .env("KOMPRESSOR__NETWORK__SOCKS5_PASSWORD", "envpass")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("[network]"))
+        .stdout(predicate::str::contains(
+            "socks5 = \"socks5h://alice:<redacted>@proxy.internal:1080\"",
+        ))
+        .stdout(predicate::str::contains("socks5_password = \"<redacted>\""))
+        .stdout(predicate::str::contains("minio.internal"))
+        .stdout(predicate::str::contains("urlpass").not())
+        .stdout(predicate::str::contains("envpass").not());
+}
+
+#[test]
+fn check_config_refuses_a_socks5_address_that_is_not_one() {
+    kompressor()
+        .arg("check-config")
+        .env("KOMPRESSOR__NETWORK__SOCKS5", "http://proxy:3128")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("network.socks5"));
+}
+
+/// `wrap` asks 127.0.0.1 whether a proxy is already up. A shell on a
+/// SOCKS5-only network often has `ALL_PROXY` set; that question must not be
+/// sent to it, or `wrap` concludes nothing is serving.
+#[cfg(unix)]
+#[test]
+fn wrap_finds_its_local_proxy_with_a_dead_all_proxy_in_the_environment() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut buf = [0u8; 2048];
+            let _ = stream.read(&mut buf);
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+        }
+    });
+    let dead = format!(
+        "socks5h://127.0.0.1:{}",
+        kompressor_core::network::testing::closed_port()
+    );
+    let home = tempfile::tempdir().unwrap();
+    kompressor()
+        .env("KOMPRESSOR_HOME", home.path())
+        .env("ALL_PROXY", &dead)
+        .env("all_proxy", &dead)
+        .env("HTTP_PROXY", &dead)
+        .env("http_proxy", &dead)
+        .args([
+            "wrap",
+            "--no-proxy",
+            "--port",
+            &port.to_string(),
+            "--env",
+            "WRAPPED_URL=root",
+            "--",
+            "sh",
+            "-c",
+            "printf %s \"$WRAPPED_URL\"",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("http://127.0.0.1:{port}")));
+}

@@ -242,6 +242,8 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
+# `network::testing`: a SOCKS5 server for the `[network] socks5` tests.
+kompressor-core = { path = "../kompressor-core", default-features = false, features = ["test-support"] }
 assert_cmd = "2"
 tower = { workspace = true }
 predicates = "3"

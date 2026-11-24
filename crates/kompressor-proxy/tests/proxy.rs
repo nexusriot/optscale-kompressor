@@ -2490,3 +2490,72 @@ async fn a_tool_choice_that_allows_retrieval_is_compressed() {
         );
     }
 }
+
+/// The upstream on a name only the SOCKS5 proxy resolves, so an answer at all
+/// proves the request went through it.
+fn behind_socks(config: &mut kompressor_core::config::Config, socks5: String) {
+    config.proxy.allow_insecure_upstream = true;
+    config.network.socks5 = socks5;
+    let upstream = &mut config.proxy.upstreams[0];
+    upstream.base_url = upstream.base_url.replace("127.0.0.1", "api.test");
+}
+
+#[tokio::test]
+async fn a_provider_request_goes_through_the_socks5_proxy_with_its_password() {
+    use kompressor_core::network::testing::SocksServer;
+    let socks = SocksServer::with_password("alice", "s3cret");
+    let harness = Harness::with(|config| {
+        behind_socks(config, socks.url());
+        config.network.socks5_username = "alice".into();
+        config.network.socks5_password = "s3cret".into();
+    })
+    .await;
+    answering(&harness).await;
+
+    let reply = harness
+        .post("/v1/chat/completions", &chat_body("a short tool result"))
+        .await;
+
+    assert_eq!(reply.status, 200, "{}", reply.text());
+    assert_eq!(harness.upstream_bodies().await.len(), 1);
+    let port = harness.server.address().port();
+    assert_eq!(socks.connected(), [format!("api.test:{port}")]);
+    assert_eq!(
+        socks.seen()[0].credentials,
+        Some(("alice".to_string(), "s3cret".to_string()))
+    );
+}
+
+#[tokio::test]
+async fn a_rejected_socks5_password_is_a_502_and_nothing_reaches_the_provider() {
+    use kompressor_core::network::testing::{Outcome, SocksServer};
+    let socks = SocksServer::with_password("alice", "s3cret");
+    let harness = Harness::with(|config| {
+        behind_socks(config, format!("socks5h://alice:wrong@{}", socks.address()));
+    })
+    .await;
+    answering(&harness).await;
+
+    let reply = harness
+        .post("/v1/chat/completions", &chat_body("a short tool result"))
+        .await;
+
+    assert_eq!(reply.status, 502, "{}", reply.text());
+    assert!(harness.upstream_bodies().await.is_empty());
+    assert_eq!(socks.seen()[0].outcome, Outcome::AuthRejected);
+}
+
+#[tokio::test]
+async fn a_loopback_provider_is_reached_directly_with_a_socks5_proxy_set() {
+    use kompressor_core::network::testing::SocksServer;
+    let socks = SocksServer::open();
+    let harness = Harness::with(|config| config.network.socks5 = socks.url()).await;
+    answering(&harness).await;
+
+    let reply = harness
+        .post("/v1/chat/completions", &chat_body("a short tool result"))
+        .await;
+
+    assert_eq!(reply.status, 200, "{}", reply.text());
+    assert!(socks.seen().is_empty(), "{:?}", socks.seen());
+}

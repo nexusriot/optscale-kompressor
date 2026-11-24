@@ -18,6 +18,7 @@ use kompressor_engine::{EngineOptions, EngineOptionsPatch};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ConfigError;
+pub use crate::network::NetworkConfig;
 
 fn default_listen() -> String {
     "127.0.0.1:8817".to_string()
@@ -36,6 +37,9 @@ pub struct Config {
     pub proxy: ProxyConfig,
     pub log: LogConfig,
     pub maintenance: MaintenanceConfig,
+    /// How outbound connections leave the machine: directly, or through a
+    /// SOCKS5 proxy. See [`crate::network`].
+    pub network: NetworkConfig,
     /// Environment overrides that named a value this build does not know, for
     /// the settings where carrying on regardless is not safe. Reported by
     /// [`Config::validate`]; never read from or written to a file.
@@ -1804,6 +1808,20 @@ impl Config {
                 "secret" => self.auth.secret = value.to_string(),
                 _ => {}
             },
+            "network" => match field {
+                "socks5" => self.network.socks5 = value.to_string(),
+                "socks5_username" => self.network.socks5_username = value.to_string(),
+                "socks5_password" => self.network.socks5_password = value.to_string(),
+                "no_proxy" => {
+                    self.network.no_proxy = value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|entry| !entry.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                }
+                _ => {}
+            },
             "maintenance" => match field {
                 "backup" => {
                     self.maintenance.backup =
@@ -2257,6 +2275,10 @@ impl Config {
                 "environment override refused: {refused}"
             )));
         }
+        // Checked here so a typo in the proxy address stops the service at
+        // startup, rather than every connection quietly going direct on a
+        // network where direct goes nowhere.
+        self.network.outbound()?;
         // Zero would mature a read on the turn after it was made, which is
         // the case the setting exists to wait out.
         if self.proxy.matured_quiesce_turns == 0 || self.proxy.matured_max_hold_turns == 0 {
@@ -2384,6 +2406,10 @@ impl Config {
         if !copy.maintenance.s3.secret_access_key.is_empty() {
             copy.maintenance.s3.secret_access_key = "<redacted>".to_string();
         }
+        if !copy.network.socks5_password.is_empty() {
+            copy.network.socks5_password = "<redacted>".to_string();
+        }
+        copy.network.socks5 = crate::network::redact_url_password(&copy.network.socks5);
         for upstream in &mut copy.proxy.upstreams {
             for value in upstream.headers.values_mut() {
                 *value = "<redacted>".to_string();
@@ -3426,6 +3452,55 @@ mod tests {
     fn an_unknown_key_in_a_config_file_is_an_error_not_a_silent_typo() {
         let text = "[engine]\nmax_array_itemz = 5\n";
         assert!(toml::from_str::<Config>(text).is_err());
+    }
+    #[test]
+    fn a_socks5_proxy_comes_from_a_file_or_the_environment_and_its_password_never_shows() {
+        let from_file: Config = toml::from_str(
+            "[network]\nsocks5 = \"socks5h://proxy:1080\"\nsocks5_username = \"u\"\nsocks5_password = \"filepass\"\nno_proxy = [\".internal\"]\n",
+        )
+        .expect("parses");
+        from_file.validate().expect("valid");
+        assert!(!from_file.redacted_toml().contains("filepass"));
+        assert!(!format!("{from_file:?}").contains("filepass"));
+
+        let mut config = Config::default();
+        assert!(config.network.outbound().unwrap().is_direct());
+        config.apply_env(&[
+            (
+                "KOMPRESSOR__NETWORK__SOCKS5".into(),
+                "socks5h://u:urlpass@proxy:1080".into(),
+            ),
+            (
+                "KOMPRESSOR__NETWORK__SOCKS5_PASSWORD".into(),
+                "hunter2".into(),
+            ),
+            (
+                "KOMPRESSOR__NETWORK__NO_PROXY".into(),
+                "minio.internal, 10.0.0.0/8,".into(),
+            ),
+        ]);
+        config.validate().expect("valid");
+        assert_eq!(config.network.no_proxy, ["minio.internal", "10.0.0.0/8"]);
+        let route = config.network.outbound().unwrap();
+        assert_eq!(route.describe().unwrap(), "socks5h://proxy:1080 as u");
+        assert!(!route.proxies("minio.internal"));
+        let shown = config.redacted_toml();
+        assert!(shown.contains("[network]"), "{shown}");
+        assert!(!shown.contains("hunter2"), "{shown}");
+        assert!(!shown.contains("urlpass"), "{shown}");
+        assert!(
+            shown.contains("socks5_password = \"<redacted>\""),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("socks5 = \"socks5h://u:<redacted>@proxy:1080\""),
+            "{shown}"
+        );
+
+        // A proxy address that is not one stops the service rather than
+        // leaving it to try a direct route.
+        config.network.socks5 = "http://proxy:3128".into();
+        assert!(config.validate().is_err());
     }
     #[test]
     fn the_statistics_listener_is_off_until_a_file_or_the_environment_names_it() {

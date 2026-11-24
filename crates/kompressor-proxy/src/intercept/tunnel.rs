@@ -14,6 +14,8 @@ use futures_util::stream::{FuturesUnordered, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 
+use kompressor_core::network::Outbound;
+
 use super::connect::Target;
 
 /// How long resolving and connecting to an origin may take, all addresses
@@ -42,7 +44,13 @@ const ATTEMPT_DELAY: Duration = Duration::from_millis(250);
 ///
 /// The host is resolved as a `(host, port)` pair rather than a `host:port`
 /// string, so an IPv6 literal is not split at its last colon.
-pub async fn dial(target: &Target) -> io::Result<TcpStream> {
+///
+/// With a SOCKS5 proxy in `outbound` the proxy does the dialling (and, for
+/// `socks5h`, the resolving), so the race does not apply.
+pub async fn dial(target: &Target, outbound: &Outbound) -> io::Result<TcpStream> {
+    if let Some(through) = outbound.connect(&target.host, target.port).await {
+        return through;
+    }
     let attempt = async {
         let addresses: Vec<SocketAddr> =
             tokio::net::lookup_host((target.host.as_str(), target.port))
@@ -162,7 +170,7 @@ mod tests {
             port: addr.port(),
         };
         let relayed = tokio::spawn(async move {
-            let mut upstream = dial(&target).await.unwrap();
+            let mut upstream = dial(&target, &Outbound::direct()).await.unwrap();
             relay(&mut proxy_side, &mut upstream).await
         });
 
@@ -187,7 +195,72 @@ mod tests {
             host: "127.0.0.1".to_string(),
             port: 1,
         };
-        assert!(dial(&target).await.is_err());
+        assert!(dial(&target, &Outbound::direct()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_tunnel_is_dialled_through_the_socks5_proxy() {
+        use kompressor_core::config::NetworkConfig;
+        use kompressor_core::network::testing::{SocksServer, http_origin};
+        let origin = http_origin("tunnelled through socks");
+        let server = SocksServer::with_password("alice", "s3cret");
+        let outbound = NetworkConfig {
+            socks5: server.url(),
+            socks5_username: "alice".into(),
+            socks5_password: "s3cret".into(),
+            no_proxy: vec![],
+        }
+        .outbound()
+        .unwrap();
+        // Only the proxy can resolve `origin.test`.
+        let target = Target {
+            host: "origin.test".to_string(),
+            port: origin,
+        };
+        let mut upstream = dial(&target, &outbound).await.unwrap();
+        upstream.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+        let mut reply = String::new();
+        upstream.read_to_string(&mut reply).await.unwrap();
+        assert!(reply.ends_with("tunnelled through socks"), "{reply}");
+        assert_eq!(server.connected(), [format!("origin.test:{origin}")]);
+    }
+
+    #[tokio::test]
+    async fn a_dead_socks5_proxy_fails_the_dial_instead_of_going_direct() {
+        use kompressor_core::config::NetworkConfig;
+        use kompressor_core::network::testing::closed_port;
+        let outbound = NetworkConfig {
+            socks5: format!("socks5h://127.0.0.1:{}", closed_port()),
+            ..NetworkConfig::default()
+        }
+        .outbound()
+        .unwrap();
+        let target = Target {
+            host: "example.test".to_string(),
+            port: 443,
+        };
+        let error = dial(&target, &outbound).await.unwrap_err();
+        assert!(error.to_string().contains("SOCKS5 proxy"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_loopback_tunnel_skips_the_socks5_proxy() {
+        use kompressor_core::config::NetworkConfig;
+        use kompressor_core::network::testing::{SocksServer, http_origin};
+        let origin = http_origin("direct");
+        let server = SocksServer::open();
+        let outbound = NetworkConfig {
+            socks5: server.url(),
+            ..NetworkConfig::default()
+        }
+        .outbound()
+        .unwrap();
+        let target = Target {
+            host: "127.0.0.1".to_string(),
+            port: origin,
+        };
+        dial(&target, &outbound).await.unwrap();
+        assert!(server.seen().is_empty());
     }
 
     fn v4(last: u8) -> SocketAddr {

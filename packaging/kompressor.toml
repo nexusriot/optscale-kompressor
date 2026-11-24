@@ -108,6 +108,18 @@ path = "/var/lib/kompressor/stats.db"
 # breakdown stay. 0 keeps it as long as the request.
 # context_retention_days = 14
 
+# Reach the internet through a SOCKS5 proxy: the providers, the websocket
+# relay, the intercept listener's tunnels and S3 uploads all go through it.
+# socks5h:// lets the proxy resolve names (what a network with no DNS of its
+# own needs); socks5:// resolves them here. Loopback is always direct. Keep
+# the password out of this file with KOMPRESSOR__NETWORK__SOCKS5_PASSWORD.
+# See "Behind a SOCKS5 proxy" in docs/QUICKSTART.md.
+# [network]
+# socks5 = "socks5h://proxy.internal:1080"
+# socks5_username = "kompressor"
+# socks5_password = "..."
+# no_proxy = ["minio.internal", "10.0.0.0/8"]
+
 [log]
 level = "info"
 format = "json"

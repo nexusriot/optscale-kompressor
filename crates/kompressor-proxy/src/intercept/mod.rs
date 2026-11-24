@@ -35,6 +35,7 @@ use std::sync::Arc;
 use axum::Router;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as ServerBuilder;
+use kompressor_core::network::Outbound;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 
@@ -77,6 +78,7 @@ pub struct Intercept {
     address: SocketAddr,
     allow: AllowList,
     authority: Arc<Authority>,
+    outbound: Outbound,
 }
 
 impl Intercept {
@@ -108,7 +110,17 @@ impl Intercept {
             address,
             allow: AllowList::new(hosts),
             authority: Arc::new(authority),
+            outbound: Outbound::direct(),
         })
+    }
+
+    /// Dial tunnelled hosts this way: through the `[network]` SOCKS5 proxy
+    /// when one is set. With it, this listener is also how a client that
+    /// speaks only HTTP `CONNECT` proxies (Claude Code and Claude Desktop
+    /// both do) reaches a network whose way out is SOCKS5.
+    pub fn with_outbound(mut self, outbound: Outbound) -> Self {
+        self.outbound = outbound;
+        self
     }
 
     /// Where it is listening, for logging.
@@ -139,6 +151,7 @@ impl Intercept {
             listener,
             allow,
             authority,
+            outbound,
             ..
         } = self;
 
@@ -166,8 +179,9 @@ impl Intercept {
             let allow = allow.clone();
             let authority = Arc::clone(&authority);
             let router = router.clone();
+            let outbound = outbound.clone();
             tokio::spawn(async move {
-                if let Err(error) = handle(stream, allow, authority, router).await {
+                if let Err(error) = handle(stream, allow, authority, router, outbound).await {
                     tracing::debug!(%peer, %error, "intercept connection ended");
                 }
             });
@@ -185,6 +199,7 @@ async fn handle(
     allow: AllowList,
     authority: Arc<Authority>,
     router: Router,
+    outbound: Outbound,
 ) -> std::io::Result<()> {
     // A client that connects and says nothing must not hold a task and a
     // socket for ever: nothing has been authenticated yet, so the wait is
@@ -204,7 +219,7 @@ async fn handle(
         // surface as a TLS handshake that dies for no stated reason, and the
         // client reports whatever it was doing at the time: for a token
         // refresh, "authentication failed".
-        let mut upstream = match tunnel::dial(&target).await {
+        let mut upstream = match tunnel::dial(&target, &outbound).await {
             Ok(upstream) => upstream,
             Err(error) => {
                 tracing::warn!(%target, %error, "could not reach a tunnelled host; answered 502");

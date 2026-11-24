@@ -806,7 +806,25 @@ async fn pump(
         request.headers_mut().insert(name, value);
     }
 
-    let (upstream, _response) = tokio_tungstenite::connect_async(request).await?;
+    // Through the `[network]` SOCKS5 proxy when one is set: the TCP stream
+    // comes from it, and TLS and the upgrade run over that stream exactly as
+    // `connect_async` would run them over its own.
+    let outbound = session.state.core.config().network.outbound()?;
+    let host = request.uri().host().unwrap_or_default().to_string();
+    let port = request
+        .uri()
+        .port_u16()
+        .unwrap_or(if request.uri().scheme_str() == Some("ws") {
+            80
+        } else {
+            443
+        });
+    let (upstream, _response) = match outbound.connect(&host, port).await {
+        Some(stream) => {
+            tokio_tungstenite::client_async_tls_with_config(request, stream?, None, None).await?
+        }
+        None => tokio_tungstenite::connect_async(request).await?,
+    };
     tracing::info!(request_id = %request_id, %url, "websocket relay open");
 
     let (mut client_tx, mut client_rx) = client.split();
