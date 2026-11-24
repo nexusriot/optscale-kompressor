@@ -463,6 +463,8 @@ fn recorded_options(mode: Mode) -> EngineOptions {
         strict_lossless: false,
         // a claimed-then-declined payload was returned whole
         enable_fold_fallback: false,
+        // the scorer's dropped lines were announced by one marker at the end
+        log_markers_in_place: false,
         // off by default anyway; named so the harness states what it assumes
         enable_preamble_aware_detection: false,
         // a fold over variants was announced as a plain repeat

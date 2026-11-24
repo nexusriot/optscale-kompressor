@@ -258,6 +258,40 @@ pub fn crush_log(
     }
 }
 
+/// Fold `content` by template only, never by score.
+///
+/// For callers that offer a payload to the fold as a *second reading* of
+/// something that is not a log — config arbitration. The scored path keeps
+/// lines by error vocabulary plus the last `keep_tail_lines`, which is right
+/// for a log, where the end is the newest output. On a `key: value` payload it
+/// is wrong: an MCP git server's commit history reads as YAML, a few commit
+/// messages say `failed`, and scoring kept a week-old commit and the oldest
+/// ones while the newest went behind the handle. Template folding keeps the
+/// first of each shape, so the head of the payload survives.
+pub fn fold_log(
+    content: &str,
+    opts: &EngineOptions,
+    _ctx: &Context<'_>,
+    refs: &mut RefCollector,
+    identity: Identity,
+) -> Option<String> {
+    let mark = refs.mark();
+    let identity = if opts.is_lossless() {
+        Identity::Exact
+    } else {
+        identity
+    };
+    let (preamble, body) = split_harness_preamble(content);
+    let lines = split_lines(body);
+    match fold_templates(&lines, opts, identity, refs, 0) {
+        Some(out) if chars_len(&out) < chars_len(body) => Some(format!("{preamble}{out}")),
+        _ => {
+            refs.rollback(mark);
+            None
+        }
+    }
+}
+
 /// Hold the harness frame out of the fold and put it back verbatim.
 ///
 /// The frame carries the outcome (`Process exited with code 1`) and the handle
@@ -753,24 +787,26 @@ fn crush_scored(lines: &[&str], opts: &EngineOptions, refs: &mut RefCollector) -
         keep.insert(index);
     }
 
-    let omitted: Vec<&str> = lines
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| !keep.contains(index))
-        .map(|(_, line)| *line)
-        .collect();
-    if omitted.is_empty() {
+    // A gap this short costs more as a marker than as the lines themselves, so
+    // it stays verbatim rather than scattering markers through the output.
+    let mut index = 0;
+    while opts.log_markers_in_place && index < lines.len() {
+        if keep.contains(&index) {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < lines.len() && !keep.contains(&index) {
+            index += 1;
+        }
+        if index - start < MIN_SCORED_GAP {
+            keep.extend(start..index);
+        }
+    }
+    if keep.len() >= lines.len() {
         return None;
     }
-    let kept: Vec<&str> = lines
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| keep.contains(index))
-        .map(|(_, line)| *line)
-        .collect();
 
-    let errors = omitted.iter().filter(|line| ERROR.is_match(line)).count();
-    let warnings = omitted.iter().filter(|line| WARN.is_match(line)).count();
     // `0 ERROR, 0 WARN` is two different statements and only one of them is
     // supported. When the payload carried error or warning vocabulary, the
     // scorer looked, found it, and kept it, so zero in the omitted span means
@@ -783,19 +819,69 @@ fn crush_scored(lines: &[&str], opts: &EngineOptions, refs: &mut RefCollector) -
     let vocabulary_exercised = lines
         .iter()
         .any(|line| ERROR.is_match(line) || WARN.is_match(line));
-    let note = if vocabulary_exercised {
-        format!("; {errors} ERROR, {warnings} WARN")
-    } else {
-        String::new()
-    };
-    let marker = omission_marker("log", omitted.len(), &join_lines(&omitted), refs, &note);
-    let mut out = join_lines(&kept);
-    if !kept.is_empty() {
-        out.push('\n');
+    if !opts.log_markers_in_place {
+        let omitted: Vec<&str> = (0..lines.len())
+            .filter(|index| !keep.contains(index))
+            .map(|index| lines[index])
+            .collect();
+        let kept: Vec<&str> = (0..lines.len())
+            .filter(|index| keep.contains(index))
+            .map(|index| lines[index])
+            .collect();
+        let note = if vocabulary_exercised {
+            let errors = omitted.iter().filter(|line| ERROR.is_match(line)).count();
+            let warnings = omitted.iter().filter(|line| WARN.is_match(line)).count();
+            format!("; {errors} ERROR, {warnings} WARN")
+        } else {
+            String::new()
+        };
+        let marker = omission_marker("log", omitted.len(), &join_lines(&omitted), refs, &note);
+        let mut out = join_lines(&kept);
+        if !kept.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&marker);
+        return Some(out);
     }
-    out.push_str(&marker);
-    Some(out)
+
+    // Each run of dropped lines is announced where it was. One marker at the
+    // end read as "everything above is what came before": on a commit history
+    // the newest entries went behind it and the oldest visible one passed for
+    // the latest. In place, the reader sees there is a gap and exactly where.
+    let mut out: Vec<String> = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        if keep.contains(&index) {
+            out.push(lines[index].to_string());
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < lines.len() && !keep.contains(&index) {
+            index += 1;
+        }
+        let run = &lines[start..index];
+        let note = if vocabulary_exercised {
+            let errors = run.iter().filter(|line| ERROR.is_match(line)).count();
+            let warnings = run.iter().filter(|line| WARN.is_match(line)).count();
+            format!("; {errors} ERROR, {warnings} WARN")
+        } else {
+            String::new()
+        };
+        out.push(omission_marker(
+            "log",
+            run.len(),
+            &join_lines(run),
+            refs,
+            &note,
+        ));
+    }
+    Some(out.join("\n"))
 }
+
+/// Dropped runs shorter than this stay in place: two lines are cheaper than the
+/// marker that would announce them.
+const MIN_SCORED_GAP: usize = 3;
 
 /// The identity of a warning, for deciding whether it is the same one again.
 ///

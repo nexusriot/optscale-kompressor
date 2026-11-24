@@ -2148,6 +2148,7 @@ impl Config {
             "enable_lossy_key_factoring" => flag!(e.enable_lossy_key_factoring),
             "enable_stale_read" => flag!(e.enable_stale_read),
             "enable_fold_fallback" => flag!(e.enable_fold_fallback),
+            "log_markers_in_place" => flag!(e.log_markers_in_place),
             "enable_line_gutter" => flag!(e.enable_line_gutter),
             // Added late and forgotten here, which is the failure mode this
             // list has: an option that exists in `EngineOptions` and cannot be
