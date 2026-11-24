@@ -1,14 +1,14 @@
 {
   "format": 4,
-  "coverage_pct": 43.9394,
-  "claimed_pct": 63.3731,
+  "coverage_pct": 43.9872,
+  "claimed_pct": 63.4633,
   "payloads": 894,
   "chars_in": 3821424,
-  "chars_out": 2142314,
+  "chars_out": 2140485,
   "billed": {
-    "coverage_pct": 45.0672,
+    "coverage_pct": 45.0815,
     "chars_in": 15886252.0,
-    "chars_out": 8726770.5,
+    "chars_out": 8724492.6,
     "cache_read_rate": 0.1
   },
   "buckets": {
@@ -22,16 +22,16 @@
     "diff": {
       "payloads": 1,
       "chars_in": 4803,
-      "chars_out": 1327,
-      "saved_pct": 72.3714,
-      "billed_out": 5573.4
+      "chars_out": 1374,
+      "saved_pct": 71.3929,
+      "billed_out": 5770.8
     },
     "html": {
       "payloads": 6,
       "chars_in": 62743,
-      "chars_out": 21149,
-      "saved_pct": 66.2927,
-      "billed_out": 48503.3
+      "chars_out": 21603,
+      "saved_pct": 65.5691,
+      "billed_out": 49405.8
     },
     "listing": {
       "payloads": 49,
@@ -43,9 +43,9 @@
     "log": {
       "payloads": 49,
       "chars_in": 705932,
-      "chars_out": 199596,
-      "saved_pct": 71.7259,
-      "billed_out": 1146314.0
+      "chars_out": 200371,
+      "saved_pct": 71.6161,
+      "billed_out": 1149020.2
     },
     "mixed": {
       "payloads": 37,
@@ -68,12 +68,19 @@
       "saved_pct": 53.2994,
       "billed_out": 825302.3
     },
+    "tabular": {
+      "payloads": 1,
+      "chars_in": 3445,
+      "chars_out": 216,
+      "saved_pct": 93.73,
+      "billed_out": 475.2
+    },
     "text": {
       "payloads": 62,
       "chars_in": 306063,
-      "chars_out": 214791,
-      "saved_pct": 29.8213,
-      "billed_out": 701589.4
+      "chars_out": 214915,
+      "saved_pct": 29.7808,
+      "billed_out": 702609.2
     },
     "untouched:build": {
       "payloads": 21,
@@ -118,11 +125,11 @@
       "billed_out": 127923.8
     },
     "untouched:source_code": {
-      "payloads": 86,
-      "chars_in": 433147,
-      "chars_out": 433147,
+      "payloads": 85,
+      "chars_in": 429702,
+      "chars_out": 429702,
       "saved_pct": 0.0,
-      "billed_out": 1348910.9
+      "billed_out": 1341331.9
     },
     "untouched:tabular": {
       "payloads": 11,
@@ -523,7 +530,7 @@
     "16df7f06bc56785a": [
       "text",
       2056,
-      1930
+      1924
     ],
     "170991ff0df3131f": [
       "untouched:text",
@@ -598,7 +605,7 @@
     "1bde3fa322f07e29": [
       "html",
       20519,
-      4353
+      4547
     ],
     "1be1fe59452a28b3": [
       "untouched:listing",
@@ -648,7 +655,7 @@
     "201832b0e150d0e1": [
       "log",
       40222,
-      3447
+      3578
     ],
     "2039bf14cbf09db2": [
       "untouched:text",
@@ -658,7 +665,7 @@
     "209911d9627dc883": [
       "diff",
       4803,
-      1327
+      1374
     ],
     "20bae18af788": [
       "untouched:text",
@@ -873,7 +880,7 @@
     "2df72ba7227ba885": [
       "html",
       7934,
-      1446
+      1511
     ],
     "2e0926e57f629b64": [
       "untouched:text",
@@ -1908,7 +1915,7 @@
     "70c087b524f4cddb": [
       "log",
       39873,
-      8823
+      9080
     ],
     "70c61df85dad3a43": [
       "untouched:text",
@@ -1921,9 +1928,9 @@
       899
     ],
     "70cfbbc785d41d18": [
-      "untouched:source_code",
+      "tabular",
       3445,
-      3445
+      216
     ],
     "71127fe5a37fbc8e": [
       "log",
@@ -2028,7 +2035,7 @@
     "77084080070a4e1d": [
       "log",
       16207,
-      1863
+      1928
     ],
     "77bf0d23a667": [
       "untouched:text",
@@ -2513,7 +2520,7 @@
     "93465eae0df5caa1": [
       "log",
       40209,
-      4119
+      4183
     ],
     "935f4ba19cad9af4": [
       "mixed",
@@ -3013,7 +3020,7 @@
     "a9b2ab3c937973d6": [
       "text",
       9284,
-      2516
+      2646
     ],
     "aa3c2ad45dd3297d": [
       "untouched:source_code",
@@ -3203,7 +3210,7 @@
     "b2de08b86df72e1f": [
       "html",
       5350,
-      2170
+      2365
     ],
     "b309ac303e0ca1ef": [
       "untouched:text",
@@ -3493,7 +3500,7 @@
     "c264cc4f8ea813fb": [
       "log",
       39932,
-      4435
+      4629
     ],
     "c308abc2e39a7ff7": [
       "untouched:search",
@@ -3968,7 +3975,7 @@
     "df6a80718dc09f5e": [
       "log",
       22448,
-      2395
+      2459
     ],
     "dfc52040eadc1dc7": [
       "untouched:text",
@@ -4617,11 +4624,11 @@
     "ids": []
   },
   "timing": {
-    "ms_per_kb": 0.3602,
-    "p50_ms": 0.2581,
-    "p95_ms": 7.3753,
-    "max_ms": 47.7757,
-    "mean_ms": 1.5038
+    "ms_per_kb": 0.2118,
+    "p50_ms": 0.1413,
+    "p95_ms": 4.1691,
+    "max_ms": 24.9725,
+    "mean_ms": 0.8841
   },
   "violations": {}
 }

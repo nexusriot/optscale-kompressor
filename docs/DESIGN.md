@@ -2265,6 +2265,7 @@ code_budget_min_body_lines = 6
 enable_gutter_aware_detection = true # classify a numbered payload by its body, §6
 enable_line_gutter = true
 enable_fold_fallback = true
+log_markers_in_place = true         # mark each dropped log run where it was
 max_line_chars = 512                # last-resort clip, §7.13; 0 disables it
 enable_lossy_key_factoring = true
 enable_stale_read = true

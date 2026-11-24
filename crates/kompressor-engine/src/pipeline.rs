@@ -21,7 +21,7 @@ use crate::detect::{code_starts_at, detect_result, file_joins, strategy_for};
 use crate::diff::crush_diff;
 use crate::gutter::split_line_gutter;
 use crate::listing::crush_listing;
-use crate::logs::{Identity, build_identity, crush_log};
+use crate::logs::{Identity, build_identity, crush_log, fold_log};
 use crate::markers::{has_envelope, has_marker, redraw_marker, whitespace_only};
 use crate::mixed::{crush_mixed, has_mixed_content};
 use crate::options::{EngineOptions, TokenGuard};
@@ -787,7 +787,7 @@ pub(crate) fn arbitrate_config(
         return Some(claimed);
     }
     let claimed_shelved = refs.shelve(mark);
-    let folded = guarded(|| crush_log(content, opts, ctx, refs, Identity::Values));
+    let folded = guarded(|| fold_log(content, opts, ctx, refs, Identity::Values));
     match folded {
         Some(folded) if chars_len(&folded) < chars_len(&claimed) => Some(folded),
         _ => {

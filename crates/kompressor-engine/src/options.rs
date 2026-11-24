@@ -298,6 +298,14 @@ pub struct EngineOptions {
     /// shaped like source.
     pub enable_fold_fallback: bool,
 
+    /// Announce each run of log lines the scorer dropped where it was, rather
+    /// than with one marker after everything kept.
+    ///
+    /// A single trailing marker reads as "what follows came after": on an MCP
+    /// git server's commit history the newest commits went behind it and a
+    /// week-old one passed for the latest. Off reproduces the recorded vectors.
+    pub log_markers_in_place: bool,
+
     /// Hold lossless mode to its promise.
     ///
     /// A mode check belongs in every compressor, not most of them. With this
@@ -403,6 +411,7 @@ impl Default for EngineOptions {
             enable_cross_turn_dedup: true,
             max_line_chars: crate::longline::DEFAULT_MAX_LINE_CHARS,
             enable_fold_fallback: true,
+            log_markers_in_place: true,
             strict_lossless: true,
             search_max_files: 8,
             diff_max_files: 8,
@@ -521,6 +530,7 @@ pub struct EngineOptionsPatch {
     pub enable_line_gutter: Option<bool>,
     pub max_line_chars: Option<usize>,
     pub enable_fold_fallback: Option<bool>,
+    pub log_markers_in_place: Option<bool>,
     pub strict_lossless: Option<bool>,
     pub search_max_files: Option<usize>,
     pub diff_max_files: Option<usize>,
@@ -573,6 +583,7 @@ impl EngineOptionsPatch {
             enable_line_gutter,
             max_line_chars,
             enable_fold_fallback,
+            log_markers_in_place,
             strict_lossless,
             search_max_files,
             diff_max_files,
