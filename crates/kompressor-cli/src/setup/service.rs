@@ -322,9 +322,14 @@ pub fn state_home() -> PathBuf {
 }
 
 /// The user unit's template, shared with `scripts/service/install.sh`.
-const UNIT_TEMPLATE: &str = include_str!("../../../../scripts/service/kompressor.service.in");
+///
+/// Kept inside this crate rather than under `scripts/`: `include_str!` needs
+/// the file wherever the crate is built, and a build from the crate alone —
+/// the e2e image copies only `crates/`, `cargo install` packages only the
+/// crate — has no `scripts/` beside it.
+const UNIT_TEMPLATE: &str = include_str!("templates/kompressor.service.in");
 /// The user configuration's template, shared with the same script.
-const CONFIG_TEMPLATE: &str = include_str!("../../../../scripts/service/config.toml.in");
+const CONFIG_TEMPLATE: &str = include_str!("templates/config.toml.in");
 
 /// The configuration a user install writes, for a state directory.
 pub fn template_config(state: &Path) -> String {

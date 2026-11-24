@@ -12,7 +12,9 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# The templates live in the CLI crate, which embeds them for `kompressor setup`;
+# one copy, so the script and the command cannot drift apart.
+TEMPLATES="$ROOT/crates/kompressor-cli/src/setup/templates"
 
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/kompressor"
@@ -61,14 +63,14 @@ if [ -e "$CONF" ] && [ "$force" -eq 0 ]; then
   echo "keeping existing $CONF (pass --force to replace it)"
 else
   [ -e "$CONF" ] && cp -a "$CONF" "$CONF.bak.$(date +%Y%m%d%H%M%S)" && echo "backed up the previous config"
-  sed "s|@STATE@|$STATE|g" "$HERE/config.toml.in" > "$CONF"
+  sed "s|@STATE@|$STATE|g" "$TEMPLATES/config.toml.in" > "$CONF"
   chmod 600 "$CONF"   # it is where an API key would go
   echo "wrote $CONF"
 fi
 
 # --- unit --------------------------------------------------------------------
 sed -e "s|@BIN@|$BIN|g" -e "s|@CONFIG@|$CONF|g" -e "s|@STATE@|$STATE|g" \
-    "$HERE/kompressor.service.in" > "$UNIT"
+    "$TEMPLATES/kompressor.service.in" > "$UNIT"
 echo "wrote $UNIT"
 
 # --- verify before enabling --------------------------------------------------

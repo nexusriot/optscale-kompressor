@@ -55,9 +55,9 @@ what the client's server stores, so every later turn pays the reduced price.
 
 ## 1. Install the binary
 
-Proxy mode is experimental and built only from the `feat/mcp-proxy` branch,
-version 2.1 and later (`kompressor version` prints it); the 2.0 builds and the
-1.x packages do not have it. `kompressor mcp serve` itself is older than proxy
+Proxy mode is experimental. It ships in the released packages from 2.6 on
+(`kompressor version` prints it); the 2.0 builds and the 1.x packages do not
+have it. `kompressor mcp serve` itself is older than proxy
 mode, so its presence proves nothing. Ask the binary whether it knows the key,
 once the configuration from step 2 exists:
 
@@ -65,7 +65,7 @@ once the configuration from step 2 exists:
 kompressor check-config --config ~/.config/kompressor/mcp-proxy.toml >/dev/null && echo "proxy mode known"
 ```
 
-Install the build that has it:
+If it does not, upgrade the package, or install a build from source:
 
 ```bash
 cp target/release/kompressor ~/.local/bin/kompressor
