@@ -23,6 +23,7 @@ mod report;
 mod restore;
 mod retrieve;
 mod serve;
+mod setup;
 mod stats;
 mod wrap;
 
@@ -77,6 +78,8 @@ enum Command {
     Wrap(WrapCmd),
     /// Undo a `wrap --attach`, restoring the agent's settings file.
     Unwrap(UnwrapCmd),
+    /// Configure the service and every installed agent to use it, durably.
+    Setup(SetupCmd),
     /// Print the version and the compiled-in features.
     Version,
 }
@@ -115,6 +118,86 @@ struct WrapCmd {
     /// List the agents this command knows.
     #[arg(long)]
     list: bool,
+}
+
+/// `kompressor setup`: one command from an installed binary to every agent on
+/// this machine compressed, and one command back.
+///
+/// Writes the recommended profile into `<config>.d/50-setup.toml` beside the
+/// service's configuration, restarts the service, and points Claude Code,
+/// Codex and opencode at it. Everything it replaces is recorded in
+/// `~/.config/kompressor/setup.json` for `setup remove`.
+#[derive(Args)]
+#[command(args_conflicts_with_subcommands = true)]
+struct SetupCmd {
+    #[command(subcommand)]
+    action: Option<SetupAction>,
+    #[command(flatten)]
+    apply: SetupApply,
+}
+
+#[derive(Subcommand)]
+enum SetupAction {
+    /// Show what is set up, whether the service answers, and recent traffic per agent.
+    Status {
+        /// The service's configuration. Defaults to the one its unit names.
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
+    },
+    /// Undo `setup`: put every agent file back, then delete the profile overlay.
+    Remove {
+        /// Only these agents (comma-separated); the profile is then kept.
+        #[arg(long, value_delimiter = ',', value_name = "AGENTS")]
+        agents: Option<Vec<String>>,
+        /// Undo the agents but keep the profile overlay.
+        #[arg(long)]
+        keep_profile: bool,
+        /// Print what would be undone, with diffs, and change nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Do not ask for confirmation.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+}
+
+#[derive(Args)]
+struct SetupApply {
+    /// Agents to wire, comma-separated: claude, codex, opencode. Defaults to
+    /// every one found on PATH.
+    #[arg(long, value_delimiter = ',', value_name = "AGENTS")]
+    agents: Option<Vec<String>>,
+    /// The service's configuration. Defaults to the one its unit names.
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+    /// How Claude Code reaches the proxy: `intercept` (HTTPS_PROXY and the
+    /// local CA; also covers Claude Desktop's Code tab) or `base-url`
+    /// (ANTHROPIC_BASE_URL; the CLI only, no CA).
+    #[arg(long, value_enum, default_value = "intercept")]
+    claude_mode: ClaudeModeArg,
+    /// Also register the retrieval tools with Claude Code as a user-scope MCP
+    /// server, so `ref:k_…` handles resolve outside the proxy too.
+    #[arg(long)]
+    with_mcp: bool,
+    /// Print the plan and the diff of every file, and change nothing.
+    #[arg(long)]
+    dry_run: bool,
+    /// Do not ask for confirmation.
+    #[arg(long, short = 'y')]
+    yes: bool,
+    /// Write the overlay but do not restart the service.
+    #[arg(long)]
+    no_restart: bool,
+    /// Replace an agent setting that already points elsewhere, and wire agents
+    /// even when the service does not answer.
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ClaudeModeArg {
+    Intercept,
+    BaseUrl,
 }
 
 #[derive(Args)]
@@ -576,6 +659,33 @@ fn run(cli: Cli) -> CliResult {
             list: args.list,
         }),
         Command::Unwrap(args) => wrap::unwrap_agent(wrap::UnwrapArgs { agent: args.agent }),
+        Command::Setup(SetupCmd { action, apply }) => match action {
+            Some(SetupAction::Status { config }) => setup::status(config.as_deref()),
+            Some(SetupAction::Remove {
+                agents,
+                keep_profile,
+                dry_run,
+                yes,
+            }) => setup::remove(setup::RemoveArgs {
+                agents,
+                dry_run,
+                yes,
+                keep_profile,
+            }),
+            None => setup::run(setup::SetupArgs {
+                agents: apply.agents,
+                config: apply.config,
+                claude_mode: match apply.claude_mode {
+                    ClaudeModeArg::Intercept => setup::agents::ClaudeMode::Intercept,
+                    ClaudeModeArg::BaseUrl => setup::agents::ClaudeMode::BaseUrl,
+                },
+                with_mcp: apply.with_mcp,
+                dry_run: apply.dry_run,
+                yes: apply.yes,
+                no_restart: apply.no_restart,
+                force: apply.force,
+            }),
+        },
         Command::CheckConfig(args) => check_config(args.config.as_deref()),
         Command::Backup(args) => backup::run(
             args.config.as_deref(),
@@ -665,6 +775,12 @@ fn check_config(path: Option<&std::path::Path>) -> CliResult {
             .try_init();
     }
     let config = Config::load(path).map_err(|e| CliError::Usage(e.to_string()))?;
+    if let Some(source) = &config.source {
+        eprintln!("# from {}", source.display());
+    }
+    for overlay in &config.overlays {
+        eprintln!("# overlay {}", overlay.display());
+    }
     print!("{}", config.redacted_toml());
     Ok(())
 }

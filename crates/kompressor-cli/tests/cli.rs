@@ -2276,3 +2276,27 @@ fn restore_refuses_while_the_service_is_running() {
         .success()
         .stdout(predicate::str::contains("Restored. Start the service."));
 }
+
+/// `kompressor setup` asks the service's binary whether it reads overlays by
+/// exactly this probe (`setup::service::reads_overlays`): a base and one
+/// overlay that changes a value, through `check-config`. This build must pass
+/// it, or setup would refuse to configure a service running this very binary.
+#[test]
+fn check_config_applies_and_names_an_overlay() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("probe.toml");
+    std::fs::write(&base, "[engine]\nmode = \"aggressive\"\n").unwrap();
+    std::fs::create_dir(dir.path().join("probe.d")).unwrap();
+    std::fs::write(
+        dir.path().join("probe.d/50.toml"),
+        "[engine]\nmode = \"lossless\"\n",
+    )
+    .unwrap();
+    kompressor()
+        .args(["check-config", "--config"])
+        .arg(&base)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("mode = \"lossless\""))
+        .stderr(predicate::str::contains("# overlay"));
+}

@@ -216,7 +216,15 @@ goes through the provider block, does not.
 
 `kompressor wrap codex` is per-session: it points codex at the proxy, runs it,
 and leaves nothing behind. To leave compression on for every codex session, run
-`kompressor serve` as a service and write the codex side once.
+`kompressor serve` as a service and write the codex side once — or let
+`kompressor setup` do both and record how to undo them ([SETUP.md](SETUP.md)).
+
+On a ChatGPT plan, `setup` writes `openai_base_url` pointed at the
+`/backend-api/codex` mount into `config.toml`, not the `/v1` alias below. Observed
+on codex 0.166.0: with that key in the file, ChatGPT-plan traffic reached
+chatgpt.com through the proxy's `codex-desktop-chatgpt` mount, compressed, and
+the file is also read by the Codex app. The 401 described below is what the
+`/v1` URL in the file produced on 0.164.0.
 
 Needs **OptScale Kompressor 0.3.0 or newer**. Earlier versions cannot read codex's
 request bodies (it sends `content-encoding: zstd`) and do not recognise the

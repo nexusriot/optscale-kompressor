@@ -13,6 +13,10 @@ lists the rest.)
 
 Everything after this assumes `kompressor` is on your `PATH`.
 
+To leave compression on for every agent on the machine rather than one session,
+`kompressor setup` configures the service and Claude Code, Codex and opencode
+in one go, and `kompressor setup remove` undoes it: [SETUP.md](SETUP.md).
+
 ---
 
 ## 1. Wrap an agent
@@ -670,6 +674,12 @@ Per-session overrides without touching the file:
 KOMPRESSOR__ENGINE__MODE=aggressive kompressor wrap claude
 ```
 
+**Overlays.** A file `NAME.toml` is read together with every `*.toml` in
+`NAME.d/` beside it, in file-name order, later files winning: tables merge key
+by key, `[[proxy.upstreams]]` and `[[mcp.servers]]` entries by `name`.
+`check-config` names each overlay it read on standard error. `kompressor setup`
+owns `50-setup.toml` there and nothing else ([SETUP.md](SETUP.md)).
+
 **Paths are never expanded.** `$HOME` and `~` in a TOML path are taken
 literally — a `path = "$HOME/.local/share/kompressor/refs.db"` creates a
 directory *called* `$HOME` under whatever the working directory happens to be.
@@ -680,7 +690,9 @@ Write absolute paths, or let a service template substitute them at install time
 
 ## 9. Running it as a service
 
-Two shapes, for two different jobs.
+Two shapes, for two different jobs. `kompressor setup` installs the first when
+no service exists, and points the agents at whichever one does
+([SETUP.md](SETUP.md)).
 
 **A user service**, for a proxy the agents on your own login talk to. It runs as
 you, reads and writes only your files, and needs no root:

@@ -167,6 +167,10 @@ Two things to know:
   directory the agent is in — so `wrap` resolves the path to an absolute one
   before handing it over. Without that the tool server would open a different
   SQLite file, create it happily, and then report every handle as expired.
+* **`kompressor setup --with-mcp` is the durable exception, on request.** It
+  registers the same server at user scope with `claude mcp add`, records that it
+  did, and `kompressor setup remove` takes it out again
+  ([SETUP.md](SETUP.md)). Without the flag setup registers nothing.
 * **`--attach` and GUI wiring go without.** Both exist precisely because the
   agent is started by something other than `wrap`, so there is no command line
   to put the flag on. Registering durably so those cases could be covered is the

@@ -51,6 +51,107 @@ pub struct Config {
     /// commands it shows. Never read from or written to a file.
     #[serde(skip)]
     pub source: Option<PathBuf>,
+    /// The overlay files merged over [`Self::source`], in the order they were
+    /// applied. See [`overlay_files`]. Never read from or written to a file.
+    #[serde(skip)]
+    pub overlays: Vec<PathBuf>,
+}
+
+/// The directory of overlays for a configuration file: the file's stem plus
+/// `.d`, beside it — `/etc/kompressor/config.toml` → `/etc/kompressor/config.d/`,
+/// `./kompressor.toml` → `./kompressor.d/`.
+///
+/// The stem rather than a fixed `config.d` so a `kompressor.toml` in a project
+/// directory never picks up an unrelated `config.d/` that happens to sit next
+/// to it.
+pub fn overlay_dir(path: &std::path::Path) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "config".into());
+    path.with_file_name(format!("{stem}.d"))
+}
+
+/// The overlays for `path`: every `*.toml` in [`overlay_dir`], by file name.
+///
+/// Overlays exist so a tool can own one file of settings — `kompressor setup`
+/// writes `50-setup.toml` — without editing a file the user, or a package
+/// manager, owns. Removing the overlay is then an exact undo. Hidden files and
+/// editor leftovers (`.toml~`, `.toml.bak`) are not `*.toml` and are skipped.
+pub fn overlay_files(path: &std::path::Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(overlay_dir(path)) else {
+        return Vec::new();
+    };
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension().is_some_and(|ext| ext == "toml")
+                && !path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with('.'))
+                && path.is_file()
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+/// Merge `overlay` into `base`, the way a later configuration file overrides an
+/// earlier one.
+///
+/// * Tables merge key by key, recursively.
+/// * An array whose every element is a table with a string `name` —
+///   `[[proxy.upstreams]]`, `[[mcp.servers]]` — merges by that name: an entry
+///   with a name already present is merged into it, a new name is appended.
+///   Replacing the whole array would make an overlay that adds one mount
+///   silently drop every other.
+/// * Anything else, arrays included, is replaced.
+pub fn merge_toml(base: &mut toml::Table, overlay: toml::Table) {
+    for (key, value) in overlay {
+        match (base.get_mut(&key), value) {
+            (Some(toml::Value::Table(into)), toml::Value::Table(from)) => merge_toml(into, from),
+            (Some(toml::Value::Array(into)), toml::Value::Array(from))
+                if named_tables(into) && named_tables(&from) =>
+            {
+                for entry in from {
+                    let name = entry
+                        .get("name")
+                        .and_then(toml::Value::as_str)
+                        .map(str::to_owned);
+                    let existing = into.iter_mut().find(|candidate| {
+                        candidate.get("name").and_then(toml::Value::as_str) == name.as_deref()
+                    });
+                    match (existing, entry) {
+                        (Some(toml::Value::Table(into)), toml::Value::Table(from)) => {
+                            merge_toml(into, from)
+                        }
+                        (_, entry) => into.push(entry),
+                    }
+                }
+            }
+            (_, value) => {
+                base.insert(key, value);
+            }
+        }
+    }
+}
+
+/// Whether every element of `array` is a table carrying a string `name`.
+fn named_tables(array: &[toml::Value]) -> bool {
+    array.iter().all(|value| {
+        value
+            .as_table()
+            .is_some_and(|table| table.get("name").is_some_and(toml::Value::is_str))
+    })
+}
+
+/// Parse one TOML file into a table, naming the file in any error.
+fn read_table(path: &std::path::Path) -> Result<toml::Table, ConfigError> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| ConfigError::Read(path.display().to_string(), e))?;
+    text.parse::<toml::Table>()
+        .map_err(|e| ConfigError::Parse(format!("{}: {e}", path.display())))
 }
 
 /// One `KOMPRESSOR_*` variable the process was started with.
@@ -1662,18 +1763,51 @@ impl Config {
                 discovered.as_deref()
             }
         };
-        let mut config = match path {
-            Some(path) => {
-                let text = std::fs::read_to_string(path)
-                    .map_err(|e| ConfigError::Read(path.display().to_string(), e))?;
-                toml::from_str(&text).map_err(|e| ConfigError::Parse(e.to_string()))?
-            }
-            None => Config::default(),
+        let (mut config, overlays) = match path {
+            Some(path) => Config::read_layered(path)?,
+            None => (Config::default(), Vec::new()),
         };
         config.source = path.map(|path| std::path::absolute(path).unwrap_or(path.to_path_buf()));
+        config.overlays = overlays;
         config.apply_env(&std::env::vars().collect::<Vec<_>>());
         config.validate()?;
         Ok(config)
+    }
+
+    /// Read `path` and merge its overlays over it (see [`overlay_files`]),
+    /// without the environment and without validating.
+    ///
+    /// A file with no overlay directory parses exactly as it always did: the
+    /// text goes straight to the deserializer, so its error messages keep
+    /// their line and column.
+    pub fn read_layered(path: &std::path::Path) -> Result<(Config, Vec<PathBuf>), ConfigError> {
+        let overlays = overlay_files(path);
+        if overlays.is_empty() {
+            let text = std::fs::read_to_string(path)
+                .map_err(|e| ConfigError::Read(path.display().to_string(), e))?;
+            let config = toml::from_str(&text).map_err(|e| ConfigError::Parse(e.to_string()))?;
+            return Ok((config, overlays));
+        }
+        let mut table = read_table(path)?;
+        for overlay in &overlays {
+            merge_toml(&mut table, read_table(overlay)?);
+        }
+        let config = Config::from_table(table).map_err(|e| {
+            let names: Vec<String> = overlays.iter().map(|p| p.display().to_string()).collect();
+            ConfigError::Parse(format!(
+                "{} with overlays {}: {e}",
+                path.display(),
+                names.join(", ")
+            ))
+        })?;
+        Ok((config, overlays))
+    }
+
+    /// Deserialize an already-merged table.
+    pub fn from_table(table: toml::Table) -> Result<Config, String> {
+        toml::Value::Table(table)
+            .try_into::<Config>()
+            .map_err(|e| e.to_string())
     }
 
     /// Read exactly one file: no discovery and no `KOMPRESSOR_*` overlay.
@@ -3662,5 +3796,99 @@ mod tests {
         assert!(!rendered.contains("wJalrXUtnFEMI-secret"), "{rendered}");
         assert!(rendered.contains("<redacted>"));
         assert!(!format!("{config:?}").contains("wJalrXUtnFEMI-secret"));
+    }
+
+    #[test]
+    fn the_overlay_directory_is_named_after_the_files_stem() {
+        use std::path::Path;
+        assert_eq!(
+            overlay_dir(Path::new("/etc/kompressor/config.toml")),
+            Path::new("/etc/kompressor/config.d")
+        );
+        assert_eq!(
+            overlay_dir(Path::new("kompressor.toml")),
+            Path::new("kompressor.d")
+        );
+    }
+
+    #[test]
+    fn an_overlay_merges_tables_and_named_arrays_and_replaces_the_rest() {
+        let mut base: toml::Table = r#"
+            [server]
+            listen = "127.0.0.1:18817"
+            [proxy]
+            tools_order = "client"
+            [[proxy.upstreams]]
+            name = "openai"
+            path_prefix = "/v1"
+            base_url = "https://gateway.example"
+        "#
+        .parse()
+        .unwrap();
+        let overlay: toml::Table = r#"
+            [server]
+            stats_listen = "127.0.0.1:8818"
+            [[proxy.upstreams]]
+            name = "openai"
+            forward_auth = true
+            [[proxy.upstreams]]
+            name = "anthropic"
+            path_prefix = "/v1/messages"
+            base_url = "https://api.anthropic.com"
+        "#
+        .parse()
+        .unwrap();
+        merge_toml(&mut base, overlay);
+        let config = Config::from_table(base).expect("merged config deserializes");
+        assert_eq!(
+            config.server.listen, "127.0.0.1:18817",
+            "kept from the base"
+        );
+        assert_eq!(config.server.stats_listen, "127.0.0.1:8818");
+        assert_eq!(config.proxy.upstreams.len(), 2, "appended, not replaced");
+        let openai = &config.proxy.upstreams[0];
+        assert_eq!(
+            openai.base_url, "https://gateway.example",
+            "the user's gateway survives"
+        );
+        assert!(openai.forward_auth);
+        assert_eq!(config.proxy.upstreams[1].name, "anthropic");
+    }
+
+    #[test]
+    fn overlays_are_read_in_name_order_and_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("config.toml");
+        std::fs::write(&base, "[engine]\nmode = \"aggressive\"\n").unwrap();
+        let d = dir.path().join("config.d");
+        std::fs::create_dir(&d).unwrap();
+        std::fs::write(d.join("90-last.toml"), "[engine]\nmode = \"lossless\"\n").unwrap();
+        std::fs::write(
+            d.join("50-setup.toml"),
+            "[engine]\nmode = \"recoverable\"\n",
+        )
+        .unwrap();
+        std::fs::write(d.join("99-ignored.toml.bak"), "not toml at all [").unwrap();
+        let config = Config::load(Some(&base)).unwrap();
+        assert_eq!(config.engine.mode, kompressor_engine::types::Mode::Lossless);
+        assert_eq!(
+            config.overlays,
+            vec![d.join("50-setup.toml"), d.join("90-last.toml")]
+        );
+    }
+
+    #[test]
+    fn a_typo_in_an_overlay_is_refused_and_names_the_overlay() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("config.toml");
+        std::fs::write(&base, "").unwrap();
+        std::fs::create_dir(dir.path().join("config.d")).unwrap();
+        std::fs::write(
+            dir.path().join("config.d/50-setup.toml"),
+            "[proxy.providers.anthropic]\ncache_tll = \"1h\"\n",
+        )
+        .unwrap();
+        let error = Config::load(Some(&base)).unwrap_err().to_string();
+        assert!(error.contains("50-setup.toml"), "{error}");
     }
 }
