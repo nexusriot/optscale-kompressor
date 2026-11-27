@@ -89,7 +89,7 @@ struct Plan {
 const MAX_SPAN_MS: i64 = 90 * 86_400_000;
 const DEFAULT_SPAN_MS: i64 = 86_400_000;
 const MODES: [&str; 5] = ["aggressive", "lossless", "recoverable", "off", "unrecorded"];
-const SURFACES: [&str; 4] = ["api", "mcp", "proxy", "cli"];
+const SURFACES: [&str; 5] = ["api", "mcp", "proxy", "cli", "hook"];
 
 /// Every rule the analysis routes apply to a query, with no I/O, so each can
 /// be tested on its own. `now` is the default end of the range.
@@ -238,13 +238,21 @@ async fn respond(
                 View::Latency => {
                     serde_json::to_value(r.latency_analysis(&tenant, from, to)?).map_err(Into::into)
                 }
-                View::Comparison => serde_json::to_value(r.compare_history(
-                    &tenant,
-                    (from, to),
-                    baseline,
-                    &filter,
-                )?)
-                .map_err(Into::into),
+                View::Comparison => {
+                    let mut compared = serde_json::to_value(r.compare_history(
+                        &tenant,
+                        (from, to),
+                        baseline,
+                        &filter,
+                    )?)?;
+                    // `proxy.output_shaping` compares arms within the window,
+                    // not windows: treated and holdout ran side by side.
+                    let arms = serde_json::to_value(r.output_shaping_arms(&tenant, from, to)?)?;
+                    if let Some(object) = compared.as_object_mut() {
+                        object.insert("output_shaping".into(), arms);
+                    }
+                    Ok(compared)
+                }
                 View::Overview => unreachable!(),
             })
             .await?;

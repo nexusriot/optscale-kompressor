@@ -642,6 +642,10 @@ fn restore_targets(config: &Config) -> [(&'static str, Result<PathBuf, &'static 
                 RefsBackend::Memory => {
                     Err("the ref store is in memory (refs.backend = \"memory\")")
                 }
+                RefsBackend::Redis => Err(
+                    "the ref store is in Redis (refs.backend = \"redis\"); back it up with \
+                     the server's own RDB/AOF",
+                ),
             },
             kompressor_store::sqlite::latest_version(),
         ),
@@ -994,6 +998,12 @@ pub fn write_archive(config: &Config, output: &Path) -> Result<Manifest, CoreErr
         RefsBackend::Memory => record(Err(Skipped {
             name: "refs.db".to_string(),
             reason: "the ref store is in memory (refs.backend = \"memory\")".to_string(),
+        })),
+        RefsBackend::Redis => record(Err(Skipped {
+            name: "refs.db".to_string(),
+            reason: "the ref store is in Redis (refs.backend = \"redis\"); back it up with \
+                     the server's own RDB/AOF"
+                .to_string(),
         })),
     }
     if manifest.databases.is_empty() {
@@ -1811,7 +1821,9 @@ mod tests {
         kompressor_stats::schema::open_read_write(&config.stats.path)
             .unwrap()
             .execute_batch(
-                "DROP TABLE backups; DROP TABLE maintenance_events; PRAGMA user_version = 15;",
+                "DROP TABLE backups; DROP TABLE maintenance_events; DROP TABLE process_starts;
+                 DROP TABLE retrieve_round_usage; DROP TABLE elisions; \
+                 ALTER TABLE proxy_requests DROP COLUMN output_shaping; PRAGMA user_version = 15;",
             )
             .unwrap();
         let archive = dir.path().join("old.tar.gz");

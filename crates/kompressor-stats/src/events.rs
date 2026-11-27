@@ -33,6 +33,10 @@ pub enum Surface {
     Proxy,
     /// The command-line client.
     Cli,
+    /// An agent's own hook calling this binary once per event
+    /// (`kompressor hook cursor`). Stored from schema v20; see
+    /// docs/design/CURSOR.md.
+    Hook,
 }
 
 impl Surface {
@@ -44,6 +48,7 @@ impl Surface {
             Surface::Mcp => "mcp",
             Surface::Proxy => "proxy",
             Surface::Cli => "cli",
+            Surface::Hook => "hook",
         }
     }
 
@@ -54,6 +59,7 @@ impl Surface {
             "mcp" => Some(Surface::Mcp),
             "proxy" => Some(Surface::Proxy),
             "cli" => Some(Surface::Cli),
+            "hook" => Some(Surface::Hook),
             _ => None,
         }
     }
@@ -133,6 +139,20 @@ pub struct OptimizationEvent {
     /// the view reports those as `unrecorded` rather than folding them into a
     /// real outcome.
     pub outcome: Option<String>,
+    /// The agent tool whose output this was (`Shell`, `MCP:<tool>`, `Read`),
+    /// for a hook-mode event. `None` everywhere else. Schema v20.
+    #[serde(default)]
+    pub tool: Option<String>,
+    /// The agent's own conversation id, for a hook-mode event: what joins the
+    /// results of one session when there is no message array to fingerprint.
+    /// Schema v20.
+    #[serde(default)]
+    pub conversation: Option<String>,
+    /// A measurement of what *would* have been removed, with nothing changed:
+    /// hook mode's shadow rows. Stored as `mode = 'off'`, so the would-be
+    /// `tokens_out` never reads as a saving.
+    #[serde(default)]
+    pub shadow: bool,
 }
 
 impl OptimizationEvent {
@@ -174,6 +194,9 @@ impl OptimizationEvent {
             frozen_messages: 0,
             engine_ms: 0.0,
             outcome: None,
+            tool: None,
+            conversation: None,
+            shadow: false,
         }
     }
 
@@ -373,6 +396,10 @@ pub struct ProxyRequestEvent {
     /// requests, or reads a turn's latency, should leave these rows out.
     #[serde(default)]
     pub keep_warm: bool,
+    /// The conversation's arm of `proxy.output_shaping` — `treated` or
+    /// `holdout` — or `None` for a conversation outside the experiment.
+    #[serde(default)]
+    pub output_shaping: Option<String>,
 }
 
 /// A periodic measurement of what the fragment store is holding.
@@ -439,6 +466,69 @@ pub struct MaintenanceEvent {
     pub error: Option<String>,
 }
 
+/// One process start: what a restart is set against conversations open across
+/// it from (`process_starts`, schema v18).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessStartEvent {
+    /// When the process finished binding, milliseconds since the Unix epoch.
+    pub time_ms: i64,
+    /// The build's version.
+    pub version: String,
+    pub pid: Option<u32>,
+    /// The surfaces it serves, comma-separated (`api,mcp,proxy`).
+    pub surfaces: String,
+}
+
+/// What the provider billed one round of a request, as it reported it.
+///
+/// `input_tokens` is the provider's own prompt figure: on Anthropic the
+/// uncached remainder, with reads and writes beside it; on OpenAI the whole
+/// prompt, cached part included — as `proxy_requests.prompt_tokens`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoundUsage {
+    /// 0 is the client's own call; 1 and up are the rounds the retrieve loop
+    /// added.
+    pub round: u32,
+    pub input_tokens: Option<u32>,
+    pub cache_read_tokens: Option<u32>,
+    pub cache_write_tokens: Option<u32>,
+    pub output_tokens: Option<u32>,
+}
+
+/// Every round of one request that ran the retrieve loop
+/// (`retrieve_round_usage`, schema v18). Filed only when the loop took at
+/// least one round: for any other request the one round is the
+/// `proxy_requests` row itself.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrieveRoundsEvent {
+    /// Request start, as on the request's `proxy_requests` row.
+    pub time_ms: i64,
+    pub tenant: String,
+    pub request_id: String,
+    pub rounds: Vec<RoundUsage>,
+}
+
+/// One handle shipped in place of content (`elisions`, schema v18).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Elided {
+    /// The handle, `k_` prefix included.
+    pub reference: String,
+    /// The kind of payload it came out of (`log`, `json`, …).
+    pub kind: String,
+    /// The fragment's size.
+    pub bytes: u64,
+}
+
+/// The handles one compression shipped. Only the first request to ship a
+/// handle is kept: the writer inserts or ignores on `(tenant, ref)`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ElisionsEvent {
+    pub time_ms: i64,
+    pub tenant: String,
+    pub request_id: String,
+    pub refs: Vec<Elided>,
+}
+
 /// Anything the writer can be handed.
 ///
 /// Externally tagged — `{"optimization": {…}}` — rather than carrying a `type`
@@ -447,6 +537,11 @@ pub struct MaintenanceEvent {
 /// workspace builds `serde_json` with `arbitrary_precision`, under which a
 /// buffered number is a map. `engine_ms` then fails to deserialize with
 /// "invalid type: map, expected f64".
+///
+/// `ProxyRequest` is the largest variant and also the commonest event, one per
+/// proxied request: boxing it would add an allocation to the hot path to save
+/// space on the rarer ones, so the size difference is accepted.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Event {
@@ -476,6 +571,12 @@ pub enum Event {
     Backup(BackupEvent),
     /// Maintenance work was done on a database or an archive.
     Maintenance(MaintenanceEvent),
+    /// The process came up.
+    ProcessStart(ProcessStartEvent),
+    /// What each round of a retrieve loop was billed.
+    RetrieveRounds(RetrieveRoundsEvent),
+    /// Handles a compression shipped.
+    Elisions(ElisionsEvent),
     /// The fragment store was measured.
     StoreSample {
         /// When the sample was taken, milliseconds since the Unix epoch.
@@ -500,6 +601,9 @@ impl Event {
             Event::StoreSample { time_ms, .. } => *time_ms,
             Event::Backup(e) => e.time_ms,
             Event::Maintenance(e) => e.time_ms,
+            Event::ProcessStart(e) => e.time_ms,
+            Event::RetrieveRounds(e) => e.time_ms,
+            Event::Elisions(e) => e.time_ms,
         }
     }
 
@@ -511,7 +615,12 @@ impl Event {
             Event::ProtectedRefs(e) => Some(&e.tenant),
             Event::ProxyRequest(e) => Some(&e.tenant),
             Event::Discarded { tenant, .. } => Some(tenant),
-            Event::StoreSample { .. } | Event::Backup(_) | Event::Maintenance(_) => None,
+            Event::RetrieveRounds(e) => Some(&e.tenant),
+            Event::Elisions(e) => Some(&e.tenant),
+            Event::StoreSample { .. }
+            | Event::Backup(_)
+            | Event::Maintenance(_)
+            | Event::ProcessStart(_) => None,
         }
     }
 }

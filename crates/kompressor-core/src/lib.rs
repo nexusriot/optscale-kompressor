@@ -8,6 +8,9 @@
 //! a rule added for one of them holds for all three.
 
 #![forbid(unsafe_code)]
+// `analysis_context` records every policy setting in one `json!` literal,
+// which outgrew the default macro recursion limit.
+#![recursion_limit = "256"]
 
 pub mod auth;
 pub mod backup;
@@ -20,7 +23,7 @@ pub mod s3;
 
 pub use auth::{Authenticator, Credentials, Identity};
 pub use config::Config;
-pub use core::{AppCore, CompressOutcome, RefsSweep, RequestInfo, build_ref_store};
+pub use core::{AppCore, Attribution, CompressOutcome, RefsSweep, RequestInfo, build_ref_store};
 pub use error::{AuthError, ConfigError, CoreError};
 pub use retrieve::{RetrieveRange, Retrieved};
 

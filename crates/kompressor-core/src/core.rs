@@ -103,6 +103,33 @@ pub struct RequestInfo<'a> {
     pub provider: Option<&'a str>,
 }
 
+/// Who a hook-mode result belongs to, beyond what [`RequestInfo`] carries.
+///
+/// A hook is handed one tool result at a time with no message array around
+/// it, so the tool and the agent's own conversation id are the only way to
+/// group its rows afterwards. Every other surface passes the default.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Attribution<'a> {
+    /// The agent's tool name: `Shell`, `MCP:<tool>`, `Read`.
+    pub tool: Option<&'a str>,
+    /// The agent's conversation id.
+    pub conversation: Option<&'a str>,
+    /// Measure only: retain nothing, and file the row as `mode = 'off'` so
+    /// the would-be removal is never read as a saving.
+    pub shadow: bool,
+    /// The most the agent would have put in front of the model without us.
+    ///
+    /// Cursor writes any tool result over 40,000 bytes to a file and hands
+    /// the model a reference instead, so for such a result the uncompressed
+    /// baseline was not the output: it was nothing inline. Counting the whole
+    /// output as removed claimed ~78k tokens for a `seq 1 20000` the model
+    /// would never have received (measured on the real CLI, 2026-11-25). For
+    /// a payload over this limit the row's `tokens_in` is set to its
+    /// `tokens_out` — no removal is claimed — while `chars_in` keeps the real
+    /// size, which is how a report tells such a result apart.
+    pub inline_limit_bytes: Option<usize>,
+}
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -460,6 +487,31 @@ impl AppCore {
         options: &EngineOptions,
         surface: Surface,
     ) -> (String, CompressOutcome) {
+        self.compress_raw_attributed(
+            identity,
+            content,
+            forced,
+            request,
+            options,
+            surface,
+            &Attribution::default(),
+        )
+    }
+
+    /// [`compress_raw`](Self::compress_raw), with the row attributed to an
+    /// agent tool and conversation, or — with `attribution.shadow` — a dry
+    /// run that retains nothing and returns the input unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compress_raw_attributed(
+        &self,
+        identity: &Identity,
+        content: &str,
+        forced: Option<ForcedType>,
+        request: &RequestInfo<'_>,
+        options: &EngineOptions,
+        surface: Surface,
+        attribution: &Attribution<'_>,
+    ) -> (String, CompressOutcome) {
         let started = Instant::now();
         let time_ms = now_ms();
         let mut refs = options.collector();
@@ -507,12 +559,46 @@ impl AppCore {
             }
         }
 
+        if let Some(limit) = attribution.inline_limit_bytes
+            && content.len() > limit
+        {
+            stats.tokens_in = stats.tokens_out;
+            stats.ratio = 1.0;
+        }
         note_oversized_refusals(&mut stats, &refs, request.request_id);
+        if attribution.shadow {
+            // Nothing is retained, so nothing is published: the row says what
+            // the engine would have removed, and the caller gets its input.
+            self.record_compression_attributed(
+                identity,
+                &stats,
+                request,
+                surface,
+                time_ms,
+                engine_ms,
+                attribution,
+            );
+            return (
+                content.to_string(),
+                CompressOutcome {
+                    stats,
+                    mode: options.mode,
+                },
+            );
+        }
         let retained = self.retain_fragments(identity, &refs, request.request_id, options);
         if !retained && options.mode == Mode::Recoverable {
             discard_compression_stats(&mut stats);
         }
-        self.record_compression(identity, &stats, request, surface, time_ms, engine_ms);
+        self.record_compression_attributed(
+            identity,
+            &stats,
+            request,
+            surface,
+            time_ms,
+            engine_ms,
+            attribution,
+        );
 
         let out = if !retained && options.mode == Mode::Recoverable {
             content.to_string()
@@ -682,7 +768,34 @@ impl AppCore {
                 }
             }
         }
+        self.record_elisions(identity, refs, request_id);
         true
+    }
+
+    /// File the handles about to be shipped, with their kind and size: the
+    /// denominator of a fetch probability, which `retrieval_events` alone
+    /// cannot give (it holds only the handles that were asked for). The
+    /// writer keeps the first request to ship each handle.
+    fn record_elisions(&self, identity: &Identity, refs: &RefCollector, request_id: &str) {
+        if !self.stats.is_enabled() {
+            return;
+        }
+        let elided = refs
+            .pairs()
+            .iter()
+            .map(|(id, fragment)| kompressor_stats::events::Elided {
+                reference: id.to_string(),
+                kind: refs.kind_of(id).as_str().to_string(),
+                bytes: fragment.len() as u64,
+            })
+            .collect();
+        self.stats
+            .send(Event::Elisions(kompressor_stats::events::ElisionsEvent {
+                time_ms: now_ms(),
+                tenant: identity.tenant.as_str().to_string(),
+                request_id: request_id.to_string(),
+                refs: elided,
+            }));
     }
 
     /// Push out the retention window of handles sitting in content we declined
@@ -714,6 +827,28 @@ impl AppCore {
         surface: Surface,
         time_ms: i64,
         engine_ms: f64,
+    ) {
+        self.record_compression_attributed(
+            identity,
+            stats,
+            request,
+            surface,
+            time_ms,
+            engine_ms,
+            &Attribution::default(),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_compression_attributed(
+        &self,
+        identity: &Identity,
+        stats: &CompressStats,
+        request: &RequestInfo<'_>,
+        surface: Surface,
+        time_ms: i64,
+        engine_ms: f64,
+        attribution: &Attribution<'_>,
     ) {
         if !self.stats.is_enabled() {
             return;
@@ -755,6 +890,9 @@ impl AppCore {
             );
         }
         event.outcome = Some(outcome.as_str().to_string());
+        event.tool = attribution.tool.map(str::to_string);
+        event.conversation = attribution.conversation.map(str::to_string);
+        event.shadow = attribution.shadow;
         self.stats.send(Event::Optimization(event));
 
         if !stats.protected_refs.is_empty() {
@@ -905,6 +1043,23 @@ pub fn build_ref_store(config: &Config) -> Result<Arc<dyn RefStore>, crate::erro
         RefsBackend::Memory => Ok(Arc::new(
             MemoryRefStore::new().with_max_bytes(config.refs.max_bytes),
         )),
+        RefsBackend::Redis => {
+            use kompressor_store::redis::{RedisOptions, RedisRefStore};
+            let mut options = RedisOptions::new(&config.refs.redis_url).map_err(|e| {
+                crate::error::CoreError::Store(kompressor_store::StoreError::Redis(e))
+            })?;
+            options.prefix = config.refs.redis_prefix.clone();
+            options.timeout = config.refs.redis_timeout;
+            options.pool = config.refs.redis_pool;
+            let store = RedisRefStore::open(options)?;
+            // Shared with other proxies, so a retrieval racing its own write
+            // is served here rather than across the network.
+            Ok(Arc::new(
+                CachedRefStore::new(store)
+                    .with_capacity(config.refs.recent_cache_entries)
+                    .with_max_bytes(config.refs.recent_cache_bytes),
+            ))
+        }
         RefsBackend::Sqlite => {
             if let Some(parent) = config.refs.path.parent()
                 && !parent.as_os_str().is_empty()
@@ -973,6 +1128,47 @@ mod tests {
                 other => panic!("{id} not stored: {other:?}"),
             }
         }
+    }
+
+    /// Every shipped handle is filed with its kind and size, which is what
+    /// a fetch probability is divided by.
+    #[test]
+    fn retained_fragments_are_filed_as_elisions_with_their_kind_and_size() {
+        let (sink, captured) = kompressor_stats::writer::capturing_sink(16);
+        let core = AppCore::new(Config::default(), Arc::new(MemoryRefStore::new()), sink);
+        let identity = Identity::anonymous();
+        let options = core.options_for(&identity, None);
+        let mut refs = options.collector();
+        refs.set_kind(Kind::Json);
+        let json = refs.stash("{\"a\": 1}").unwrap();
+        refs.set_kind(Kind::SourceCode);
+        let code = refs.stash("fn main() {}").unwrap();
+
+        assert!(core.retain_fragments(&identity, &refs, "req-7", &options));
+
+        let filed: Vec<_> = captured
+            .drain()
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::Elisions(e) => Some(e),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(filed.len(), 1);
+        assert_eq!(filed[0].request_id, "req-7");
+        let shipped: Vec<(String, String, u64)> = filed[0]
+            .refs
+            .iter()
+            .map(|e| (e.reference.clone(), e.kind.clone(), e.bytes))
+            .collect();
+        assert_eq!(
+            shipped,
+            [
+                (json.to_string(), "json".to_string(), 8),
+                (code.to_string(), "source_code".to_string(), 12),
+            ]
+        );
+        assert!(shipped[0].0.starts_with("k_"), "as retrievals name it");
     }
 
     fn log_payload(lines: usize) -> String {
@@ -1195,11 +1391,24 @@ mod tests {
             store.stats().expect("store stats").live_refs > 0,
             "publication retains what was elided"
         );
+        let filed = captured.drain();
         assert_eq!(
-            captured.drain().len(),
+            filed
+                .iter()
+                .filter(|event| matches!(event, Event::Optimization(_)))
+                .count(),
             1,
-            "publication files exactly one event"
+            "publication files exactly one compression"
         );
+        assert_eq!(
+            filed
+                .iter()
+                .filter(|event| matches!(event, Event::Elisions(_)))
+                .count(),
+            1,
+            "and the handles it shipped"
+        );
+        assert_eq!(filed.len(), 2);
     }
 
     #[test]

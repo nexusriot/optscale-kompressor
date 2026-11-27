@@ -61,7 +61,9 @@ pub(crate) async fn handle(
 ) -> Response {
     let request_id = request_id(request.headers());
     let span = tracing::info_span!("proxy", request_id = %request_id);
-    run(state, request, request_id).instrument(span).await
+    // Tracked so the request can tell, once its body is decided, whether it
+    // gave up anywhere: what `Stage::AfterCompressed` counts.
+    crate::failopen::track(run(state, request, request_id).instrument(span)).await
 }
 
 async fn run(state: ProxyState, request: axum::extract::Request, request_id: String) -> Response {
@@ -216,6 +218,12 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
     // After `decoded` is taken, so a renamed model reads as a rewritten body and
     // is re-encoded rather than forwarded as the bytes that arrived.
     let body = model_for_upstream(body, family, route.origin());
+    let platform = kompressor_wire::platform(&route.path);
+    // A Bedrock stream comes back as AWS event-stream frames, which the
+    // retrieve loop does not read: a call to the tool would reach a client
+    // that never declared it.
+    let retrieve_allowed = !(platform == kompressor_wire::Platform::Bedrock
+        && kompressor_wire::streams_by_path(&route.path));
     let identity = resolve_identity(&state, &parts.headers);
     let mode = resolve_mode(
         &state,
@@ -239,8 +247,16 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
         body,
         &request_id,
         upstream.name.as_str(),
+        route.origin(),
+        retrieve_allowed,
     )
     .await;
+    // The cloud platforms name the model and ask for a stream in the path,
+    // not the body.
+    prepared.stream |= kompressor_wire::streams_by_path(&route.path);
+    if prepared.model.is_none() && family.is_some() {
+        prepared.model = kompressor_wire::model_in_path(&route.path);
+    }
     // After every rewrite, so it rides on whatever goes out, compressed or
     // not, and before the capture, so the capture shows it.
     let retention = ask_for_retention(
@@ -251,6 +267,9 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
         auth_mode.is_subscription(),
         &mut prepared,
     );
+    // After every rewrite, on the body as it will go out, and before anything
+    // copies it: the keep-warm ping and the capture below both read it.
+    guard_the_rewrite(&state, family, route.origin(), &decoded, &mut prepared);
 
     // The client is back in this conversation, so whatever was keeping its
     // cache warm has done its job. Cancelled before this request is sent, so a
@@ -305,6 +324,7 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
     // arrived, in the coding they arrived in. Only a body this proxy rewrote
     // is re-encoded, and if that fails the original ships rather than a body
     // whose `content-encoding` lies about it.
+    let mut sent_as_received = prepared.body == decoded;
     let outbound_body = if prepared.body == decoded {
         // Unchanged: the bytes that arrived, in the coding they arrived in.
         wire
@@ -322,28 +342,30 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
                 state
                     .failopen
                     .record(Stage::Parse, &"the rewritten body could not be re-encoded");
-                // The client's original goes out, so nothing was recompacted:
-                // the provider will cache these bytes, and the conversation
-                // keeps the freeze and the ledger that go with them. Dropping
-                // the reservation frees it for the next turn that finds the
-                // cache gone.
-                prepared.pending_recompaction = None;
-                prepared.reservation = None;
-                prepared.recompacted = None;
-                if let Some(seen) = prepared.observation.as_mut() {
-                    seen.recompacted = None;
-                    seen.ledger_reads = 0;
-                }
-                // The drift tracker was told the rewritten body went out.
-                // It did not: the next request is to be compared with the
-                // client's own bytes on both sides.
-                if let Some(conversation) = prepared.prefix {
-                    state.drift.sent_as_received(conversation, prepared.ticket);
-                }
+                forget_the_rewrite(&state, &mut prepared);
+                sent_as_received = true;
                 wire
             }
         }
     };
+    // Counting only. A request that went out as the client sent it, having
+    // given up somewhere, in a conversation an earlier turn of which went out
+    // compressed: see `Stage::AfterCompressed` for why that one is worth a
+    // number of its own.
+    let sent_compressed = !sent_as_received && prepared.saved_tokens > 0;
+    if !sent_compressed
+        && let Some(stage) = crate::failopen::failed_open_here()
+        && let Some(conversation) = prepared.prefix
+        && state.prefixes.was_compressed(conversation)
+    {
+        state.failopen.record(
+            Stage::AfterCompressed,
+            &format_args!(
+                "gave up at {} after an earlier turn went out compressed",
+                stage.as_str()
+            ),
+        );
+    }
     // The commit point of a recompaction: this body is what the provider will
     // cache, so from here the conversation has no freeze and its ledger holds
     // what this turn decided.
@@ -377,6 +399,9 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
             outbound = outbound.with_json(json);
         }
         outbound = outbound.with_retention(retention).with_started(started);
+        if let Some(signer) = aws_signer(upstream, &parts.headers) {
+            outbound = outbound.with_signer(signer);
+        }
         if !prepared.stream {
             outbound = outbound.with_timeout(proxy.upstream_read_timeout);
         }
@@ -413,6 +438,7 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
                 prepared.prefix,
             )
             .with_timing(outbound.timing())
+            .with_siblings(proxy.retrieve_attach_siblings)
         });
     let budget = Budget::new(
         proxy.retrieve_max_rounds,
@@ -431,6 +457,7 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
     );
     recorder.timing = Some(outbound.timing());
     recorder.keep_warm = keep_warm;
+    recorder.compressed = sent_compressed;
 
     if prepared.stream {
         stream_response(
@@ -461,6 +488,141 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
         )
         .await
     }
+}
+
+/// The SigV4 signer for an upstream configured with `aws_sigv4`, unless the
+/// client authenticates with a bearer key (which covers no body and is
+/// forwarded) or the proxy has no AWS credentials, in which case the client's
+/// own headers go out and the provider decides.
+fn aws_signer(upstream: &Upstream, client: &HeaderMap) -> Option<crate::sigv4::Signer> {
+    let config = upstream.aws_sigv4.as_ref()?;
+    if crate::sigv4::uses_bearer(client) {
+        return None;
+    }
+    let Some(credentials) = crate::sigv4::Credentials::from_env() else {
+        tracing::warn!(
+            upstream = %upstream.name,
+            "aws_sigv4 is set but AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY are not; forwarding the client's signature"
+        );
+        return None;
+    };
+    Some(crate::sigv4::Signer {
+        region: config.region.clone(),
+        service: config.service.clone(),
+        credentials,
+    })
+}
+
+/// The client's original goes out instead of the rewrite, so nothing was
+/// recompacted: the provider will cache these bytes, and the conversation
+/// keeps the freeze and the ledger that go with them. Dropping the reservation
+/// frees it for the next turn that finds the cache gone.
+fn forget_the_rewrite(state: &ProxyState, prepared: &mut Prepared) {
+    prepared.pending_recompaction = None;
+    prepared.reservation = None;
+    prepared.recompacted = None;
+    if let Some(seen) = prepared.observation.as_mut() {
+        seen.recompacted = None;
+        seen.ledger_reads = 0;
+    }
+    // The drift tracker was told the rewritten body went out. It did not: the
+    // next request is to be compared with the client's own bytes on both
+    // sides.
+    if let Some(conversation) = prepared.prefix {
+        state.drift.sent_as_received(conversation, prepared.ticket);
+    }
+}
+
+/// Run the stability guards (`proxy.guard_thinking`,
+/// `proxy.guard_upstream_body`) over a rewritten body, and under `enforce`
+/// put the client's original back in its place. See [`crate::guard`].
+///
+/// Both bodies are parsed again here rather than taken from `prepared.json`:
+/// what is checked has to be the bytes that go out, after every rewrite and
+/// its serialisation, and the client's as they arrived. A body this proxy did
+/// not change is not looked at.
+fn guard_the_rewrite(
+    state: &ProxyState,
+    family: Option<ApiFamily>,
+    origin: &str,
+    decoded: &Bytes,
+    prepared: &mut Prepared,
+) {
+    use crate::guard::{Guard, Verdict, check_thinking, check_upstream_body};
+    use kompressor_core::config::GuardMode;
+
+    if prepared.body != *decoded
+        && let Some(fault) = state
+            .rewrite_fault
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+        && let Ok(mut value) = serde_json::from_slice::<Value>(&prepared.body)
+    {
+        fault(&mut value);
+        if let Ok(out) = serde_json::to_vec(&value) {
+            prepared.body = Bytes::from(out);
+        }
+    }
+    let Some(family) = family else {
+        return;
+    };
+    if prepared.body == *decoded {
+        return;
+    }
+    let config = state.core.config_for(Some(family.provider()));
+    let thinking = config.proxy.guard_thinking;
+    let upstream_body = config.proxy.guard_upstream_body;
+    if !thinking.checks() && !upstream_body.checks() {
+        return;
+    }
+    let (Ok(original), Ok(sent)) = (
+        serde_json::from_slice::<Value>(decoded),
+        serde_json::from_slice::<Value>(&prepared.body),
+    ) else {
+        return;
+    };
+    let mut enforced: Option<(Guard, String)> = None;
+    for (guard, mode) in [
+        (Guard::Thinking, thinking),
+        (Guard::UpstreamBody, upstream_body),
+    ] {
+        if !mode.checks() {
+            continue;
+        }
+        let verdict = match guard {
+            Guard::Thinking => check_thinking(&original, &sent, family),
+            Guard::UpstreamBody => check_upstream_body(&original, &sent, family),
+        };
+        match verdict {
+            Verdict::Pass => {}
+            Verdict::ClientInvalid(reason) => state.guards.client_invalid(&reason),
+            Verdict::Trip(reason) => {
+                state.guards.trip(guard, mode, &reason);
+                if mode == GuardMode::Enforce && enforced.is_none() {
+                    enforced = Some((guard, reason));
+                }
+            }
+        }
+    }
+    let Some((guard, reason)) = enforced else {
+        return;
+    };
+    state
+        .failopen
+        .record(Stage::Guard, &format_args!("{}: {reason}", guard.as_str()));
+    // The client's bytes, with only the model renamed where its upstream
+    // needs that: the one change made before any rewrite, and not one a
+    // guard checks.
+    prepared.body = model_for_upstream(decoded.clone(), Some(family), origin);
+    prepared.json = None;
+    prepared.saved_tokens = 0;
+    prepared.injected = false;
+    prepared.strip_usage = false;
+    prepared.tools_compacted_bytes = 0;
+    prepared.tools_deferred = Default::default();
+    prepared.reasoning_elided_bytes = 0;
+    forget_the_rewrite(state, prepared);
 }
 
 /// Ask OpenAI to keep this prompt's cache entry for a day, when
@@ -552,11 +714,17 @@ fn keep_warm_for(
     identity: &Identity,
     upstream: &str,
 ) -> Option<KeepWarmPlan> {
-    if family != Some(ApiFamily::AnthropicMessages) || prepared.one_hour {
+    // The provider's own API only: a ping copies this request's headers, and
+    // on Vertex or Bedrock those carry a token or signature for another body.
+    if family != Some(ApiFamily::AnthropicMessages)
+        || url.parse::<http::Uri>().is_ok_and(|uri| {
+            kompressor_wire::platform(uri.path()) != kompressor_wire::Platform::Direct
+        })
+    {
         return None;
     }
     let proxy = &state.core.config_for(Some("anthropic")).proxy;
-    if !proxy.cache_keep_warm {
+    if !proxy.cache_keep_warm || (prepared.one_hour && !proxy.cache_keep_warm_one_hour) {
         return None;
     }
     let conversation = prepared.prefix?;
@@ -577,23 +745,43 @@ fn keep_warm_for(
         prepared.model.clone(),
         upstream,
         conversation,
+        proxy.cache_keep_warm_one_hour,
     )?;
+    // An entry asked to last an hour gets one ping near its end, after a
+    // `tool_use` only (`proxy.cache_keep_warm_one_hour`): no background
+    // schedule, so an `end_turn` arms nothing.
+    if ping.one_hour || prepared.one_hour {
+        return Some(KeepWarmPlan {
+            state: state.clone(),
+            ping,
+            schedule: crate::keepwarm::Schedule {
+                interval: proxy.cache_keep_warm_one_hour_delay,
+                max_pings: 1,
+            },
+            background: None,
+            background_prior: false,
+        });
+    }
     // Read from what the client sent, not what compression made of it: see
     // `client_background_wait`. Parsed again only when the two differ.
     let rewritten = (prepared.body != *client).then_some(client.as_ref());
-    let background = (proxy.cache_keep_warm_background_pings > 0)
+    let wait = (proxy.cache_keep_warm_background_pings > 0)
         .then(|| crate::keepwarm::client_background_wait(rewritten, sent))
-        .flatten()
-        .map(|wait| crate::keepwarm::Schedule {
-            interval: proxy.cache_keep_warm_interval,
-            max_pings: wait.max_pings(
-                proxy.cache_keep_warm_interval,
-                wait.cap(
-                    proxy.cache_keep_warm_background_pings,
-                    proxy.cache_keep_warm_max_pings,
-                ),
+        .flatten();
+    let background_prior = proxy.cache_keep_warm_background_prior
+        && wait
+            .as_ref()
+            .is_some_and(crate::keepwarm::Wait::may_be_a_dead_end);
+    let background = wait.map(|wait| crate::keepwarm::Schedule {
+        interval: proxy.cache_keep_warm_interval,
+        max_pings: wait.max_pings(
+            proxy.cache_keep_warm_interval,
+            wait.cap(
+                proxy.cache_keep_warm_background_pings,
+                proxy.cache_keep_warm_max_pings,
             ),
-        });
+        ),
+    });
     Some(KeepWarmPlan {
         state: state.clone(),
         ping,
@@ -602,6 +790,7 @@ fn keep_warm_for(
             max_pings: proxy.cache_keep_warm_max_pings,
         },
         background,
+        background_prior,
     })
 }
 
@@ -613,6 +802,10 @@ pub(crate) struct KeepWarmPlan {
     /// The schedule for an `end_turn` while a background task runs, or `None`
     /// when there is no such task (or that case is turned off).
     background: Option<crate::keepwarm::Schedule>,
+    /// The background wait may be a dead end and
+    /// `proxy.cache_keep_warm_background_prior` is on: the conversation's
+    /// earlier waits decide whether it is pinged ([`crate::keepwarm::Prior`]).
+    background_prior: bool,
 }
 
 /// What the compression stage decided to send.
@@ -664,10 +857,15 @@ struct Prepared {
     ticket: u64,
     /// Bytes `proxy.tools_compact` took out of the tool definitions.
     tools_compacted_bytes: usize,
+    /// What `proxy.tools_defer` kept out of the rendered prompt.
+    tools_deferred: crate::tooldefer::Deferred,
     /// Bytes it would take out, where it is not applied.
     tools_compactable_bytes: usize,
     /// Bytes of earlier-turn reasoning taken out of the conversation.
     reasoning_elided_bytes: usize,
+    /// The conversation's arm of `proxy.output_shaping`, when it is in the
+    /// experiment.
+    output_shaping: Option<crate::outputshape::Arm>,
 }
 
 impl Prepared {
@@ -685,8 +883,10 @@ impl Prepared {
             reservation: None,
             ticket: 0,
             tools_compacted_bytes: 0,
+            tools_deferred: Default::default(),
             tools_compactable_bytes: 0,
             reasoning_elided_bytes: 0,
+            output_shaping: None,
             body,
             json: None,
             saved_tokens: 0,
@@ -761,12 +961,14 @@ fn passthrough_with_stable_tools(
     body: Bytes,
     stream: bool,
     model: Option<String>,
+    retrieve_allowed: bool,
 ) -> Prepared {
-    let wants_tool = offers_retrieve_tool(
-        proxy,
-        engine_mode,
-        tool::carries_handle(&String::from_utf8_lossy(&body)),
-    );
+    let wants_tool = retrieve_allowed
+        && offers_retrieve_tool(
+            proxy,
+            engine_mode,
+            tool::carries_handle(&String::from_utf8_lossy(&body)),
+        );
     if !wants_tool {
         return Prepared::passthrough(body, stream, model);
     }
@@ -800,8 +1002,10 @@ fn passthrough_with_stable_tools(
         reservation: None,
         ticket: 0,
         tools_compacted_bytes: 0,
+        tools_deferred: Default::default(),
         tools_compactable_bytes: 0,
         reasoning_elided_bytes: 0,
+        output_shaping: None,
     }
 }
 
@@ -1152,6 +1356,126 @@ fn compact_tool_schemas(state: &ProxyState, identified: &Identified, prepared: &
     }
 }
 
+/// Keep the tools a conversation does not use every turn out of the rendered
+/// prompt, under `proxy.tools_defer`. See [`crate::tooldefer`].
+///
+/// Asked of every Anthropic conversation, on or off, so the answer is on
+/// record from its first request. Applied only on the first-party API: the
+/// `anthropic` mount or a host of `api.anthropic.com`. Gateways, Bedrock and
+/// Vertex refuse the tool-search shape or gate it behind another beta.
+fn defer_tool_schemas(
+    state: &ProxyState,
+    identified: &Identified,
+    provider: &str,
+    origin: &str,
+    prepared: &mut Prepared,
+) {
+    if identified.family != ApiFamily::AnthropicMessages {
+        return;
+    }
+    let config = state.core.config_for(Some(identified.family.provider()));
+    let proxy = &config.proxy;
+    if !state.defer_policies.compacting(
+        identified.fingerprint,
+        identified.messages,
+        proxy.tools_defer && first_party_anthropic(provider, origin),
+    ) {
+        return;
+    }
+    let mut parsed = None;
+    let value = match prepared.json.as_mut() {
+        Some(value) => value,
+        None => match serde_json::from_slice::<Value>(&prepared.body) {
+            Ok(value) => parsed.insert(value),
+            Err(_) => return,
+        },
+    };
+    let mut changed = false;
+    if let Some(Value::Array(tools)) = value.get_mut("tools")
+        && let Some(deferred) = crate::tooldefer::defer_tools(
+            tools,
+            &proxy.tools_defer_keep,
+            proxy.tools_defer_min_tools,
+        )
+    {
+        prepared.tools_deferred = deferred;
+        changed = true;
+    }
+    // On every request of a deferred conversation, deferred this time or not:
+    // a side request replaying the transcript with fewer tools is the case.
+    let repaired = crate::tooldefer::repair_history(value);
+    if repaired > 0 {
+        tracing::debug!(
+            repaired,
+            "replaced tool-search blocks this request cannot resolve"
+        );
+    }
+    if (changed || repaired > 0)
+        && let Ok(out) = serde_json::to_vec(value)
+    {
+        prepared.body = Bytes::from(out);
+    }
+}
+
+/// Whether a request goes to Anthropic's own API rather than a gateway or a
+/// cloud platform: the `anthropic` mount, or the host itself, and never a
+/// Google or AWS host whatever the mount is called.
+fn first_party_anthropic(provider: &str, origin: &str) -> bool {
+    let host = origin
+        .split("://")
+        .nth(1)
+        .unwrap_or(origin)
+        .split([':', '/'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if host.ends_with("googleapis.com") || host.ends_with("amazonaws.com") {
+        return false;
+    }
+    provider == "anthropic" || host == "api.anthropic.com"
+}
+
+/// Append the output-shaping instruction to a treated conversation's system
+/// prompt, under `proxy.output_shaping`. See [`crate::outputshape`].
+///
+/// Asked of every conversation, on or off and in every family, for the
+/// reason `compact_tool_schemas` is: the answer is fixed by the first request.
+/// Where the text goes is the family's: see
+/// [`crate::outputshape::append_instruction_for`].
+fn shape_output(state: &ProxyState, identified: &Identified, prepared: &mut Prepared) {
+    let proxy = &state
+        .core
+        .config_for(Some(identified.family.provider()))
+        .proxy;
+    let Some(decision) = state.output_shaping.decide(
+        identified.fingerprint,
+        identified.opening,
+        identified.messages,
+        proxy.output_shaping,
+        proxy.output_shaping_holdout_pct,
+        &proxy.output_shaping_text,
+    ) else {
+        return;
+    };
+    prepared.output_shaping = Some(decision.arm);
+    let Some(text) = decision.text else {
+        return;
+    };
+    let mut parsed = None;
+    let value = match prepared.json.as_mut() {
+        Some(value) => value,
+        None => match serde_json::from_slice::<Value>(&prepared.body) {
+            Ok(value) => parsed.insert(value),
+            Err(_) => return,
+        },
+    };
+    if crate::outputshape::append_instruction_for(value, identified.family, &text)
+        && let Ok(out) = serde_json::to_vec(value)
+    {
+        prepared.body = Bytes::from(out);
+    }
+}
+
 /// Send this request's tools in the order the conversation's first request
 /// used, under `proxy.tools_order = "pinned"`. See [`crate::stabilize`].
 ///
@@ -1249,6 +1573,8 @@ fn observe_prefix(
     observation.quiet_read_bytes = clamp(identified.reads.matured);
     observation.tools_compacted_bytes =
         u32::try_from(prepared.tools_compacted_bytes).unwrap_or(u32::MAX);
+    observation.tools_proxy_deferred = prepared.tools_deferred.tools;
+    observation.tools_proxy_deferred_bytes = prepared.tools_deferred.bytes;
     if let Some((kind, held)) = prepared.recompacted {
         observation.recompacted = Some(kind.as_str().to_string());
         observation.ledger_reads = u32::try_from(held).unwrap_or(u32::MAX);
@@ -1342,6 +1668,8 @@ async fn prepare(
     body: Bytes,
     request_id: &str,
     provider: &str,
+    origin: &str,
+    retrieve_allowed: bool,
 ) -> Prepared {
     let identified = prefix_identity(state, identity, family, &body, provider, request_headers);
     let fingerprint = identified.as_ref().map(|found| found.fingerprint);
@@ -1385,6 +1713,7 @@ async fn prepare(
         fingerprint,
         long_ttl,
         cold,
+        retrieve_allowed,
     )
     .await;
     // Whatever the settings: `predicted_cold` reads it when the setting is
@@ -1440,6 +1769,12 @@ async fn prepare(
         // Asked of every conversation, on or off: the answer is fixed by the
         // first request, and has to be on record before the setting changes.
         compact_tool_schemas(state, identified, &mut prepared);
+        // After compaction, which then sees every schema, and before pinning,
+        // which then orders the list that is sent.
+        defer_tool_schemas(state, identified, provider, origin, &mut prepared);
+        // Before the observation, which then describes the system prompt
+        // that is sent.
+        shape_output(state, identified, &mut prepared);
         if state
             .core
             .config_for(family.map(ApiFamily::provider))
@@ -1501,6 +1836,9 @@ async fn prepare_inner(
     long_ttl: bool,
     // This request finds the provider's cache gone; see `cold_turn`.
     cold: Option<crate::recompact::Cold>,
+    // Whether the retrieve tool may be offered on this transport at all: not
+    // where the answer comes back in a framing the loop cannot read.
+    retrieve_allowed: bool,
 ) -> Prepared {
     // This provider's settings: `proxy.providers` applied over the defaults.
     let config = state.core.config_for(family.map(ApiFamily::provider));
@@ -1627,7 +1965,15 @@ async fn prepare_inner(
             request_id,
             "tool_choice forbids the retrieve tool; forwarding as it arrived"
         );
-        return passthrough_with_stable_tools(proxy, options.mode, family, body, stream, model);
+        return passthrough_with_stable_tools(
+            proxy,
+            options.mode,
+            family,
+            body,
+            stream,
+            model,
+            retrieve_allowed,
+        );
     }
 
     let before = compressible_tokens(&walk);
@@ -1636,7 +1982,15 @@ async fn prepare_inner(
             tokens = before,
             "below proxy.min_tokens; forwarding as it arrived"
         );
-        return passthrough_with_stable_tools(proxy, options.mode, family, body, stream, model);
+        return passthrough_with_stable_tools(
+            proxy,
+            options.mode,
+            family,
+            body,
+            stream,
+            model,
+            retrieve_allowed,
+        );
     }
 
     // Is the freeze protecting a cache that still exists? Fingerprinted over
@@ -1770,6 +2124,18 @@ async fn prepare_inner(
             (state.recompact.reads(key), decide)
         });
 
+    // `proxy.elision_gate = "net_cost"`: the engine prices each new message's
+    // elision against this conversation's prompt, and replays its pins.
+    let options = crate::netgate::gated_options(
+        options,
+        proxy,
+        &state.prefixes,
+        conversation,
+        family,
+        model.as_deref(),
+        long_ttl,
+        before.saturating_add(outside_tokens(&value)),
+    );
     let compressed = compress_with_ledger(
         state,
         identity,
@@ -1806,7 +2172,15 @@ async fn prepare_inner(
     )
     .await;
     let Some((messages, saved, read_decisions)) = compressed else {
-        return passthrough_with_stable_tools(proxy, options.mode, family, body, stream, model);
+        return passthrough_with_stable_tools(
+            proxy,
+            options.mode,
+            family,
+            body,
+            stream,
+            model,
+            retrieve_allowed,
+        );
     };
     walk.messages = messages;
 
@@ -1819,7 +2193,15 @@ async fn prepare_inner(
             .failopen
             .record(Stage::Discarded, &"compression did not shrink the prompt");
         record_discard(state, identity, request_id);
-        return passthrough_with_stable_tools(proxy, options.mode, family, body, stream, model);
+        return passthrough_with_stable_tools(
+            proxy,
+            options.mode,
+            family,
+            body,
+            stream,
+            model,
+            retrieve_allowed,
+        );
     }
 
     let carries_handle = tool::carries_handle(&String::from_utf8_lossy(&body))
@@ -1828,7 +2210,7 @@ async fn prepare_inner(
             .iter()
             .filter_map(|origin| walk.current_text(origin))
             .any(tool::carries_handle);
-    let wants_tool = offers_retrieve_tool(proxy, options.mode, carries_handle);
+    let wants_tool = retrieve_allowed && offers_retrieve_tool(proxy, options.mode, carries_handle);
     let mut injected = false;
     if wants_tool {
         match tool::inject(&mut value, family) {
@@ -1868,6 +2250,7 @@ async fn prepare_inner(
                     body,
                     stream,
                     model,
+                    retrieve_allowed,
                 );
             }
             tracing::info!(
@@ -1905,8 +2288,10 @@ async fn prepare_inner(
                 reservation: None,
                 ticket: 0,
                 tools_compacted_bytes: 0,
+                tools_deferred: Default::default(),
                 tools_compactable_bytes: 0,
                 reasoning_elided_bytes: 0,
+                output_shaping: None,
             }
         }
         Err(error) => {
@@ -2180,6 +2565,9 @@ async fn compress_with_ledger(
             // against a bar that will have moved, is how a promoted fragment
             // gets re-elided and loses the prefix a second time.
             prefixes.record_inlined(conversation, &outcome.stats.kept_inline_refs);
+            // Likewise the net-cost gate's first decisions: replayed on every
+            // later turn, so the message's bytes never follow the prompt.
+            prefixes.record_gate_pins(conversation, &outcome.stats.gate_pins);
             let saved = outcome
                 .stats
                 .tokens_in
@@ -2815,6 +3203,7 @@ async fn buffered_response(
             .ok()
             .and_then(|body| body.get("stop_reason")?.as_str().map(str::to_string));
     }
+    recorder.round_usage = relayed.round_usage;
     recorder.finish(
         Some(relayed.status.as_u16()),
         relayed.rounds,
@@ -2874,7 +3263,12 @@ async fn stream_response(
 
     // An error, or a response that is not an event stream after all, is a whole
     // body: relaying it as one is both simpler and what the client expects.
-    if !status.is_success() || !is_event_stream(upstream.headers(), prepared.stream) {
+    // AWS event-stream framing (Bedrock's streaming actions) is the exception:
+    // binary, never SSE, and piped through below as it arrives.
+    let aws_frames = is_aws_event_stream(upstream.headers());
+    if !status.is_success()
+        || (!aws_frames && !is_event_stream(upstream.headers(), prepared.stream))
+    {
         let body = upstream.bytes().await.unwrap_or_default();
         recorder.finish(Some(status.as_u16()), 0, 0, None, started, None);
         let mut response = Response::new(Body::from(body));
@@ -2886,7 +3280,10 @@ async fn stream_response(
     // A family we do not walk has no turn to intercept, so its stream skips the
     // machine entirely and is piped through. Buffering it to look for a tool
     // call we could not have injected would hold every token back until the
-    // provider finished the answer.
+    // provider finished the answer. Bedrock's event-stream frames take the
+    // same road: the retrieve tool is never offered on them, and usage is in
+    // binary frames this proxy does not decode.
+    let family = family.filter(|_| !aws_frames);
     let Some(family) = family else {
         recorder.finish(Some(status.as_u16()), 0, 0, None, started, None);
         let mut response = Response::new(Body::from_stream(upstream.bytes_stream()));
@@ -2917,8 +3314,9 @@ async fn stream_response(
     let (tx, rx) = tokio::sync::mpsc::channel::<ClientChunk>(32);
     let mut recorder = recorder;
     tokio::spawn(async move {
-        let outcome = relay.run(upstream, tx).await;
+        let mut outcome = relay.run(upstream, tx).await;
         recorder.stop_reason = outcome.stop_reason.clone();
+        recorder.round_usage = std::mem::take(&mut outcome.round_usage);
         // A stream the client walked out on still gets a row, and the row says
         // so. Without the note it is a healthy 200 carrying usage for tokens
         // that reached nobody, which is worse than no row at all: it is a row
@@ -2976,6 +3374,15 @@ fn is_event_stream(headers: &HeaderMap, asked_for_stream: bool) -> bool {
     }
 }
 
+/// Whether the response is AWS's binary event-stream framing
+/// (`application/vnd.amazon.eventstream`), as Bedrock's streaming actions send.
+fn is_aws_event_stream(headers: &HeaderMap) -> bool {
+    headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("vnd.amazon.eventstream"))
+}
+
 /// Say when the provider refused a request, at a level the default log keeps.
 ///
 /// Refusals are relayed untouched, which is right, but they used to leave no
@@ -3027,6 +3434,9 @@ pub(crate) struct Recorder {
     pub(crate) keep_warm: Option<KeepWarmPlan>,
     /// How the model stopped, where the path that relayed it could tell.
     pub(crate) stop_reason: Option<String>,
+    /// This request's body went upstream compressed, which the prefix tracker
+    /// is told once the request is filed (`Stage::AfterCompressed`).
+    pub(crate) compressed: bool,
     /// For the two things a response settles about a recompaction.
     recompact: Arc<crate::recompact::Recompact>,
     /// This request's place among all requests, by arrival.
@@ -3034,6 +3444,8 @@ pub(crate) struct Recorder {
     /// This request was recompacted on a *predicted* lapse, so the provider's
     /// answer can be held against the prediction.
     predicted_cold: bool,
+    /// Each round's own usage, round 0 first, where the relay kept it.
+    pub(crate) round_usage: Vec<Value>,
     /// Counts this request among those under way for as long as it is.
     _under_way: kompressor_core::runtime::Entered,
 }
@@ -3092,6 +3504,7 @@ impl Recorder {
             total_ms: None,
             error: None,
             keep_warm: false,
+            output_shaping: prepared.output_shaping.map(|arm| arm.as_str().to_string()),
         };
         Recorder {
             _under_way: state.core.runtime().enter(event.stream),
@@ -3103,11 +3516,13 @@ impl Recorder {
             prefix: prepared.prefix,
             keep_warm: None,
             stop_reason: None,
+            compressed: false,
             recompact: state.recompact.clone(),
             ticket: prepared.ticket,
             predicted_cold: prepared
                 .recompacted
                 .is_some_and(|(kind, _)| kind == crate::recompact::Cold::Predicted),
+            round_usage: Vec::new(),
         }
     }
 
@@ -3135,6 +3550,21 @@ impl Recorder {
         let schedule = match self.stop_reason.as_deref() {
             Some("tool_use") => plan.schedule,
             Some("end_turn") => match plan.background {
+                Some(schedule)
+                    if plan.background_prior
+                        && !plan.state.keepwarm.background_wait(
+                            plan.ping.conversation,
+                            plan.ping.messages,
+                            schedule.covers_until(started),
+                        ) =>
+                {
+                    tracing::debug!(
+                        request_id = %plan.ping.request_id,
+                        "keep-warm not armed: this conversation's background waits \
+                         have not come back"
+                    );
+                    return;
+                }
                 Some(schedule) => schedule,
                 None => return,
             },
@@ -3168,17 +3598,46 @@ impl Recorder {
         self.event.upstream_ms = (waited > 0).then(|| waited as f64 / 1000.0);
         self.event.error = error;
         if let Some(usage) = usage {
-            self.event.prompt_tokens = billed(usage, &["prompt_tokens", "input_tokens"]);
-            self.event.completion_tokens = billed(usage, &["completion_tokens", "output_tokens"]);
-            self.event.cache_read_tokens =
-                billed(usage, &["cache_read_input_tokens"]).or_else(|| {
-                    usage
-                        .pointer("/prompt_tokens_details/cached_tokens")
-                        .or_else(|| usage.pointer("/input_tokens_details/cached_tokens"))
-                        .and_then(Value::as_u64)
-                        .map(|tokens| tokens as u32)
-                });
-            self.event.cache_write_tokens = billed(usage, &["cache_creation_input_tokens"]);
+            // Gemini (`usageMetadata`) and Bedrock Converse spell the same
+            // numbers in camelCase. Gemini's prompt count includes the cached
+            // part, as OpenAI's does.
+            self.event.prompt_tokens = billed(
+                usage,
+                &[
+                    "prompt_tokens",
+                    "input_tokens",
+                    "promptTokenCount",
+                    "inputTokens",
+                ],
+            );
+            self.event.completion_tokens = billed(
+                usage,
+                &[
+                    "completion_tokens",
+                    "output_tokens",
+                    "candidatesTokenCount",
+                    "outputTokens",
+                ],
+            );
+            self.event.cache_read_tokens = billed(
+                usage,
+                &[
+                    "cache_read_input_tokens",
+                    "cachedContentTokenCount",
+                    "cacheReadInputTokens",
+                ],
+            )
+            .or_else(|| {
+                usage
+                    .pointer("/prompt_tokens_details/cached_tokens")
+                    .or_else(|| usage.pointer("/input_tokens_details/cached_tokens"))
+                    .and_then(Value::as_u64)
+                    .map(|tokens| tokens as u32)
+            });
+            self.event.cache_write_tokens = billed(
+                usage,
+                &["cache_creation_input_tokens", "cacheWriteInputTokens"],
+            );
             // The TTL split, which prices the write: 1.25x input for five-minute
             // entries, 2x for one-hour ones.
             self.event.cache_write_1h_tokens = usage
@@ -3252,6 +3711,12 @@ impl Recorder {
             // wrote nothing" would have the next turn recompacted again.
             let cache_read = self.event.cache_read_tokens.filter(|_| !predates);
             self.prefixes.record(prefix, cache_read, prompt, rounds);
+            if let Some(prompt) = prompt {
+                self.prefixes.record_prompt(prefix, prompt, rounds);
+            }
+            if self.compressed {
+                self.prefixes.record_compressed(prefix);
+            }
             // The request that opened the conversation: what the provider
             // holds of it now is what another conversation opening with the
             // same bytes can keep alive, and so no evidence about this one.
@@ -3276,7 +3741,41 @@ impl Recorder {
             }
         }
         self.arm_keep_warm(started);
+        // Only where the loop took a round: otherwise the one round is the
+        // row itself.
+        if rounds > 0 && !self.round_usage.is_empty() {
+            self.core.stats().send(Event::RetrieveRounds(
+                kompressor_stats::RetrieveRoundsEvent {
+                    time_ms: self.event.time_ms,
+                    tenant: self.event.tenant.clone(),
+                    request_id: self.event.request_id.clone(),
+                    rounds: self
+                        .round_usage
+                        .iter()
+                        .enumerate()
+                        .map(|(round, usage)| round_usage(round as u32, usage))
+                        .collect(),
+                },
+            ));
+        }
         self.core.stats().send(Event::ProxyRequest(self.event));
+    }
+}
+
+/// One round's usage in the columns `proxy_requests` uses for the sum.
+fn round_usage(round: u32, usage: &Value) -> kompressor_stats::RoundUsage {
+    kompressor_stats::RoundUsage {
+        round,
+        input_tokens: billed(usage, &["prompt_tokens", "input_tokens"]),
+        cache_read_tokens: billed(usage, &["cache_read_input_tokens"]).or_else(|| {
+            usage
+                .pointer("/prompt_tokens_details/cached_tokens")
+                .or_else(|| usage.pointer("/input_tokens_details/cached_tokens"))
+                .and_then(Value::as_u64)
+                .map(|tokens| tokens as u32)
+        }),
+        cache_write_tokens: billed(usage, &["cache_creation_input_tokens"]),
+        output_tokens: billed(usage, &["completion_tokens", "output_tokens"]),
     }
 }
 

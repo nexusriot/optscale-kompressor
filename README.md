@@ -402,6 +402,28 @@ OpenCode Desktop needs **2.2.4 or newer**: the CLI that 2.0.11 bundles does not
 reliably honour a provider's `baseURL`, so its traffic bypasses the proxy.
 Details, including a permanent setup: [docs/OPENCODE.md](docs/OPENCODE.md).
 
+### From your own code: the thin clients
+
+`clients/python` (standard library only) and `clients/typescript` (`fetch`
+only) wrap `/v1/compress`, `/v1/compress/raw`, `/v1/retrieve` and
+`/v1/detect` of a running `kompressor serve`, with a fail-open
+`compress_or_passthrough`. No second engine: the server does the work.
+
+```python
+from kompressor_client import Kompressor
+messages = Kompressor("http://127.0.0.1:8817").compress_or_passthrough(messages)
+```
+
+### Gemini, Vertex AI and Bedrock
+
+Besides the OpenAI and Anthropic APIs, the proxy compresses Gemini
+`generateContent` (Google AI and Vertex), Claude on Vertex (`:rawPredict`),
+Claude on Bedrock (`/model/{id}/invoke`) and Bedrock Converse, including
+Gemini `functionResponse` tool output. A Bedrock mount with `aws_sigv4`
+re-signs every request over the compressed body. Paths, auth and what differs
+(no in-band retrieve tool where the response is not read): 
+[docs/CLOUD-PLATFORMS.md](docs/CLOUD-PLATFORMS.md).
+
 ### Other agents
 
 ```bash
@@ -410,10 +432,40 @@ kompressor wrap aider -- --model sonnet    # your own arguments go after --
 kompressor wrap --env NAME=root|v1 -- your-agent
 ```
 
-`wrap` knows `codex`, `claude`, `opencode`, `aider`, `cursor` (prints the base URL
-to set in Cursor's settings; only applies when Cursor uses your own OpenAI key) and
-`cursor-agent` (refused with an explanation: it speaks Connect RPC over protobuf,
-which the proxy cannot read).
+`wrap` knows `codex`, `claude`, `opencode`, `copilot` (BYOK), `goose`, `aider` and
+`cursor-agent`. `cline` and `continue` are configured in the editor:
+`kompressor wrap cline` prints the base URLs to paste and holds the proxy up
+until Ctrl-C.
+
+### Is it working? `kompressor doctor`
+
+```bash
+kompressor doctor          # one line per check, a remedy under each problem
+kompressor doctor --json   # {version, exit_code, checks: [{check, status, detail, remedy}]}
+```
+
+It checks the configuration, whether a kompressor answers on the proxy
+listener, the upstreams, the fragment and statistics stores (Redis is pinged),
+which known agents are on `PATH`, and every `ANTHROPIC_BASE_URL`-style variable
+in the shell that points at a loopback port nothing answers on. It never calls
+a provider. Exit 0 healthy, 1 warnings only, 2 a failure.
+
+### Cursor
+
+Cursor's traffic is protobuf to its own servers, which no proxy can read, so it
+is compressed through Cursor's own hooks instead — no proxy runs:
+
+```bash
+kompressor wrap cursor-agent -- -p "fix the failing test"   # one console session
+kompressor hook install cursor --shadow                      # editor and CLI: measure first
+kompressor hook install cursor                               # then compress MCP results
+kompressor hook status cursor
+```
+
+MCP tool results are compressed; shell output is opt-in; built-in Read and Grep
+output cannot be. How much this saves on Cursor has not been measured yet —
+Cursor already keeps any tool result over ~40 KB out of the conversation, and
+shadow mode is how to find out on your own work. [docs/CURSOR.md](docs/CURSOR.md).
 
 <a id="quick-start-claude-code"></a>
 ### Claude Code
@@ -626,7 +678,7 @@ are in [docs/charts/](docs/charts/).
 | MCP proxy  | `kompressor mcp serve` (stdio): the same tools, plus those of every `[[mcp.servers]]` it fronts, with their results compressed                                            |
 | Backup     | `kompressor backup`, the Maintenance page (off unless `maintenance.backup = true`), or on a schedule (`maintenance.backup_dir`): every database as one `.tar.gz`, service running; each is recorded and Health warns when the last is stale; `kompressor restore` puts one back |
 | Databases  | `kompressor db status`, `check`, `checkpoint`, and the same on the Maintenance page: size, write-ahead log, schema version, reclaimable space, integrity; the page also vacuums, optimizes, shows space per table, retention runs and disk headroom, and can trim request settings or delete statistics by day, tenant, run or experiment (preview first), verify archives against their `.sha256`, show what is running and the effective configuration, keep a history of all of it, and erase all statistics (off unless `maintenance.erase = true`) |
-| CLI        | `kompressor compress`, `retrieve`, `detect`, `stats`, `bench`, `backup`, `restore`, `db`, `check-config`                                                                                     |
+| CLI        | `kompressor compress`, `retrieve`, `detect`, `stats`, `bench`, `backup`, `restore`, `db`, `check-config`, `doctor`                                                                           |
 | Library    | the `kompressor-engine` crate: compress a string or a conversation, no I/O                                                                                                  |
 
 
@@ -757,7 +809,7 @@ other and from every page's **Dashboards** link:
 - `/advisor`: which of the opt-in settings would pay on this traffic. One row
   per setting — pinned tool order, kept beta tokens, an OpenAI cache key,
   schema compaction, recompaction on a lapsed cache, the read decisions,
-  reasoning elision, and tool deferral, which is not built — with whether it
+  reasoning elision, and tool deferral — with whether it
   is on now, a verdict (turn on, not worth it, not enough data), the value to
   set, the figure the verdict rests on beside the bar it was held against, a
   ceiling on the saving, and the reason in a sentence. Under it, the figures
@@ -781,7 +833,7 @@ statistics listener (`server.stats_listen`) as well.
 | `GET /v1/stats/analysis?from=&to=` | the analysis overview (`report`, `stats_dropped`, `retention_days`); defaults to the last 24 h |
 | `GET /v1/stats/analysis/retrievals?from=&to=` | retrieval amplification |
 | `GET /v1/stats/analysis/latency?from=&to=` | latency and reliability |
-| `GET /v1/stats/analysis/compare?from=&to=` | historical comparison; `compare_from`/`compare_to`, `model`, `mode`, `surface`, `experiment_id`, `run_id` |
+| `GET /v1/stats/analysis/compare?from=&to=` | historical comparison; `compare_from`/`compare_to`, `model`, `mode`, `surface`, `experiment_id`, `run_id`; `output_shaping` sets the two arms of `proxy.output_shaping` against each other within the window |
 | `GET /v1/stats/trends?window=26w&bucket=week` | per-period history from raw rows and the daily archive; `window` up to `104w`, `bucket` `day`, `week` or `month`, or `from=&to=` up to 730 days |
 | `GET /v1/stats/yield?window=24h` | tokens removed per content type (estimated by message share) and retrieval asks per fragment kind |
 | `GET /v1/stats/store-health?window=24h` | the ref store's census by kind, age and expiry, its size over time, minted versus asked handles, expired and missing asks |
@@ -877,6 +929,8 @@ per setting, whether it clears the bar.
 | `sticky_beta = true` | re-sends the `anthropic-beta` tokens a conversation already sent when a later request leaves some out |
 | `prompt_cache_key = "conversation"` | names an OpenAI cache route from the conversation's opening where the client named none |
 | `tools_compact = true` | drops schema bookkeeping from tool definitions (`$comment`, a `title` that restates its property's name, a `$schema` no keyword in the schema depends on); about 2% of the tool block on Claude Code |
+| `tools_defer = true` | first-party Anthropic: marks every tool but the core ones (`tools_defer_keep`) `defer_loading` and adds Anthropic's tool-search tool, for requests with at least `tools_defer_min_tools` (12) tools whose client does not defer already; decided per conversation on its first request |
+| `output_shaping = true` | appends a fixed "answer concisely" instruction ahead of the conversation — after the last `system` block (Anthropic), at the end of `instructions` (OpenAI Responses), or to the leading system message (OpenAI Chat, inserting one if there is none) — for all but `output_shaping_holdout_pct` (default 50, at least 30) of conversations; the only setting that changes what the model is asked, so an experiment, compared per arm at `/v1/stats/analysis/compare` |
 | `cold_recompact = "observed"` or `"predicted"` | under `frozen_prefix = "first_seen"`, rewrites the whole conversation on the turn that finds the provider's cache gone, and replays what that turn decided on every turn after it |
 | `superseded_reads`, `matured_reads` | with `cold_recompact`: on that turn, also replace a file read a later read contains, and compress as source a read left alone for `matured_quiesce_turns` |
 | `reasoning_elide_models = ["…"]` | OpenAI Chat: for the models named, elides the plain-text reasoning of turns before the last user message. Rewrites the finished turn once per user turn |
@@ -887,8 +941,6 @@ per setting, whether it clears the bar.
 
 - **Needle retention**: a measure of whether compression kept what the agent went
 on to use. It is the one quality metric that can fail while every ratio improves.
-- **Redis fragment backend**: needed for several proxies behind one load balancer.
-SQLite and in-memory stores exist.
 - `**bench` subcommands** beyond `replay` and `extract` (`sample`, `needles`,
 `calibrate-tokens`).
 - **Per-stage tracing and proxy metrics on `/metrics`**: status codes, fail-open
@@ -920,7 +972,7 @@ Good first issues are labelled
 | `make harbor-gates` | every live-agent benchmark gate, with no provider spend                                        |
 
 
-`cargo test --workspace` runs **1,882 tests** across ten crates; clippy and rustfmt
+`cargo test --workspace` runs **2,236 tests** across ten crates; clippy and rustfmt
 are clean. `make bench-save` and `make golden` move what the tests compare against,
 so both ask before they run.
 

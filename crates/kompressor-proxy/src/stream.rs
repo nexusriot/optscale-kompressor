@@ -74,6 +74,9 @@ pub(crate) struct StreamOutcome {
     pub(crate) rounds: u32,
     pub(crate) injected_tokens: u32,
     pub(crate) usage: Option<Value>,
+    /// Each round's own usage, round 0 first, for the rounds that finished:
+    /// what `retrieve_round_usage` is filed from.
+    pub(crate) round_usage: Vec<Value>,
     /// Why the model stopped, as the provider said in the round the client
     /// was given. Anthropic only; what decides whether to keep the
     /// conversation's cache warm.
@@ -207,6 +210,7 @@ fn observe_terminal(family: ApiFamily, frame: &SseFrame, terminal: &mut Option<b
         && !data.contains("stop")
         && !data.contains("response.")
         && !data.contains("finish_reason")
+        && !data.contains("finishReason")
     {
         return;
     }
@@ -242,6 +246,18 @@ fn observe_terminal(family: ApiFamily, frame: &SseFrame, terminal: &mut Option<b
                         .iter()
                         .any(|choice| choice.get("finish_reason").is_some_and(|r| !r.is_null()))
                 }),
+            // Gemini ends a candidate with a `finishReason` in its last chunk.
+            ApiFamily::GeminiGenerateContent => value
+                .as_ref()
+                .and_then(|v| v.get("candidates"))
+                .and_then(Value::as_array)
+                .is_some_and(|candidates| {
+                    candidates
+                        .iter()
+                        .any(|c| c.get("finishReason").is_some_and(|r| !r.is_null()))
+                }),
+            // Converse streams are AWS event-stream frames, never SSE.
+            ApiFamily::BedrockConverse => false,
         };
         if complete {
             *terminal = Some(true);
@@ -305,12 +321,14 @@ impl StreamRelay {
                 }
                 RoundEnd::Finished { usage, stop_reason } => {
                     turn::add_usage(&mut total, &usage);
+                    outcome.round_usage.push(usage);
                     outcome.stop_reason = stop_reason;
                     break;
                 }
                 RoundEnd::Intercepted { turn, usage } => (turn, usage),
             };
             turn::add_usage(&mut total, &usage);
+            outcome.round_usage.push(usage.clone());
 
             if self.budget.is_spent() {
                 refusals += 1;
@@ -349,7 +367,9 @@ impl StreamRelay {
     async fn recovery_error(&self, tx: &Sender<ClientChunk>, code: &str) {
         let message = "kompressor: could not complete the retrieval loop";
         let error = match self.family {
-            ApiFamily::OpenAiChat => format!(
+            ApiFamily::OpenAiChat
+            | ApiFamily::GeminiGenerateContent
+            | ApiFamily::BedrockConverse => format!(
                 "data: {}\n\n",
                 json!({"error": {
                     "type": "kompressor_retrieve_loop", "code": code, "message": message
@@ -902,6 +922,11 @@ impl StreamRelay {
             tokens = tokens.saturating_add(cost);
             results.push((call.clone(), payload));
         }
+        // As on the buffered path: siblings ride in what the allowance leaves.
+        if !spent && let Some(submission) = self.outbound.json() {
+            let attached = retriever.attach_siblings(submission, &mut results, left);
+            tokens = tokens.saturating_add(attached.tokens);
+        }
 
         let synthetic = turn.as_response();
         let mut next = self.outbound.json().cloned()?;
@@ -911,6 +936,9 @@ impl StreamRelay {
             self.failopen
                 .record(Stage::RetrieveRound, &"could not build the next round");
             return None;
+        }
+        if let Some(submission) = self.outbound.json() {
+            retriever.capture_round(self.budget.rounds + 1, submission);
         }
         self.budget.spend(tokens);
 
@@ -1420,6 +1448,9 @@ fn scrub(family: ApiFamily, frame: &SseFrame, others_remain: bool) -> Option<Byt
             delta["stop_reason"] = Value::String("end_turn".to_string());
             Some(reframe(frame, &value))
         }
+        // No retrieve tool is offered on these families, so no call of ours
+        // can be in the stream.
+        ApiFamily::GeminiGenerateContent | ApiFamily::BedrockConverse => None,
     }
 }
 
@@ -1799,6 +1830,8 @@ impl StreamTurn {
             ApiFamily::OpenAiChat => self.observe_chat(value),
             ApiFamily::OpenAiResponses => self.observe_responses(value),
             ApiFamily::AnthropicMessages => self.observe_anthropic(value),
+            // No retrieve tool is offered here; nothing to decide.
+            ApiFamily::GeminiGenerateContent | ApiFamily::BedrockConverse => Signal::None,
         };
         (signal, self.touched.take())
     }
@@ -2175,6 +2208,8 @@ impl StreamTurn {
                 }
                 json!({"content": blocks})
             }
+            // The retrieve loop never runs on these families.
+            ApiFamily::GeminiGenerateContent | ApiFamily::BedrockConverse => json!({}),
         }
     }
 }
@@ -2255,6 +2290,15 @@ fn usage_pointer(family: ApiFamily, value: &Value) -> Option<&'static str> {
                 .map(|_| "/usage"),
             _ => None,
         },
+        // Cumulative on every chunk; the caller keeps the maximum.
+        ApiFamily::GeminiGenerateContent => value
+            .get("usageMetadata")
+            .filter(|usage| usage.is_object())
+            .map(|_| "/usageMetadata"),
+        ApiFamily::BedrockConverse => value
+            .get("usage")
+            .filter(|usage| usage.is_object())
+            .map(|_| "/usage"),
     }
 }
 
